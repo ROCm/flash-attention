@@ -36,9 +36,9 @@ def fwd(q,
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::fwd")
-        print("q:", q.shape)
-        print("k:", k.shape)
-        print("v:", v.shape)
+        print("q:", q, q.shape)
+        print("k:", k, k.shape)
+        print("v:", v, v.shape)
         print("alibi_slopes:", alibi_slopes)
         print("dropout_p:", dropout_p)
         print("softmax_scale:", softmax_scale)
@@ -150,9 +150,9 @@ def varlen_fwd(
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::varlen_fwd")
-        print("q:", q.shape)
-        print("k:", k.shape)
-        print("v:", v.shape)
+        print("q:", q, q.shape)
+        print("k:", k, k.shape)
+        print("v:", v, v.shape)
         print("cu_seqlens_q:", cu_seqlens_q)
         print("cu_seqlens_k:", cu_seqlens_k)
         print("block_table_:", block_table_)
@@ -176,8 +176,8 @@ def varlen_fwd(
 
     # Setup metadata
     input_metadata = MetaData(sm_scale=softmax_scale)
+    # set layout to "thd" and other metdata
     input_metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k)
-    input_metadata.layout = "bshd"
 
     # get shapes
     batch, nheads_q, nheads_k, head_size = get_shape_from_layout(q, k, input_metadata)
