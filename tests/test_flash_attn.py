@@ -33,7 +33,8 @@ def is_amd():
     return False
 
 def is_power_of_2(n):
-    return n > 0 and (n & (n - 1)) == 0
+    # return n > 0 and (n & (n - 1)) == 0
+    return True
 
 
 def attn_bias_from_alibi_slopes(
