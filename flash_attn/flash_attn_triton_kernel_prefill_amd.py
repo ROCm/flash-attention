@@ -897,13 +897,13 @@ def get_strides_from_layout(q, k, v, o, metadata):
     return q_strides, k_strides, v_strides, o_strides
 
 
-class _attention(torch.autograd.Function):
+class _attention_prefill(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, o, metadata):
         if DEBUG:
             print()
-            print("_attention.forward")
+            print("_attention_prefill.forward")
             print("q:", q, q.shape)
             print("k:", k, k.shape)
             print("v:", v, v.shape)
@@ -1053,7 +1053,7 @@ class _attention(torch.autograd.Function):
         return dq, dk, dv, None, None
 
 
-attention_prefill = _attention.apply
+attention_prefill = _attention_prefill.apply
 
 
 def input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout):
