@@ -626,8 +626,8 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
             pytest.skip("local sliding window attention not supported on AMD yet")
         
         # skip all cases where seqlen_q, seqlen_k, or d are not powers of 2
-        if not (is_power_of_2(seqlen) and is_power_of_2(d)):
-            pytest.skip("seqlen_q, seqlen_k, or d are not powers of 2")
+        # if not (is_power_of_2(seqlen) and is_power_of_2(d)):
+        #     pytest.skip("seqlen_q, seqlen_k, or d are not powers of 2")
 
         if test_backward == True:
             pytest.skip("Backward Attention not supported on AMD yet")
@@ -791,8 +791,8 @@ def test_flash_attn_varlen_qkvpacked(
             pytest.skip("local sliding window attention not supported on AMD yet")
         
         # skip all cases where seqlen_q, seqlen_k, or d are not powers of 2
-        if not (is_power_of_2(seqlen) and is_power_of_2(d)):
-            pytest.skip("seqlen_q, seqlen_k, or d are not powers of 2")
+        # if not (is_power_of_2(seqlen) and is_power_of_2(d)):
+        #     pytest.skip("seqlen_q, seqlen_k, or d are not powers of 2")
         
         if test_backward == True:
             pytest.skip("Backward Attention not supported on AMD yet")
