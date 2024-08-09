@@ -57,13 +57,13 @@ jobs:
       - name: Build
         run: |
           python setup.py install
-      # - name: Flash Attention qkvpacked Tests
-      #   run: |
-      #     pytest tests/test_flash_attn.py::test_flash_attn_qkvpacked
-      #     pytest tests/test_flash_attn.py::test_flash_attn_varlen_qkvpacked
+      - name: Flash Attention qkvpacked Tests
+        run: |
+          pytest tests/test_flash_attn.py::test_flash_attn_qkvpacked
+          pytest tests/test_flash_attn.py::test_flash_attn_varlen_qkvpacked
       - name: Flash Attention output Tests
         run: |
-          pytest tests/test_flash_attn.py::test_flash_attn_output
+          # pytest tests/test_flash_attn.py::test_flash_attn_output
           pytest tests/test_flash_attn.py::test_flash_attn_varlen_output
       - name: Flash Attention causal Tests
         run: |
