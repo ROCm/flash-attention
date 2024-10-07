@@ -26,4 +26,6 @@ var/
 
 # Dev
 venv
+.venv
 scripts
+log

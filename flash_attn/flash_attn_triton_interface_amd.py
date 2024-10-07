@@ -161,6 +161,12 @@ def fwd_kvcache(
         cache_seqlens,
         rotary_cos,
         rotary_sin,
+        rotary_cos_k,
+        rotary_sin_k,
+        rotary_interleaved,
+        rotary_inplace,
+        rotary_conjugate,
+        rotary_seqlen_offsets,
         cache_batch_idx,
         cache_leftpad,
         block_table,
@@ -168,10 +174,10 @@ def fwd_kvcache(
         out,
         softmax_scale,
         causal,
+        local,
         window_size_left,
         window_size_right,
         softcap,
-        rotary_interleaved,
         num_splits):
 
     if out is None:
@@ -194,9 +200,15 @@ def fwd_kvcache(
     if causal:
         input_metadata.need_causal()
 
+    if local:
+        input_metadata.need_local()
+
     if alibi_slopes is not None:
         batch, _ , nheads_q, _= q.shape
         input_metadata.need_alibi(alibi_slopes, batch, nheads_q)
+
+    if torch.is_tensor(rotary_cos) and torch.is_tensor(rotary_sin):
+        input_metadata.need_rotary(rotary_cos, rotary_sin, rotary_cos_k, rotary_sin_k, rotary_interleaved, rotary_seqlen_offsets, rotary_inplace=rotary_inplace, rotary_conjugate=rotary_conjugate)
 
     # launch kernel
     tri_out, softmax_lse = attention_decode(q, k_cache, v_cache, input_metadata)

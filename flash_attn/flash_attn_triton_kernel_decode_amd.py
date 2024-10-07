@@ -1,13 +1,16 @@
 import math
-from typing import Optional
+from typing import Optional, Union
+from einops import rearrange, repeat
+from flash_attn.layers.rotary import apply_rotary_emb
 import pytest
 import torch
 import sys
 
+import pdb
+
 import triton
 import triton.language as tl
 from flash_attn.flash_attn_triton_kernel_prefill_amd import MetaData
-
 
 def _strides(x: torch.Tensor, *stride_names: str):
     if x is None:
@@ -15,7 +18,6 @@ def _strides(x: torch.Tensor, *stride_names: str):
 
     assert x.ndim == len(stride_names)
     return {f"stride_{s}": x.stride(i) for i, s in enumerate(stride_names)}
-
 
 @triton.jit
 def _fwd_kernel_splitK(
@@ -30,6 +32,8 @@ def _fwd_kernel_splitK(
     Cache_seqlens,
     Cache_batch_idx,
     Alibi_slopes,
+    Rotary_cos,
+    Rotary_sin,
     stride_qz,
     stride_qm,
     stride_qg,
@@ -84,6 +88,8 @@ def _fwd_kernel_splitK(
     IS_GQA: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_ALIBI: tl.constexpr,
+    USE_ROTARY: tl.constexpr,
+    ROTARY_INTERLEAVED: tl.constexpr
 ):
     # Padding
     PADDED_HEAD: tl.constexpr = (ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL)
@@ -92,9 +98,9 @@ def _fwd_kernel_splitK(
 
     start_m = tl.program_id(0)
     off_zhg = tl.program_id(1)
-    off_z = off_zhg // (H_q * G_q)
-    off_h_q = (off_zhg // G_q) % H_q
-    off_g_q = off_zhg % G_q
+    off_z = off_zhg // (H_q * G_q)      # batch
+    off_h_q = (off_zhg // G_q) % H_q    # head
+    off_g_q = off_zhg % G_q             # group (gca / mqa)
     splitk_idx = tl.program_id(2)
 
     # pick batch index
@@ -226,11 +232,15 @@ def _fwd_kernel_splitK(
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
-    qk_scale = sm_scale * 1.44269504
+    log2_e = 1.44269504
+    qk_scale = sm_scale * log2_e
+
     # load q: it will stay in SRAM throughout
     q = tl.load(  # noqa: F821
-        tl.advance(Q_block_ptr, (0, 0)), boundary_check=(0, ))
-    q = (q * qk_scale).to(q.dtype)
+        tl.advance(Q_block_ptr, (0, 0)),
+        boundary_check=(0, )
+    )
+    q = (q * qk_scale)
     if PADDED_HEAD:
         q = tl.where(d_mask[None, :], q, 0.0)
 
@@ -252,9 +262,13 @@ def _fwd_kernel_splitK(
             k = tl.where(d_mask[:, None], k, 0.0)
             v = tl.where(d_mask[None, :], v, 0.0)
 
+        if USE_ROTARY:
+            # rotate q and k before dot product
+            pass
+
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k)  # noqa: F821
+        qk += tl.dot(q, k)
 
         if USE_ALIBI:
             row_idx = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -266,7 +280,7 @@ def _fwd_kernel_splitK(
             
             # Compute ALiBi bias
             alibi_bias = -1 * alibi_slope * relative_pos
-            qk += (alibi_bias * 1.44269504)
+            qk += (alibi_bias * log2_e)
 
         # Apply causal mask if IS_CAUSAL is True
         if IS_CAUSAL:
@@ -295,11 +309,11 @@ def _fwd_kernel_splitK(
         if IS_CAUSAL:
             qk = tl.where(qk > float("-inf"), qk - m_i_new[:, None], float("-inf"))
         else:
-            qk = qk - m_i_new[:, None] 
+            qk = qk - m_i_new[:, None]
         
-        p = tl.math.exp2(qk)
+        p = tl.math.exp2(qk) # p = e^(qk^T)
 
-        # -- update m_i and l_i --
+        # -- update m_i (current max) and l_i (sum of elements) --
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
         p = p.to(Q.dtype.element_ty)
@@ -353,8 +367,8 @@ def load_k_v_group(
     V_block_ptr = tl.advance(V_block_ptr, (0, ACTUAL_BLOCK_DMODEL * group_id))
 
     # -- load k, v --
-    k = tl.load(K_block_ptr, boundary_check=(1, ) if BOUNDS_CHECKS_N else ())
-    v = tl.load(V_block_ptr, boundary_check=(0, ) if BOUNDS_CHECKS_N else ())
+    k = tl.load(K_block_ptr, boundary_check=(1, ) if BOUNDS_CHECKS_N else ()).to(tl.float32)
+    v = tl.load(V_block_ptr, boundary_check=(0, ) if BOUNDS_CHECKS_N else ()).to(tl.float32)
 
     return k, v
 
@@ -460,7 +474,6 @@ def _splitK_reduce(
         alpha = tl.where(l_m_offset > float("-inf"), tl.math.exp2(l_m_offset), 0.0)
     else:
         alpha = tl.math.exp2(l_m - g_m)
-
     # read sum
     l_sum *= alpha
     g_sum = tl.sum(l_sum, axis=0)
@@ -478,13 +491,16 @@ def _splitK_reduce(
                off_k * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE))
     tl.store(Out_ptr, acc_out)
 
+    # log constant
+    log2_e = 1.44269504
+
     # Store lse
     l_ptrs = LSE + off_zhg * stride_lse_zhg + off_m
     if IS_CAUSAL:
-        lse = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
+        lse = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / log2_e, g_m)
         tl.store(l_ptrs, lse)
     else:
-        tl.store(l_ptrs, (g_m + tl.math.log2(g_sum)) / 1.44269504)
+        tl.store(l_ptrs, (g_m + tl.math.log2(g_sum)) / log2_e)
 
 
 def quantize_kv_int4(k: torch.Tensor, num_groups: int = 1) -> torch.Tensor:
@@ -578,8 +594,40 @@ class _attention(torch.autograd.Function):
     NAME = "triton_splitKF"
 
     @staticmethod
-    def forward(cls, q, k, v, input_metadata):
+    def forward(cls, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, input_metadata: MetaData):
         original_layout = input_metadata.layout
+
+        # Rotary Embedding Implementation
+        if torch.is_tensor(input_metadata.rotary_cos) and torch.is_tensor(input_metadata.rotary_sin):
+            if input_metadata.causal or input_metadata.local:
+                q_ro = apply_rotary_emb(
+                    q,
+                    input_metadata.rotary_cos,
+                    input_metadata.rotary_sin,
+                    seqlen_offsets=input_metadata.cache_seqlens,
+                    interleaved=input_metadata.rotary_interleaved,
+                )
+            else:
+                q_ro = rearrange(
+                    apply_rotary_emb(
+                        rearrange(q, "b s h d -> b 1 (s h) d"),
+                        input_metadata.rotary_cos,
+                        input_metadata.rotary_sin,
+                        seqlen_offsets=input_metadata.cache_seqlens,
+                        interleaved=input_metadata.rotary_interleaved,
+                    ),
+                    "b 1 (s h) d -> b s h d",
+                    s=input_metadata.max_seqlens_q,
+                )
+            k_ro = apply_rotary_emb(
+                input_metadata.k_new,
+                input_metadata.rotary_cos,
+                input_metadata.rotary_sin,
+                seqlen_offsets=input_metadata.cache_seqlens,
+                interleaved=input_metadata.rotary_interleaved,
+            )
+
+            q, input_metadata.k_new = q_ro.to(q.dtype), k_ro.to(q.dtype)
 
         # kernels expects "bsghd"
         if input_metadata.layout == "bshd":
@@ -673,6 +721,8 @@ class _attention(torch.autograd.Function):
             Cache_seqlens=cache_seqlens,
             Cache_batch_idx=input_metadata.cache_batch_idx,
             Alibi_slopes=input_metadata.alibi_slopes,
+            Rotary_cos = input_metadata.rotary_cos,
+            Rotary_sin = input_metadata.rotary_sin,
             **_strides(q, "qz", "qm", "qg", "qh", "qd"),
             **_strides(k, "kz", "kn", "kg", "kh", "kd"),
             **_strides(v, "vz", "vn", "vg", "vh", "vd"),
@@ -700,6 +750,8 @@ class _attention(torch.autograd.Function):
             IS_GQA=input_metadata.is_gqa,
             IS_CAUSAL=input_metadata.causal,
             USE_ALIBI=False if input_metadata.alibi_slopes is None else True,
+            USE_ROTARY=False if input_metadata.rotary_cos is None or input_metadata.rotary_sin is None else True,
+            ROTARY_INTERLEAVED = True if input_metadata.rotary_interleaved else False,
             num_warps=num_warps,
             num_stages=1,
         )

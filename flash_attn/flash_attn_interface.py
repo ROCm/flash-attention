@@ -1154,15 +1154,20 @@ def flash_attn_with_kvcache(
     v=None,
     rotary_cos=None,
     rotary_sin=None,
+    rotary_cos_k=None,
+    rotary_sin_k=None,
+    rotary_interleaved=True,
+    rotary_inplace=False,
+    rotary_conjugate=False,
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
+    local=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
-    rotary_interleaved=True,
     alibi_slopes=None,
     num_splits=0,
     return_softmax_lse=False,
@@ -1254,6 +1259,7 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    # assert ALIBI is not ROTARY ?
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1275,6 +1281,12 @@ def flash_attn_with_kvcache(
         cache_seqlens,
         rotary_cos,
         rotary_sin,
+        rotary_cos_k,
+        rotary_sin_k,
+        rotary_interleaved,
+        rotary_inplace,
+        rotary_conjugate,
+        cache_seqlens,
         cache_batch_idx,
         cache_leftpad,
         block_table,
@@ -1282,10 +1294,10 @@ def flash_attn_with_kvcache(
         None,
         softmax_scale,
         causal,
+        local,
         window_size[0],
         window_size[1],
         softcap,
-        rotary_interleaved,
         num_splits,
     )
     return (out, softmax_lse) if return_softmax_lse else out

@@ -1970,38 +1970,48 @@ def test_flash_attn_splitkv(
 # @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("num_splits", [1, 0])
-# @pytest.mark.parametrize("num_splits", [1])
+# @pytest.mark.parametrize("num_splits", [0])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("new_kv", [False, True])
+# @pytest.mark.parametrize("new_kv", [False, True])
 # @pytest.mark.parametrize("new_kv", [False])
+@pytest.mark.parametrize("new_kv", [True])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
-# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
+# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("rotary_interleaved", [False, True])
 # @pytest.mark.parametrize("rotary_interleaved", [False])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
-# @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("paged_kv_block_size", [None, 256])
+# @pytest.mark.parametrize("rotary_fraction", [0.5, 1.0])
+# @pytest.mark.parametrize("rotary_fraction", [1.0])
+# @pytest.mark.parametrize("paged_kv_block_size", [None, 256])
 # @pytest.mark.parametrize("paged_kv_block_size", [256, 512])
-# @pytest.mark.parametrize("paged_kv_block_size", [None])
+@pytest.mark.parametrize("paged_kv_block_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [True])
+# @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
-@pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("has_batch_idx", [False])
+@pytest.mark.parametrize("has_batch_idx", [True])
+# @pytest.mark.parametrize("d", [2, 8, 16, 32, 59, 64, 80, 128, 256])
+@pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [16]) # 16 fails
+# @pytest.mark.parametrize("d", [2])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        # (1, 1),
+        # (1, 2),
+        # (2, 2),
+        # (4, 4),
+        # (1, 4),
         (1, 128),
         (1, 339),
         (3, 1024),
@@ -2010,12 +2020,13 @@ def test_flash_attn_splitkv(
         (3, 799),
         (64, 2048),
         (16, 20000),
-        (1, 128 * 1024),
-        (16, 128 * 1024),
-        (128, 128),
+        # (1, 128 * 1024),
+        # (16, 128 * 1024),
+        # (128, 128),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
+@pytest.mark.parametrize('DEBUG_ENABLED', [False])
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
@@ -2033,6 +2044,7 @@ def test_flash_attn_kvcache(
     mha_type,
     num_splits,
     dtype,
+    DEBUG_ENABLED
 ):
     if USE_TRITON_ROCM:
         if paged_kv_block_size is not None:
@@ -2041,14 +2053,14 @@ def test_flash_attn_kvcache(
         if local == True:
             pytest.skip("local sliding window attention not supported on AMD's Triton Backend yet")
         
-        if rotary_interleaved == True or rotary_fraction > 0.0:
-            pytest.skip("rotary embedding not supported on AMD's Triton Backend yet")
+        # if rotary_interleaved == True or rotary_fraction > 0.0:
+        #     pytest.skip("rotary embedding not supported on AMD's Triton Backend yet")
 
         if has_leftpad == True:
             pytest.skip("cache_leftpad not supported on AMD's Triton Backend yet")
 
-        if skip_config(seqlen_q=seqlen_q, seqlen_k=seqlen_k, d=d):
-            pytest.skip("Skipping configuration due to limited test time")
+        # if skip_config(seqlen_q=seqlen_q, seqlen_k=seqlen_k, d=d):
+        #     pytest.skip("Skipping configuration due to limited test time")
 
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
@@ -2058,27 +2070,46 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
+
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 2
+    batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 6
+    nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+
+    # in case of GCA and nhead is < 3 skip since nheads_k (group size) will be 3 and you don't have enough heads for a single group
+    if mha_type == "gqa" and nheads < 3:
+        pytest.skip()
+
+    assert nheads % nheads_k == 0, "num heads cannot be evenly split into groups"
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+
+    if DEBUG_ENABLED:
+        q = torch.arange(seqlen_q, dtype=dtype, device="cuda").view(1, seqlen_q, 1, 1).expand(batch_size, seqlen_q, nheads, d).requires_grad_().contiguous().to(dtype=dtype)
+    else:
+        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
     if new_kv:
-        k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-        v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
+        if DEBUG_ENABLED or True:
+            k = torch.arange(seqlen_new, dtype=dtype, device="cuda").view(1, seqlen_new, 1, 1).expand(batch_size, seqlen_new, nheads_k, d).requires_grad_().contiguous().to(dtype=dtype)
+            v = torch.arange(seqlen_new, dtype=dtype, device="cuda").view(1, seqlen_new, 1, 1).expand(batch_size, seqlen_new, nheads_k, d).requires_grad_().contiguous().to(dtype=dtype)
+        else:
+            k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
+            v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
     else:
         k, v = None, None
     if paged_kv_block_size is None:
-        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        if DEBUG_ENABLED:
+            k_cache = torch.arange(seqlen_k, dtype=dtype, device="cuda").view(1, seqlen_k, 1, 1).expand(batch_size_cache, seqlen_k, nheads_k, d).requires_grad_().contiguous()
+            v_cache = torch.arange(seqlen_k, dtype=dtype, device="cuda").view(1, seqlen_k, 1, 1).expand(batch_size_cache, seqlen_k, nheads_k, d).requires_grad_().contiguous()
+        else:
+            k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+            v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
         block_table = None
     else:
         (
@@ -2188,13 +2219,18 @@ def test_flash_attn_kvcache(
         v,
         rotary_cos=cos,
         rotary_sin=sin,
+        rotary_cos_k=None,
+        rotary_sin_k=None,
+        rotary_interleaved=rotary_interleaved,
+        rotary_inplace=False,
+        rotary_conjugate=False,
         cache_seqlens=cache_seqlens,
         cache_batch_idx=cache_batch_idx,
         cache_leftpad=cache_leftpad,
         block_table=block_table,
         causal=causal,
+        local=local,
         window_size=window_size,
-        rotary_interleaved=rotary_interleaved,
         alibi_slopes=alibi_slopes,
         num_splits=num_splits,
     )

@@ -37,9 +37,18 @@ class MetaData():
     bias = None
     alibi_slopes = None
     causal = False
+    local = False
     num_contexts = 0
     varlen = False
     layout = None
+    rotary_cos = None
+    rotary_sin = None
+    rotary_cos_k = None         # cos/sin_k is cos/sin meant specifically for vector k. It's when we want to deliberately rotate each vector independently?
+    rotary_sin_k = None
+    rotary_interleaved = False
+    rotary_seqlen_offsets = None
+    rotary_inplace = False
+    rotary_conjugate = False
     cache_seqlens = None
     cache_batch_idx = None
     new_kv = False
@@ -58,9 +67,18 @@ class MetaData():
                 f"  bias={self.bias},\n"
                 f"  alibi_slopes={self.alibi_slopes},\n"
                 f"  causal={self.causal},\n"
+                f"  local={self.local},\n"
                 f"  num_contexts={self.num_contexts},\n"
                 f"  varlen={self.varlen},\n"
                 f"  layout={self.layout},\n"
+                f"  rotary_cos={self.rotary_cos},\n"
+                f"  rotary_sin={self.rotary_sin},\n"
+                f"  rotary_cos={self.rotary_cos_k},\n"
+                f"  rotary_sin={self.rotary_sin_k},\n"
+                f"  rotary_interleaved={self.rotary_interleaved},\n"
+                f"  rotary_seqlen_offsets={self.rotary_seqlen_offsets},\n"
+                f"  rotary_inplace={self.rotary_inplace},\n"
+                f"  rotary_conjugate={self.rotary_conjugate},\n"
                 f"  cache_seqlens={self.cache_seqlens},\n"
                 f"  cache_batch_idx={self.cache_batch_idx},\n"
                 f"  new_kv={self.new_kv},\n"
@@ -101,8 +119,27 @@ class MetaData():
         assert alibi_slopes.shape[1] == nheads
         self.alibi_slopes = alibi_slopes
 
+    def need_rotary(self, rotary_cos, rotary_sin, rotary_cos_k, rotary_sin_k, rotary_interleaved, rotary_seqlen_offsets, rotary_inplace, rotary_conjugate):
+        assert rotary_cos.is_cuda
+        assert rotary_sin.is_cuda
+        assert rotary_cos.shape == rotary_sin.shape, "rotary_sin and rotary_cos shapes must match"
+        assert rotary_cos.dim() == 2 and rotary_sin.dim() == 2
+        assert rotary_interleaved is not None
+        self.rotary_cos = rotary_cos
+        self.rotary_sin = rotary_sin
+        self.rotary_cos_k = rotary_cos_k
+        self.rotary_sin_k = rotary_sin_k
+        self.rotary_interleaved = rotary_interleaved
+        self.rotary_seqlen_offsets = rotary_seqlen_offsets
+        self.rotary_inplace = rotary_inplace
+        self.rotary_conjugate = rotary_conjugate
+
+
     def need_causal(self):
         self.causal = True
+
+    def need_local(self):
+        self.local = True
 
     def need_dropout(self, dropout_p, return_encoded_softmax):
         self.dropout_p = dropout_p
@@ -135,6 +172,8 @@ class MetaData():
         assert (nheads_q % nheads_k) == 0
         assert self.layout is not None
         assert self.layout == 'thd' or not self.varlen
+        assert not (torch.is_tensor(self.rotary_cos) and not torch.is_tensor(self.rotary_sin)), "rotary_sin and rotary_cos must either both be None or both be Tensors"
+        assert not (torch.is_tensor(self.rotary_cos_k) and not torch.is_tensor(self.rotary_sin_k)), "rotary_sin_k and rotary_cos_k must either both be None or both be Tensors"
 
 
 @triton.jit
