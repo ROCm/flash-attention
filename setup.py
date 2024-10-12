@@ -305,10 +305,14 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     )
 elif not SKIP_CUDA_BUILD and IS_ROCM:
     ck_dir = "csrc/composable_kernel"
+    
 
     #use codegen get code dispatch
     if not os.path.exists("./build"):
         os.makedirs("build")
+
+    #WA for hipModuleLoadData 
+    os.system(f"sed -i 's/fmha_bwd_ext_kernel impl/static thread_local fmha_bwd_ext_kernel impl/g' {ck_dir}/example/ck_tile/01_fmha/codegen/ops/fmha_bwd.py")
 
     os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd --output_dir build --receipt 2")
     os.system(f"{sys.executable} {ck_dir}/example/ck_tile/01_fmha/generate.py -d fwd_appendkv --output_dir build --receipt 2")
@@ -356,7 +360,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
                        "csrc/flash_attn_ck/mha_fwd.cu",
                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                       "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+                       "csrc/flash_attn_ck/mha_varlen_fwd.cu"]
+    renamed_sources += glob.glob(f"build/fmha_*wd*.cu")
+    renamed_sources += glob.glob(f"{ck_dir}/example/ck_tile/01_fmha/hsaco/*.cpp")
 
     cc_flag += ["-O3","-std=c++17",
                 "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
@@ -378,7 +384,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
     hip_version = get_hip_version()
     if hip_version > Version('5.7.23302'):
-        cc_flag += ["-fno-offload-uniform-block"]
+        cc_flag += ["-fno-offload-uniform-block", "-Wno-undefined-func-template"]
     if hip_version > Version('6.1.40090'):
         cc_flag += ["-mllvm", "-enable-post-misched=0"]
     if hip_version > Version('6.2.41132'):

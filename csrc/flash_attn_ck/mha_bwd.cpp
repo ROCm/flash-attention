@@ -2,6 +2,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
+#include <cstdlib>  // getenv
 #include "flash_common.hpp"
 
 #include "fmha_bwd.hpp"
@@ -25,9 +26,9 @@ fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                            false, // s_randval
                            deterministic,
                            true, // uses_ext_asm
-                           true, // is_asm_atomic_fp32
+                           false, // is_asm_atomic_fp32
                            false, // is_asm_no_coex
-                           false}; // is_asm_rtz_cvt
+                           true}; // is_asm_rtz_cvt
 }
 
 fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
