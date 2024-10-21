@@ -61,8 +61,12 @@ jobs:
       - name: Flash Attention Tests
         run: |
           export FLASH_ATTENTION_USE_TRITON_ROCM="TRUE"
-          pytest tests/test_flash_attn.py
+          pytest tests/test_flash_attn_triton.py
       - name: AMD Kernel Tests
         run: |
-          pytest -v -s flash_attn/flash_attn_triton_kernel_decode_amd.py::test_op_fwd
-          pytest -v -s flash_attn/flash_attn_triton_kernel_prefill_amd.py
+          export FLASH_ATTENTION_USE_TRITON_ROCM="TRUE"
+          pytest -v -s flash_attn/flash_attn_triton_amd/test.py
+      - name: AMD Kernel Bench
+        run: |
+          export FLASH_ATTENTION_USE_TRITON_ROCM="TRUE"
+          python flash_attn/flash_attn_triton_amd/bench.py
