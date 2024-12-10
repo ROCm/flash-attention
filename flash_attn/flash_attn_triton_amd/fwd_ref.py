@@ -1,10 +1,23 @@
 import torch
 import math
-from .utils import DEBUG
+from .utils import create_scale_tensors, check_is_fp8, DEBUG
 
 DEBUG_CORE = False
 
-def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2):
+def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, layout, dropout_p, philox_seed, philox_offset, use_exp2):
+    is_fp8 = check_is_fp8(q)
+    if is_fp8:
+        # if qkv are fp8, then find scaling factor for quantization
+        q_scale, k_scale, v_scale = create_scale_tensors(q, k, v, SCALE_PER_HEAD=True, layout=layout) # TODO: if SCALE_PER_HEAD: within the kernel itself just compute qkv_scale = tl.max(q or k or v)
+        q_scale_stride_z = q_scale.stride(0)
+        kv_scale_stride_z = k_scale.stride(0)
+
+        # scale qkv tensors if FP8
+        q = q / q_scale
+        k = k / k_scale
+        v = v / v_scale
+    else:
+        q_scale = k_scale = v_scale = 1
     if DEBUG_CORE:
         print()
         print("attention_forward_core_ref_impl")
@@ -17,6 +30,11 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
         print("philox_seed:", philox_seed)
         print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
+        print('layout:', layout)
+        print('is_fp8:', is_fp8)
+        print('q_scale:', q_scale)
+        print('k_scale:', k_scale)
+        print('v_scale:', v_scale)
 
     # cast to float32
     q = q.to(torch.float32)
@@ -24,7 +42,10 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
     v = v.to(torch.float32)
     
     # Compute attention scores
-    attention_scores = torch.matmul(q, k.transpose(-2, -1))
+    if is_fp8:
+        attention_scores = torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32)) * q_scale * v_scale
+    else:
+        attention_scores = torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32))
     if DEBUG_CORE:
         print("attention_scores:", attention_scores, attention_scores.shape)
 
@@ -129,7 +150,10 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
 
     # Compute output
-    o = torch.matmul(p, v)
+    if is_fp8:
+        o = torch.matmul(p, v.to(torch.float32)) * v_scale
+    else:
+        o = torch.matmul(p, v)
     if DEBUG_CORE:
         print("o:", o, o.shape)
 
@@ -176,7 +200,7 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
 
     # Call the core attention function
     o, softmax_lse, sd_mask = attention_forward_core_ref_impl(
-        q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2
+        q, k, v, sm_scale, causal, layout, dropout_p, philox_seed, philox_offset, use_exp2
     )
 
     if group_size != 1:
@@ -278,7 +302,7 @@ def attention_varlen_forward_pytorch_ref_impl(
             v_i = v_i.reshape(nheads_k, seqlen_k, head_dim)
 
         # Call the core attention function for this sequence
-        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2)
+        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, layout, dropout_p, philox_seed, philox_offset, use_exp2)
 
         # Reshape outputs back to original dimensions
         if group_size != 1:

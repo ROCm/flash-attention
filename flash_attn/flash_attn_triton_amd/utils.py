@@ -11,6 +11,7 @@ import triton.language as tl
 AUTOTUNE = os.environ.get('FLASH_ATTENTION_TRITON_AMD_AUTOTUNE', '0').lower() in ('1', 'true', 'yes')
 DEBUG = os.environ.get('FLASH_ATTENTION_TRITON_AMD_DEBUG', '0').lower() in ('1', 'true', 'yes')
 PERF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_PERF', '0').lower() in ('1', 'true', 'yes')
+REMOVE_QUANTIZATION_SCALING = os.environ.get('FLASH_ATTENTION_TRITON_AMD_REMOVE_QUANT_SCALE', '0').lower() in ('1', 'true', 'yes')
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if USE_TRITON_ROCM: # TODO remove this
     random.seed(42)
@@ -153,17 +154,20 @@ def input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device="cud
 
     if DEBUG_INPUT:
         if layout == "bhsd":
-            q = torch.arange(N_CTX_Q, dtype=dtype, device=device).view(1, 1, N_CTX_Q, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
-            k = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
-            v = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            q = torch.arange(N_CTX_Q, dtype=torch.float32, device=device).view(1, 1, N_CTX_Q, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
+            k = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            v = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
         elif layout == "bshd":
-            q = torch.arange(N_CTX_Q, dtype=dtype, device=device).view(1, N_CTX_Q, 1, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
-            k = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
-            v = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            q = torch.arange(N_CTX_Q, dtype=torch.float32, device=device).view(1, N_CTX_Q, 1, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
+            k = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            v = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
     else:
-        q = torch.randn(q_tensor_shape, dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn(k_tensor_shape, dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn(k_tensor_shape, dtype=dtype, device=device, requires_grad=True)
+        q = torch.randn(q_tensor_shape, dtype=torch.float32, device=device, requires_grad=True)
+        k = torch.randn(k_tensor_shape, dtype=torch.float32, device=device, requires_grad=True)
+        v = torch.randn(k_tensor_shape, dtype=torch.float32, device=device, requires_grad=True)
+
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    q_fp32, k_fp32, v_fp32 = q.to(torch.float32), k.to(torch.float32), v.to(torch.float32)
     
     if DEBUG_INPUT:
         sm_scale = 1
@@ -173,7 +177,7 @@ def input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device="cud
     input_metadata.max_seqlens_q = N_CTX_Q
     input_metadata.max_seqlens_k = N_CTX_K
     input_metadata.layout = layout
-    return q, k, v, input_metadata
+    return q, k, v, q_fp32, k_fp32, v_fp32, input_metadata
 
 
 def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device="cuda", equal_seqlens=False, DEBUG_INPUT=False):
@@ -337,3 +341,83 @@ def is_cdna():
 
 def is_rdna():
     return is_hip() and get_arch() in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201")
+
+def check_is_fp8(x: torch.Tensor):
+    if REMOVE_QUANTIZATION_SCALING:
+        return False # makes all methods believe they aren't working with fp8s, so no scaling is applied
+    
+    fp8_types = {
+        torch.float8_e4m3fnuz,
+        torch.float8_e4m3fn,  
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }
+    return x.dtype in fp8_types
+
+def create_scale_tensors(q, k, v, SCALE_PER_HEAD=False, layout='bshd'):
+    """
+    Create scale tensors for q and k based on the scaling configuration.
+    
+    Args:
+    q (torch.Tensor): Query tensor
+    k (torch.Tensor): Key tensor
+    v (torch.Tensor): Value tensor
+    SCALE_PER_HEAD (bool): Whether to compute scale per head or globally
+    
+    Returns:
+    tuple: (q_scale, k_scale, v_scale) tensors
+    """
+    is_fp8 = check_is_fp8(q)
+
+    if layout == 'bhsd':
+        seqlen_loc = 2
+        dim_loc = 3
+    elif layout == 'bshd':
+        seqlen_loc = 1
+        dim_loc = 3
+    else:
+        # is varlen
+        pass
+
+    is_varlen = layout == "thd"
+
+    # Handle float8 dtype special case
+    if is_fp8:
+        # Convert to float32 for scale computation
+        q_float32 = q.to(torch.float32)
+        k_float32 = k.to(torch.float32)
+        v_float32 = v.to(torch.float32)
+        
+        if SCALE_PER_HEAD:
+            if is_varlen:
+                assert False, "VARLEN NOT SUPPORTED FOR SCALE PER HEAD"
+            else:
+                # Compute max for each batch-head pair
+                q_scale = q_float32.abs().amax(dim=(seqlen_loc, dim_loc))  # Shape: (BATCH, HEAD) - computes mas across seqlen and dim
+                k_scale = k_float32.abs().amax(dim=(seqlen_loc, dim_loc))  # Shape: (BATCH, HEAD)
+                v_scale = v_float32.abs().amax(dim=(seqlen_loc, dim_loc))  # Shape: (BATCH, HEAD)
+        else:
+            # Compute global max and create a tensor of that value
+            q_global_max = q_float32.abs().max().item()
+            k_global_max = k_float32.abs().max().item()
+            v_global_max = v_float32.abs().max().item()
+            
+            # Create tensors filled with the global max
+            batch, _, head, _ = q.shape
+            q_scale = torch.full((batch, head), q_global_max, device=q.device)
+            k_scale = torch.full((batch, head), k_global_max, device=k.device)
+            v_scale = torch.full((batch, head), v_global_max, device=v.device)
+    else:
+        # For non-float8 dtypes, use a default scale of 1
+        if layout == 'bshd':
+            batch, _, head, _ = q.shape
+        elif layout == 'bhsd':
+            batch, head, _, _ = q.shape
+        else:
+            assert False, "VARLEN NOT SUPPORTED"
+        q_scale = torch.ones((batch, head), device=q.device)
+        k_scale = torch.ones((batch, head), device=k.device)
+        v_scale = torch.ones((batch, head), device=v.device)
+    
+    return q_scale*0.025, k_scale*0.025, v_scale*0.025
+
