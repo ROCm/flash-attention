@@ -287,6 +287,8 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
                 bool is_rotary_interleaved, // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits)
 {
+    TORCH_CHECK(false, "vllm layout does not support mha_fwd_kvcache for now");
+
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
