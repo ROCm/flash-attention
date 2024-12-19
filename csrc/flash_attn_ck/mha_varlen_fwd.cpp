@@ -446,7 +446,8 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     }
 
     int num_splits = 0;
-    num_splits = flash::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size, 0, num_splits);
+    num_splits = flash::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size, head_size, 
+        /*p_drop=*/0, /*is_prefill=*/true, num_splits);
     TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
     TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
 
