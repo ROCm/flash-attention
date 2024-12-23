@@ -11,6 +11,7 @@ import triton.language as tl
 AUTOTUNE = os.environ.get('FLASH_ATTENTION_TRITON_AMD_AUTOTUNE', '0').lower() in ('1', 'true', 'yes')
 DEBUG = os.environ.get('FLASH_ATTENTION_TRITON_AMD_DEBUG', '0').lower() in ('1', 'true', 'yes')
 PERF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_PERF', '0').lower() in ('1', 'true', 'yes')
+REMOVE_QUANTIZATION_SCALING = os.environ.get('FLASH_ATTENTION_TRITON_AMD_REMOVE_QUANT_SCALE', '0').lower() in ('1', 'true', 'yes')
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if USE_TRITON_ROCM: # TODO remove this
     random.seed(42)
@@ -153,17 +154,19 @@ def input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, layout, device="cud
 
     if DEBUG_INPUT:
         if layout == "bhsd":
-            q = torch.arange(N_CTX_Q, dtype=dtype, device=device).view(1, 1, N_CTX_Q, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
-            k = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
-            v = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            q = torch.arange(N_CTX_Q, dtype=torch.float32, device=device).view(1, 1, N_CTX_Q, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
+            k = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            v = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, 1, N_CTX_K, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
         elif layout == "bshd":
-            q = torch.arange(N_CTX_Q, dtype=dtype, device=device).view(1, N_CTX_Q, 1, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
-            k = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
-            v = torch.arange(N_CTX_K, dtype=dtype, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            q = torch.arange(N_CTX_Q, dtype=torch.float32, device=device).view(1, N_CTX_Q, 1, 1).expand(*q_tensor_shape).contiguous().requires_grad_()
+            k = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
+            v = torch.arange(N_CTX_K, dtype=torch.float32, device=device).view(1, N_CTX_K, 1, 1).expand(*k_tensor_shape).contiguous().requires_grad_()
     else:
-        q = torch.randn(q_tensor_shape, dtype=dtype, device=device, requires_grad=True)
-        k = torch.randn(k_tensor_shape, dtype=dtype, device=device, requires_grad=True)
-        v = torch.randn(k_tensor_shape, dtype=dtype, device=device, requires_grad=True)
+        q = torch.randn(q_tensor_shape, dtype=torch.float32, device=device, requires_grad=True)
+        k = torch.randn(k_tensor_shape, dtype=torch.float32, device=device, requires_grad=True)
+        v = torch.randn(k_tensor_shape, dtype=torch.float32, device=device, requires_grad=True)
+
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
     
     if DEBUG_INPUT:
         sm_scale = 1
@@ -201,19 +204,21 @@ def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device="cuda
 
     if DEBUG_INPUT:
         # Initialize q, k, v with deterministic values
-        q = torch.arange(total_q, dtype=dtype, device=device).view(total_q, 1, 1)
+        q = torch.arange(total_q, dtype=torch.float32, device=device).view(total_q, 1, 1)
         q = q.expand(total_q, HQ, D_HEAD).contiguous().requires_grad_()
-        k = torch.arange(total_k, dtype=dtype, device=device).view(total_k, 1, 1)
+        k = torch.arange(total_k, dtype=torch.float32, device=device).view(total_k, 1, 1)
         k = k.expand(total_k, HK, D_HEAD).contiguous().requires_grad_()
-        v = torch.arange(total_k, dtype=dtype, device=device).view(total_k, 1, 1)
+        v = torch.arange(total_k, dtype=torch.float32, device=device).view(total_k, 1, 1)
         v = v.expand(total_k, HK, D_HEAD).contiguous().requires_grad_()
         sm_scale = 1
     else:
         # Initialize q, k, v with random values
-        q = torch.randn((total_q, HQ, D_HEAD), dtype=dtype, device=device).requires_grad_()
-        k = torch.randn((total_k, HK, D_HEAD), dtype=dtype, device=device).requires_grad_()
-        v = torch.randn((total_k, HK, D_HEAD), dtype=dtype, device=device).requires_grad_()
+        q = torch.randn((total_q, HQ, D_HEAD), dtype=torch.float32, device=device).requires_grad_()
+        k = torch.randn((total_k, HK, D_HEAD), dtype=torch.float32, device=device).requires_grad_()
+        v = torch.randn((total_k, HK, D_HEAD), dtype=torch.float32, device=device).requires_grad_()
         sm_scale = D_HEAD ** -0.5
+
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
 
     input_metadata = MetaData(sm_scale=sm_scale)
     input_metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k)
@@ -337,3 +342,131 @@ def is_cdna():
 
 def is_rdna():
     return is_hip() and get_arch() in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201")
+
+
+def check_is_fp8(x: torch.Tensor):
+    if REMOVE_QUANTIZATION_SCALING:
+        return False # makes all methods believe they aren't working with fp8s, so no scaling is applied
+    
+    fp8_types = {
+        torch.float8_e4m3fnuz,
+        torch.float8_e4m3fn,  
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }
+    return x.dtype in fp8_types
+
+
+def create_scale_tensors(
+    q, k, v, layout,
+    cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None,
+    scale_per_head=False, eps=1e-9
+):
+    """
+    Create scale tensors for q, k and v based on the scaling configuration.
+
+    Args:
+    q (torch.Tensor): Query tensor.
+    k (torch.Tensor): Key tensor.
+    v (torch.Tensor): Value tensor.
+    layout (str): Tensor layout, can be "bhsd", "bshd" or "thd".
+    cu_seqlens_q (?): Used with "thd" varlen layout.
+    cu_seqlens_k (?): Used with "thd" varlen layout.
+    max_seqlen_q (?): Used with "thd" varlen layout.
+    max_seqlen_k (?): Used with "thd" varlen layout.
+    scale_per_head (bool): Whether to compute scale per head or globally. Defaults to False.
+    eps (float): If the maximum absolute value of a tensor is zero, this contant avoids
+                 division by zero while scaling. Defaults to 1e-9.
+
+    Returns:
+    tuple: (q_scale, k_scale, v_scale, p_scale, p_inv_scale) tensors
+    To perform fp8 quantization you should divide by scale factor (x_quant = x / x_scale).
+    To perform fp8 dequantization, your should multiply by scale factor (x = x_quant * x_scale).
+    p_scale and p_inv_scale are related to intermediate FA computation
+    p = softmax(matmul(q, transpose(k))).
+    All scale tensors are float32 ones.
+    """
+    assert layout in ["bhsd", "bshd", "thd"], "Unknow layout."
+    is_varlen = layout == "thd"
+    if is_varlen:
+        assert cu_seqlens_q is not None, "cu_seqlens_q is required for varlen layout."
+        assert cu_seqlens_k is not None, "cu_seqlens_k is required for varlen layout."
+        assert max_seqlen_q is not None, "max_seqlen_q is required for varlen layout."
+        assert max_seqlen_k is not None, "max_seqlen_k is required for varlen layout."
+
+    is_fp8 = check_is_fp8(q) or check_is_fp8(k) or check_is_fp8(v)
+    batch, head_q, head_k, head_size, max_seqlen_q, max_seqlen_k = get_shape_from_layout(
+        q, k, layout,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+    )
+
+    if not is_fp8:
+        # For non-float8 dtypes, use a default scale of 1.
+        q_scale = torch.ones((batch, head_q), dtype=torch.float32, device=q.device)
+        k_scale = torch.ones((batch, head_k), dtype=torch.float32, device=k.device)
+        v_scale = torch.ones((batch, head_k), dtype=torch.float32, device=v.device)
+        # TODO: Which number of heads is the correct one? Q or KV?
+        p_scale = torch.ones((batch, head_q), dtype=torch.float32, device="cuda")
+        p_inv_scale = p_scale
+
+    else:
+        # Handle float8 dtype special case.
+
+        # Convert to float32 for scale computation.
+        q_float32 = q.detach().to(torch.float32)
+        k_float32 = k.detach().to(torch.float32)
+        v_float32 = v.detach().to(torch.float32)
+
+        if not scale_per_head:
+            # Handle global scaling.
+
+            # Compute global max and create a tensor of that value.
+            q_global_max = max(q_float32.abs().max().item(), eps)
+            k_global_max = max(k_float32.abs().max().item(), eps)
+            v_global_max = max(v_float32.abs().max().item(), eps)
+
+            q_scale = torch.full((batch, head_q), q_global_max, dtype=torch.float32, device=q.device)
+            k_scale = torch.full((batch, head_k), k_global_max, dtype=torch.float32, device=k.device)
+            v_scale = torch.full((batch, head_k), v_global_max, dtype=torch.float32, device=v.device)
+
+        else:
+            # Handle per batch / head scaling.
+
+            if is_varlen:
+                # TODO: varlen should be supported.
+                assert False, "varlen layout is still not supported for scale per head."
+
+            if layout == "bhsd":
+                seqlen_loc = 2
+                dim_loc = 3
+            elif layout == "bshd":
+                seqlen_loc = 1
+                dim_loc = 3
+
+            # Compute max for each batch-head pair.
+            # Compute max across seqlen and dim.
+            eps = torch.tensor(eps)
+            q_scale = torch.maximum(q_float32.abs().amax(dim=(seqlen_loc, dim_loc)), eps)  # Shape: (BATCH, HEAD)
+            k_scale = torch.maximum(k_float32.abs().amax(dim=(seqlen_loc, dim_loc)), eps)  # Shape: (BATCH, HEAD)
+            v_scale = torch.maximum(v_float32.abs().amax(dim=(seqlen_loc, dim_loc)), eps)  # Shape: (BATCH, HEAD)
+
+        # Divide max tensors by respective data type max.
+        fp8_max = {
+            dtype: torch.finfo(dtype).max
+            for dtype in [
+                torch.float8_e5m2,
+                torch.float8_e5m2fnuz,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ]
+        }
+        q_scale = q_scale / fp8_max[q.dtype]
+        k_scale = k_scale / fp8_max[k.dtype]
+        v_scale = v_scale / fp8_max[v.dtype]
+
+        # Compute p_scale.
+        # TODO: Which number of heads is the correct one? Q or KV?
+        p_scale = torch.full((batch, head_q), 1 / fp8_max[q.dtype], dtype=torch.float32, device="cuda")
+        p_inv_scale = 1 / p_scale
+
+    return q_scale, k_scale, v_scale, p_scale, p_inv_scale
