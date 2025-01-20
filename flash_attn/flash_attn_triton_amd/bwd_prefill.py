@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, get_strides_from_layout, write_dropout_mask, create_dropout_mask
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, arch_supports_fp8, get_shape_from_layout, get_strides_from_layout, write_dropout_mask, create_dropout_mask
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
@@ -12,9 +12,11 @@ def _bwd_preprocess_use_o(
     Out,
     DO,
     Delta,
+    DESCALE_O, DESCALE_DO,
     stride_oz, stride_oh, stride_om, stride_ok,
     stride_doz, stride_doh, stride_dom, stride_dok,
     stride_deltaz, stride_deltah, stride_deltam,
+    descale_o_stride_z, descale_do_stride_z,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -25,7 +27,8 @@ def _bwd_preprocess_use_o(
     N_CTX_Q: tl.constexpr,
     Z: tl.constexpr,
     H: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -33,6 +36,13 @@ def _bwd_preprocess_use_o(
     # Compute batch and head indices
     off_z = pid_bh // H
     off_h = pid_bh % H
+
+    # load scale factors if IS_FP8
+    if IS_FP8:
+        descale_o = tl.load(DESCALE_O + off_z * descale_o_stride_z + off_h)
+        descale_do = tl.load(DESCALE_DO + off_z * descale_do_stride_z + off_h)
+    else:
+        descale_o, descale_do = 1.0, 1.0
 
     if IS_VARLEN:
         # Compute sequence lengths for the current batch
@@ -70,7 +80,11 @@ def _bwd_preprocess_use_o(
     do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
 
     # compute delta
-    delta = tl.sum(o * do, axis=1)
+    if IS_FP8:
+        # descale delta if IS_FP8
+        delta = tl.sum(o * do, axis=1) * descale_o * descale_do
+    else:
+        delta = tl.sum(o * do, axis=1)
 
     # write-back delta
     delta_offset = Delta + off_z * stride_deltaz + off_h * stride_deltah + q_start * stride_deltam
@@ -126,6 +140,7 @@ def _bwd_kernel_one_col_block(
     dropout_p,
     philox_seed,
     batch_philox_offset,
+    descale_q, descale_k, descale_v, descale_do, descale_p, descale_ds,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     ACTUAL_BLOCK_DMODEL: tl.constexpr,
@@ -135,6 +150,7 @@ def _bwd_kernel_one_col_block(
     DROPOUT: tl.constexpr,
     USE_EXP2: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     if CAUSAL:
         # TODO: Causal can skip more blocks with something like lo = start_m * BLOCK_M
@@ -179,7 +195,11 @@ def _bwd_kernel_one_col_block(
 
         # recompute p = softmax(qk, dim=-1).T
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, tl.trans(k))
+        if IS_FP8:
+            # descale qk if IS_FP8
+            qk += tl.dot(q, tl.trans(k)) * descale_q * descale_k
+        else:
+            qk += tl.dot(q, tl.trans(k))
 
         if CAUSAL:
             col_offset = N_CTX_Q - N_CTX_K
@@ -223,13 +243,21 @@ def _bwd_kernel_one_col_block(
             # apply dropout mask
             p_drop = tl.where(dropout_mask, p, 0.0)
             p_drop_scaled = p_drop * dropout_scale
-            p_drop_scaled = p_drop_scaled.to(tl.float16)
+            p_drop_scaled = p_drop_scaled.to(do.type.element_ty)
 
             # compute dv
-            dv += tl.dot(tl.trans(p_drop_scaled), do)
+            if IS_FP8:
+                # scale p and descale dv if IS_FP8
+                dv += tl.dot(tl.trans(p_drop_scaled) * (1 / descale_p), do) * descale_p * descale_do
+            else:
+                dv += tl.dot(tl.trans(p_drop_scaled), do)
 
             # compute dp
-            dp_drop_scaled = tl.dot(do, tl.trans(v))
+            if IS_FP8:
+                # descale dp if IS_FP8
+                dp_drop_scaled = tl.dot(do, tl.trans(v)) * descale_do * descale_v
+            else:
+                dp_drop_scaled = tl.dot(do, tl.trans(v))
             dp = tl.where(dropout_mask, dp_drop_scaled, 0.0) * dropout_scale
 
             # compute ds
@@ -238,15 +266,22 @@ def _bwd_kernel_one_col_block(
             dscores_scaled = (p * (dp - delta_i[:, None]))
             ds = dscores_scaled * sm_scale
             ds = tl.where(p_mask, ds, 0.0)
-            ds = ds.to(tl.float16)
         else:
-            p = p.to(tl.float16)
+            p = p.to(do.type.element_ty)
 
             # compute dv
-            dv += tl.dot(tl.trans(p), do)
+            if IS_FP8:
+                # scale p and descale dv if IS_FP8
+                dv += tl.dot(tl.trans(p) * (1 / descale_p), do) * descale_p * descale_do
+            else:
+                dv += tl.dot(tl.trans(p), do)
 
             # compute dp
-            dp = tl.dot(do, tl.trans(v))
+            if IS_FP8:
+                # descale dp if IS_FP8
+                dp = tl.dot(do, tl.trans(v)) * descale_do * descale_v
+            else:
+                dp = tl.dot(do, tl.trans(v))
 
             # compute ds
             delta_ptrs = delta_offset + offs_m * stride_deltam
@@ -254,17 +289,28 @@ def _bwd_kernel_one_col_block(
             dscores_scaled = (p * (dp - delta_i[:, None]))
             ds = dscores_scaled * sm_scale
             ds = tl.where(p_mask, ds, 0.0)
-            ds = ds.to(tl.float16)
             
         # compute dk
-        dk += tl.dot(tl.trans(ds), q)
+        if IS_FP8:
+            # scale ds and descale dk if IS_FP8
+            dk += tl.dot((tl.trans(ds) * (1 / descale_ds)).to(q.type.element_ty), q) * descale_ds * descale_q
+        else:
+            dk += tl.dot(tl.trans(ds).to(q.type.element_ty), q)
 
         # compute dq
         if SEQUENCE_PARALLEL:
-            dq = tl.dot(ds, k)
+            if IS_FP8:
+                # scale ds and descale dq if IS_FP8
+                dq = tl.dot((ds * (1 / descale_ds)).to(k.type.element_ty), k) * descale_ds * descale_k
+            else:
+                dq = tl.dot(ds.to(k.type.element_ty), k)
         else:
             dq = tl.load(dq_ptrs, mask=q_mask, other=0.0)
-            dq += tl.dot(ds, k)
+            if IS_FP8:
+                # scale ds and descale dq if IS_FP8
+                dq += tl.dot((ds * (1 / descale_ds)).to(k.type.element_ty), k) * descale_ds * descale_k
+            else:
+                dq += tl.dot(ds.to(k.type.element_ty), k)
         tl.store(dq_ptrs, dq.to(Q.dtype.element_ty), mask=q_mask)
 
     # write-back dv and dk
@@ -294,6 +340,7 @@ def _bwd_kernel(
     L,
     Delta,
     Dropout_mask,
+    DESCALE_Q, DESCALE_K, DESCALE_V, DESCALE_DO, DESCALE_P, DESCALE_DS,
     stride_dq_all,
     stride_qz,
     stride_qh,
@@ -311,6 +358,7 @@ def _bwd_kernel(
     stride_deltah, 
     stride_deltam,
     stride_dropoutz, stride_dropouth, stride_dropoutm, stride_dropoutn,
+    descale_q_stride_z, descale_k_stride_z, descale_v_stride_z, descale_do_stride_z, descale_p_stride_z, descale_ds_stride_z,
     Z,
     HQ,
     HK,
@@ -332,6 +380,8 @@ def _bwd_kernel(
     DROPOUT: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     # program ids
     off_zh = tl.program_id(0)
@@ -340,7 +390,6 @@ def _bwd_kernel(
     off_z = off_zh // HQ
     off_hq = off_zh % HQ
 
-    GROUP_SIZE = HQ // HK
     if GROUP_SIZE != 1:
         off_hk = off_hq // GROUP_SIZE
     else:
@@ -361,6 +410,17 @@ def _bwd_kernel(
         k_start = 0
         N_CTX_Q = max_seqlen_q
         N_CTX_K = max_seqlen_k
+
+    # load scale factors if IS_FP8
+    if IS_FP8:
+        descale_q = tl.load(DESCALE_Q + off_z * descale_q_stride_z + off_hq)
+        descale_k = tl.load(DESCALE_K + off_z * descale_k_stride_z + off_hk)
+        descale_v = tl.load(DESCALE_V + off_z * descale_v_stride_z + off_hk)
+        descale_do = tl.load(DESCALE_DO + off_z * descale_do_stride_z + off_hq)
+        descale_p = tl.load(DESCALE_P + off_z * descale_p_stride_z + off_hq)
+        descale_ds = tl.load(DESCALE_DS + off_z * descale_ds_stride_z + off_hq)
+    else:
+        descale_q, descale_k, descale_v, descale_do, descale_p, descale_ds = 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
 
     # input tensor offsets
     q_offset = Q + off_z * stride_qz + off_hq * stride_qh + q_start * stride_qm
@@ -433,6 +493,7 @@ def _bwd_kernel(
             num_block_m,
             num_block_n,
             dropout_p, philox_seed, batch_philox_offset,
+            descale_q, descale_k, descale_v, descale_do, descale_p, descale_ds,
             BLOCK_M=BLOCK_M,
             BLOCK_DMODEL=BLOCK_DMODEL,
             ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
@@ -441,7 +502,8 @@ def _bwd_kernel(
             CAUSAL=CAUSAL,
             DROPOUT=DROPOUT,
             USE_EXP2=USE_EXP2,
-            GROUP_SIZE=GROUP_SIZE
+            GROUP_SIZE=GROUP_SIZE,
+            IS_FP8=IS_FP8,
         )
     else:
         for start_n in range(0, num_block_n):
@@ -490,6 +552,7 @@ def _bwd_kernel(
                 num_block_m,
                 num_block_n,
                 dropout_p, philox_seed, batch_philox_offset,
+                descale_q, descale_k, descale_v, descale_do, descale_p, descale_ds,
                 BLOCK_M=BLOCK_M,
                 BLOCK_DMODEL=BLOCK_DMODEL,
                 ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
@@ -498,7 +561,8 @@ def _bwd_kernel(
                 CAUSAL=CAUSAL,
                 DROPOUT=DROPOUT,
                 USE_EXP2=USE_EXP2,
-                GROUP_SIZE=GROUP_SIZE
+                GROUP_SIZE=GROUP_SIZE,
+                IS_FP8=IS_FP8,
             )
 
 
@@ -526,6 +590,13 @@ def attention_prefill_backward_triton_impl(
     philox_offset,
     use_exp2: bool,
     sequence_parallel = True,
+    descale_q=None,
+    descale_k=None,
+    descale_v=None,
+    descale_o=None,
+    descale_do=None,
+    descale_p=None,
+    descale_ds=None,
 ):
     if DEBUG:
         print()
@@ -552,6 +623,40 @@ def attention_prefill_backward_triton_impl(
         print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
         print("sequence_parallel:", sequence_parallel)
+
+    is_fp8 = arch_supports_fp8() and q.dtype in {torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e5m2fnuz}
+    if is_fp8:
+        # get batch strides for the kernel
+        descale_q_stride_z = descale_q.stride(0)
+        descale_k_stride_z = descale_k.stride(0)
+        descale_v_stride_z = descale_v.stride(0)
+        descale_o_stride_z = descale_o.stride(0)
+        descale_do_stride_z = descale_do.stride(0)
+        descale_p_stride_z = descale_p.stride(0)
+        descale_ds_stride_z = descale_ds.stride(0)
+    else:
+        # for non-fp8 types, use dummy values (no scaling needed)
+        descale_q = descale_k = descale_v = descale_o = descale_do = descale_p = descale_ds = 1
+        descale_q_stride_z = descale_k_stride_z = descale_v_stride_z = descale_o_stride_z = descale_do_stride_z = descale_p_stride_z = descale_ds_stride_z = 0
+
+    if DEBUG:
+        print("is_fp8:", is_fp8)
+        if is_fp8:
+            print(f"fp8_type_max: {torch.finfo(q.dtype).max}")
+        print("descale_q:", descale_q)
+        print("descale_k:", descale_k)
+        print("descale_v:", descale_v)
+        print("descale_o:", descale_o)
+        print("descale_do:", descale_do)
+        print("descale_p:", descale_p)
+        print("descale_ds:", descale_ds)
+        print("descale_q_stride_z:", descale_q_stride_z)
+        print("descale_k_stride_z:", descale_k_stride_z)
+        print("descale_v_stride_z:", descale_v_stride_z)
+        print("descale_o_stride_z:", descale_o_stride_z)
+        print("descale_do_stride_z:", descale_do_stride_z)
+        print("descale_p_stride_z:", descale_p_stride_z)
+        print("descale_ds_stride_z:", descale_ds_stride_z)
 
     # make contigious
     q = q.contiguous()
@@ -677,9 +782,11 @@ def attention_prefill_backward_triton_impl(
         o,
         do,
         delta,
+        descale_o, descale_do,
         stride_oz, stride_oh, stride_om, stride_ok,
         stride_oz, stride_oh, stride_om, stride_ok,
         stride_deltaz, stride_deltah, stride_deltam,
+        descale_o_stride_z, descale_do_stride_z,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -690,7 +797,8 @@ def attention_prefill_backward_triton_impl(
         N_CTX_Q=max_seqlen_q,
         Z=batch,
         H=nheads_q,
-        IS_VARLEN=is_varlen
+        IS_VARLEN=is_varlen,
+        IS_FP8=is_fp8,
     )
 
     if False:
@@ -742,12 +850,14 @@ def attention_prefill_backward_triton_impl(
         softmax_lse,
         delta,
         dropout_mask,
+        descale_q, descale_k, descale_v, descale_do, descale_p, descale_ds,
         stride_dq_all,
         stride_qz, stride_qh, stride_qm, stride_qk,
         stride_kz, stride_kh, stride_kn, stride_kk,
         stride_vz, stride_vh, stride_vn, stride_vk,
         stride_deltaz, stride_deltah, stride_deltam,
         stride_dropoutz, stride_dropouth, stride_dropoutm, stride_dropoutn,
+        descale_q_stride_z, descale_k_stride_z, descale_v_stride_z, descale_do_stride_z, descale_p_stride_z, descale_ds_stride_z,
         batch,
         nheads_q,
         nheads_k,
@@ -769,7 +879,9 @@ def attention_prefill_backward_triton_impl(
         num_warps=num_warps,
         num_stages=num_stages,
         waves_per_eu = waves_per_eu,
-        IS_VARLEN=is_varlen
+        IS_VARLEN=is_varlen,
+        GROUP_SIZE=nheads_q // nheads_k,
+        IS_FP8=is_fp8,
     )
 
     if sequence_parallel:

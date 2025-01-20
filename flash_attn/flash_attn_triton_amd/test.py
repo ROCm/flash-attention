@@ -735,7 +735,6 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
     torch.testing.assert_close(dq_ref_out, tri_out, atol=1e-3, rtol=0)
 
 
-
 @pytest.mark.parametrize(
     "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
     [
@@ -777,85 +776,144 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
 @pytest.mark.parametrize('DEBUG_INPUT', [False])
 @pytest.mark.skipif(not arch_supports_fp8(), reason="fp8 not supported on this device")
 def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
+    if HQ // HK != 1:
+        # TODO: fix this skip!
+        pytest.skip("Skipping MQA/GQA because bf16/fp8 do not support atomic_add.")
+
+    # common properties
     device = "cuda"
-    window_size =  (-1, -1)
+    window_size = (-1, -1)
     softcap = None
     alibi_slopes = None
     deterministic = False
     layout = "bshd"
 
-    q, k, v, metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, torch.float32, layout, device=device, DEBUG_INPUT=DEBUG_INPUT)
+    # data types
+    fp32_dtype = torch.float32
+    fp16_dtype = torch.bfloat16  # NOTE: use bfp16 becasue it's fp32 truncated
+    fp8_dtype = torch.float8_e4m3fnuz
+    fp8_max = torch.finfo(fp8_dtype).max
 
-    # NOTE: use bfp16 becasue it fp32 trunacted
-    # launch kernel in fp16
-    q_bfp16 = q.clone().to(torch.bfloat16)
-    k_bfp16 = k.clone().to(torch.bfloat16)
-    v_bfp16 = v.clone().to(torch.bfloat16)
-    out_bfp16, lse_bfp16, S_dmask_bfp16 = flash_attn_func(
-            q_bfp16,
-            k_bfp16,
-            v_bfp16,
-            dropout_p,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_attn_probs=True,
-        )
+    # generate input tensors
+    q, k, v, _ = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, fp32_dtype, layout, device=device, DEBUG_INPUT=DEBUG_INPUT)
+    if DEBUG_INPUT:
+        do = torch.ones_like(q).contiguous()
+    else:
+        do = torch.randn_like(q)
+
+    # launch fwd kernel in fp16
+    q_fp16 = q.clone().to(fp16_dtype)
+    k_fp16 = k.clone().to(fp16_dtype)
+    v_fp16 = v.clone().to(fp16_dtype)
+    out_fp16, lse_fp16, S_dmask_fp16 = flash_attn_func(
+        q_fp16,
+        k_fp16,
+        v_fp16,
+        dropout_p,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=True,
+    )
+
     if DEBUG:
-        print("out_bfp16", out_bfp16)
-        print("lse_bfp16", lse_bfp16)
-        print("S_dmask_bfp16", S_dmask_bfp16)
+        print("out_fp16", out_fp16)
+        print("lse_fp16", lse_fp16)
+        print("S_dmask_fp16", S_dmask_fp16)
 
-    # compute p for descaling
-    batch, _ , nheads_q, dim = q.shape
-    _, _ , nheads_k, _ = k.shape
+    # launch bwd kernel in fp16
+    do_fp16 = do.clone().to(fp16_dtype)
+    # TODO: store fp16 bwd results for comparison
+    out_fp16.backward(do_fp16)
 
     # compute max for each batch-head pair across seqlen and dim
     q_max = torch.maximum(q.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
     k_max = torch.maximum(k.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
     v_max = torch.maximum(v.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
+    out_fp32 = out_fp16.to(fp32_dtype)
+    out_max = torch.maximum(out_fp32.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
+    do_max = torch.maximum(do.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
+
+    # compute max p and max ds from a reference implementation
+    def max_p_ds():
+        q_r = q.transpose(1, 2).contiguous().reshape(Z * HQ, N_CTX_Q, D_HEAD)
+        k_r = k.transpose(1, 2).contiguous().reshape(Z * HK, N_CTX_K, D_HEAD)
+        v_r = v.transpose(1, 2).contiguous().reshape(Z * HK, N_CTX_K, D_HEAD)
+        o_r = out_fp16.transpose(1, 2).contiguous().reshape(Z * HQ, N_CTX_Q, D_HEAD).to(fp32_dtype)
+        lse_r = lse_fp16.reshape(Z * HQ, N_CTX_Q).to(fp32_dtype)
+        do_r = do.transpose(1, 2).contiguous().reshape(Z * HQ, N_CTX_Q, D_HEAD)
+        scores = torch.matmul(q_r, k_r.transpose(-2, -1)) * D_HEAD**-0.5
+        p = torch.exp(scores - lse_r.unsqueeze(-1))
+        dp = torch.matmul(do_r, v_r.transpose(-2, -1))
+        delta = torch.sum(o_r * do_r, axis=-1).unsqueeze(-1)
+        ds = p * (dp - delta) * D_HEAD**-0.5
+        return max(p.abs().max().item(), 1e-9), max(ds.abs().max().item(), 1e-9)
+    p_max, ds_max = max_p_ds()
+    if DEBUG:
+        print("p_max:", p_max)
+        print("ds_max:", ds_max)
 
     # scale values to fp8 range
-    type_max = torch.finfo(torch.float8_e4m3fnuz).max
-    q_fp8 = (q * type_max/ q_max).to(torch.float8_e4m3fnuz)
-    k_fp8 = (k * type_max/ k_max).to(torch.float8_e4m3fnuz)
-    v_fp8 = (v * type_max/ v_max).to(torch.float8_e4m3fnuz)
+    q_fp8 = (q * fp8_max / q_max).to(fp8_dtype)
+    k_fp8 = (k * fp8_max / k_max).to(fp8_dtype)
+    v_fp8 = (v * fp8_max / v_max).to(fp8_dtype)
+    out_fp8 = (out_fp32 * fp8_max / out_max).to(fp8_dtype)
+    do_fp8 = (do * fp8_max / do_max).to(fp8_dtype)
 
     # compute descale values
-    descale_q = q_max / type_max
-    descale_k = k_max / type_max
-    descale_v = v_max / type_max
-    descale_p = torch.full_like(descale_q, 1.0 / type_max, dtype=torch.float32, device=q.device)
+    descale_q = q_max / fp8_max
+    descale_k = k_max / fp8_max
+    descale_v = v_max / fp8_max
+    descale_out = out_max / fp8_max
+    descale_do = do_max / fp8_max
+    descale_p = torch.full_like(descale_q, p_max / fp8_max, dtype=fp32_dtype, device=q.device)
+    descale_ds = torch.full_like(descale_q, ds_max / fp8_max, dtype=fp32_dtype, device=q.device)
+    if DEBUG:
+        print("descale_q:", descale_q, descale_q.shape)
+        print("descale_k:", descale_k, descale_k.shape)
+        print("descale_v:", descale_v, descale_v.shape)
+        print("descale_out:", descale_out, descale_out.shape)
+        print("descale_do:", descale_do, descale_do.shape)
+        print("descale_p:", descale_p, descale_p.shape)
+        print("descale_ds:", descale_ds, descale_ds.shape)
 
-    # launch kernel in fp8
+    # launch fwd kernel in fp8
     out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_func(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            dropout_p,
-            causal=causal,
-            window_size=window_size,
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_attn_probs=True,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
-            descale_p=descale_p,
-        )
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        dropout_p,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=True,
+        descale_q=descale_q,
+        descale_k=descale_k,
+        descale_v=descale_v,
+        descale_o=descale_out,
+        descale_do=descale_do,
+        descale_p=descale_p,
+        descale_ds=descale_ds,
+    )
     if DEBUG:
         print("out_fp8", out_fp8)
         print("lse_fp8", lse_fp8)
         print("S_dmask_fp8", S_dmask_fp8)
 
+    # TODO: launch bwd kernel in fp8
+    # out_fp8.backward(do_fp8)
+
     if DEBUG:
-        print("out_bfp16:", out_bfp16, out_bfp16.shape)
+        print("out_fp16:", out_fp16, out_fp16.shape)
         print("out_fp8:", out_fp8, out_fp8.shape)
-    
-    torch.testing.assert_close(out_bfp16.to(torch.float32), out_fp8.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8)
+
+    torch.testing.assert_close(out_fp16.to(fp32_dtype), out_fp8.to(fp32_dtype), atol=ATOL_fp8, rtol=RTOL_fp8)
+    # TODO: compare fp16 vs fp8 bwd results
+
 
 @pytest.mark.parametrize(
     "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
