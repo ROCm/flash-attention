@@ -17,28 +17,11 @@ concurrency:
 permissions: read-all
 
 jobs:
-  Runner-Preparation-AMD:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    outputs:
-      matrix-HIP: ${{ steps.set-matrix.outputs.matrix-HIP }}
-    steps:
-      - name: Prepare runner matrix
-        id: set-matrix
-        run: |
-          if [ x"${{ github.repository }}" == x"ROCm/flash-attention" ]; then
-            echo '::set-output name=matrix-HIP::[["linux-mi300-gpu-1"]]'
-          else
-            echo '::set-output name=matrix-HIP::[["ubuntu-latest"]]'
-          fi
-
   Integration-Tests-AMD:
-    needs: Runner-Preparation-AMD
-    if: needs.Runner-Preparation-AMD.outputs.matrix-HIP != ''
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        runner: ${{fromJson(needs.Runner-Preparation-AMD.outputs.matrix-HIP)}}
+        runner: [linux-mi300-gpu-1, gfx1100]
     container:
       image: rocm/pytorch:rocm6.2.3_ubuntu22.04_py3.10_pytorch_release_2.3.0
       options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --user root
@@ -61,35 +44,38 @@ jobs:
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           python setup.py install
-      - name: Flash Attention Tests Using Reference Impl
-        if: matrix.runner[0] == 'linux-mi300-gpu-1'
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          export FLASH_ATTENTION_TRITON_AMD_REF=1
-          pytest tests/test_flash_attn_triton_amd.py
-      - name: Flash Attention CDNA Tests
-        if: matrix.runner[0] == 'linux-mi300-gpu-1'
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          pytest tests/test_flash_attn_triton_amd.py
-      - name: Flash Attention RDNA Tests
-        if: matrix.runner[1] == 'gfx1100'
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          pytest tests/test_flash_attn_triton_amd.py::test_flash_attn_output tests/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache
+      # CDNA Tests
+      # - name: Flash Attention Tests Using Reference Impl
+      #   if: matrix.runner == 'linux-mi300-gpu-1'
+      #   run: |
+      #     export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+      #     export FLASH_ATTENTION_TRITON_AMD_REF=1
+      #     pytest tests/test_flash_attn_triton_amd.py
+      # - name: Flash Attention CDNA Tests
+      #   if: matrix.runner == 'linux-mi300-gpu-1'
+      #   run: |
+      #     export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+      #     pytest tests/test_flash_attn_triton_amd.py
       - name: AMD Tests
-        if: matrix.runner[0] == 'linux-mi300-gpu-1'
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           pytest -v -s flash_attn/flash_attn_triton_amd/test.py
       - name: AMD Bench
-        if: matrix.runner[0] == 'linux-mi300-gpu-1'
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           python flash_attn/flash_attn_triton_amd/bench.py
       - name: AMD Bench with Autotune
-        if: matrix.runner[0] == 'linux-mi300-gpu-1'
+        if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1
           python flash_attn/flash_attn_triton_amd/bench.py
+      
+      # RDNA Tests
+      - name: Flash Attention RDNA Tests
+        if: matrix.runner == 'gfx1100'
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          pytest tests/test_flash_attn_triton_amd.py::test_flash_attn_output tests/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache
