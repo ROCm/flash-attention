@@ -41,6 +41,7 @@ jobs:
         run: |
           git clone https://github.com/triton-lang/triton
           cd triton
+          git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4
           pip install ninja cmake wheel pybind11 # build-time dependencies
           pip install --verbose --no-build-isolation ./python
           cd ..
