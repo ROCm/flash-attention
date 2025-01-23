@@ -8,7 +8,7 @@ on:
     branches: [main_perf]
     types: [checks_requested]
   push:
-    branches: [main_perf, micmelesse/upstream_pr]
+    branches: [main_perf]
 
 concurrency:
   group: ${{ github.ref }}
@@ -32,13 +32,17 @@ jobs:
       - name: Show Device Info
         run: |
           rocminfo | grep gfx
+      - name: Uninstall Triton
+        run : |
+          pip uninstall -y triton
+          rm -rf ~/.triton
+          rm -rf ./triton/python/build
       - name: Install Triton
         run: |
-          pip uninstall -y triton
           git clone https://github.com/triton-lang/triton
           cd triton
           pip install ninja cmake wheel pybind11 # build-time dependencies
-          pip install --verbose -e python
+          pip install --verbose --no-build-isolation ./python
           cd ..
       - name: Show Triton version
         run: |
@@ -47,18 +51,19 @@ jobs:
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           python setup.py install
+      
       # CDNA Tests
-      # - name: Flash Attention Tests Using Reference Impl
-      #   if: matrix.runner == 'linux-mi300-gpu-1'
-      #   run: |
-      #     export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-      #     export FLASH_ATTENTION_TRITON_AMD_REF=1
-      #     pytest tests/test_flash_attn_triton_amd.py
-      # - name: Flash Attention CDNA Tests
-      #   if: matrix.runner == 'linux-mi300-gpu-1'
-      #   run: |
-      #     export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-      #     pytest tests/test_flash_attn_triton_amd.py
+      - name: Flash Attention Tests Using Reference Impl
+        if: matrix.runner == 'linux-mi300-gpu-1'
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          export FLASH_ATTENTION_TRITON_AMD_REF=1
+          pytest tests/test_flash_attn_triton_amd.py
+      - name: Flash Attention CDNA Tests
+        if: matrix.runner == 'linux-mi300-gpu-1'
+        run: |
+          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+          pytest tests/test_flash_attn_triton_amd.py
       - name: AMD Tests
         if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
