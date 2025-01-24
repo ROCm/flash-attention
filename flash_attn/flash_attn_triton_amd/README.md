@@ -61,6 +61,9 @@ Inside the docker, it should open to the flash attention repo with everything in
 pytest tests/test_flash_attn_triton_amd.py
 ``` 
 
+##### FP8
+In our fork, we have modified the api to work with fp8. You provide tensors that are scaled to be in fp8 range and their associated descaling factors.
+
 ##### Credits
 AMD Triton kernels team
 
