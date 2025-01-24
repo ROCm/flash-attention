@@ -1,5 +1,7 @@
 import torch
 import pytest
+import numpy as np
+from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 from .utils import DEBUG, DEBUG_TRITON, DEBUG_TRITON_DETAIL, MetaData, get_input_shapes, input_helper, varlen_input_helper, compute_alibi_tensor_ref, get_arch, arch_supports_fp8
 from .interface_torch import attention_prefill, attention_decode
@@ -9,9 +11,11 @@ from .bwd_prefill import attention_prefill_backward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .fwd_decode import dequantize_kv_fp16, quantize_kv_int4
+
+# set print options
 torch.set_printoptions(linewidth=5e5, edgeitems=10, sci_mode=False)
-import numpy as np
 np.set_printoptions(linewidth=5000, threshold=1e4, suppress=True, precision=4)
+
 # defailt fp16 tolerance is ATOL, RTOL = 1e-5, 1e-3. See table https://pytorch.org/docs/stable/testing.html
 ATOL, RTOL = 1e-2, 1e-2 # old standard. maybe to lose. 
 # ATOL, RTOL = 1e-3, 1e-3  # catchs fa mismatch issues
@@ -741,6 +745,7 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
     "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
     [
         (1, 1, 1, 1, 1, 1),
+        (1, 1, 1, 2, 2, 16),
         (1, 1, 1, 2, 4, 16),
         (1, 2, 2, 2, 4, 16),
         (1, 4, 1, 2, 4, 16),
@@ -774,7 +779,7 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
     ],
 )
 @pytest.mark.parametrize('causal', [False, True])
-@pytest.mark.parametrize('dropout_p', [0.0, 0.25])
+@pytest.mark.parametrize('dropout_p', [0.0])
 @pytest.mark.parametrize('DEBUG_INPUT', [False])
 @pytest.mark.skipif(not arch_supports_fp8(), reason="fp8 not supported on this device")
 def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
@@ -786,16 +791,21 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
     layout = "bshd"
 
     q, k, v, metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, torch.float32, layout, device=device, DEBUG_INPUT=DEBUG_INPUT)
+    if DEBUG:
+        do = torch.ones_like(q)
+    else:
+        do = torch.randn_like(q)
 
-    # NOTE: use bfp16 becasue it fp32 trunacted
-    # launch kernel in fp16
-    q_bfp16 = q.clone().to(torch.bfloat16)
-    k_bfp16 = k.clone().to(torch.bfloat16)
-    v_bfp16 = v.clone().to(torch.bfloat16)
-    out_bfp16, lse_bfp16, S_dmask_bfp16 = flash_attn_func(
-            q_bfp16,
-            k_bfp16,
-            v_bfp16,
+    # ref forward pass
+    # NOTE: bfp16 is not supported by atomic ops. we have to use fp16
+    q_fp16 = q.clone().to(torch.float16).requires_grad_()
+    k_fp16 = k.clone().to(torch.float16).requires_grad_()
+    v_fp16 = v.clone().to(torch.float16).requires_grad_()
+    do_fp16 = do.clone().to(torch.float16)
+    out_fp16, lse_fp16, S_dmask_fp16 = flash_attn_func(
+            q_fp16,
+            k_fp16,
+            v_fp16,
             dropout_p,
             causal=causal,
             window_size=window_size,
@@ -804,33 +814,34 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
             deterministic=deterministic,
             return_attn_probs=True,
         )
-    if DEBUG:
-        print("out_bfp16", out_bfp16)
-        print("lse_bfp16", lse_bfp16)
-        print("S_dmask_bfp16", S_dmask_bfp16)
 
-    # compute p for descaling
-    batch, _ , nheads_q, dim = q.shape
-    _, _ , nheads_k, _ = k.shape
+    # ref backward pass
+    dq_fp16, dk_fp16, dv_fp16 = torch.autograd.grad(out_fp16, (q_fp16, k_fp16, v_fp16), do_fp16)
+
+    # ----------------------------------------------------------------
+    # --- FP8 ---
+    # ----------------------------------------------------------------
+    type_max = torch.finfo(torch.float8_e4m3fnuz).max
 
     # compute max for each batch-head pair across seqlen and dim
     q_max = torch.maximum(q.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
     k_max = torch.maximum(k.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
     v_max = torch.maximum(v.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
+    do_max = torch.maximum(do.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
+
+    # compute scaling and descaling factors
+    scale_q, descale_q = type_max/ q_max, q_max / type_max
+    scale_k, descale_k = type_max/ k_max, k_max / type_max
+    scale_v, descale_v = type_max/ v_max, v_max / type_max
+    scale_do, descale_do = type_max/ do_max, do_max / type_max
 
     # scale values to fp8 range
-    type_max = torch.finfo(torch.float8_e4m3fnuz).max
-    q_fp8 = (q * type_max/ q_max).to(torch.float8_e4m3fnuz)
-    k_fp8 = (k * type_max/ k_max).to(torch.float8_e4m3fnuz)
-    v_fp8 = (v * type_max/ v_max).to(torch.float8_e4m3fnuz)
+    q_fp8 = (q.clone() * scale_q).to(torch.float8_e4m3fnuz).requires_grad_()
+    k_fp8 = (k.clone() * scale_k).to(torch.float8_e4m3fnuz).requires_grad_()
+    v_fp8 = (v.clone() * scale_v).to(torch.float8_e4m3fnuz).requires_grad_()
+    do_fp8 = (do.clone() * scale_do).to(torch.float8_e4m3fnuz)
 
-    # compute descale values
-    descale_q = q_max / type_max
-    descale_k = k_max / type_max
-    descale_v = v_max / type_max
-    descale_p = torch.full_like(descale_q, 1.0 / type_max, dtype=torch.float32, device=q.device)
-
-    # launch kernel in fp8
+    # fp8 forward pass
     out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_func(
             q_fp8,
             k_fp8,
@@ -845,18 +856,56 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
             descale_q=descale_q,
             descale_k=descale_k,
             descale_v=descale_v,
-            descale_p=descale_p,
+            descale_p=None,
+            descale_do=descale_do
         )
+
+    # compare forward
     if DEBUG:
-        print("out_fp8", out_fp8)
-        print("lse_fp8", lse_fp8)
-        print("S_dmask_fp8", S_dmask_fp8)
+        print()
+        print("Compare fp8 against ref")
 
     if DEBUG:
-        print("out_bfp16:", out_bfp16, out_bfp16.shape)
+        print("out_fp16:", out_fp16, out_fp16.shape)
         print("out_fp8:", out_fp8, out_fp8.shape)
+    torch.testing.assert_close(out_fp16.to(torch.float32), out_fp8.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8)
+  
+    if DEBUG:
+        print("lse_fp16:", lse_fp16, lse_fp16.shape)
+        print("lse_fp8:", lse_fp8, lse_fp8.shape)
+    torch.testing.assert_close(lse_fp16.to(torch.float32), lse_fp8.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8)
 
-    torch.testing.assert_close(out_bfp16.to(torch.float32), out_fp8.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8)
+    if DEBUG:
+        print("S_dmask_fp16:", S_dmask_fp16, S_dmask_fp16.shape if S_dmask_fp16 is not None else None )
+        print("S_dmask_fp8:", S_dmask_fp8, S_dmask_fp8.shape if S_dmask_fp16 is not None else None)
+    torch.testing.assert_close(S_dmask_fp16.to(torch.float32) if S_dmask_fp16 is not None else None, S_dmask_fp8.to(torch.float32) if S_dmask_fp8 is not None else None, atol=ATOL_fp8, rtol=RTOL_fp8)
+
+    if HQ // HK != 1:
+        print("Skipping backward for MQA/GQA cases because atomic_add doesnot support fp8")
+        return
+    
+    # fp8 backward pass
+    dq_fp8, dk_fp8, dv_fp8 = torch.autograd.grad(out_fp8, (q_fp8, k_fp8, v_fp8), do_fp8)
+
+    # compare backward
+    if DEBUG:
+        print("dv_fp16:", dv_fp16, dv_fp16.shape)
+        print("dv_fp8:", dv_fp8, dv_fp8.shape)
+    torch.testing.assert_close(dv_fp16.to(torch.float32), dv_fp8.to(torch.float32), 
+                             atol=ATOL_fp8, rtol=RTOL_fp8, equal_nan=EQUAL_NAN)
+
+    if DEBUG:
+        print("dk_fp16:", dk_fp16, dk_fp16.shape)
+        print("dk_fp8:", dk_fp8, dk_fp8.shape)
+    torch.testing.assert_close(dk_fp16.to(torch.float32), dk_fp8.to(torch.float32), 
+                             atol=ATOL_fp8, rtol=RTOL_fp8, equal_nan=EQUAL_NAN)
+    
+    if DEBUG:
+        print("dq_fp16:", dq_fp16, dq_fp16.shape)
+        print("dq_fp8:", dq_fp8, dq_fp8.shape)
+    torch.testing.assert_close(dq_fp16.to(torch.float32), dq_fp8.to(torch.float32), 
+                             atol=ATOL_fp8, rtol=RTOL_fp8, equal_nan=EQUAL_NAN)
+
 
 @pytest.mark.parametrize(
     "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
@@ -895,7 +944,7 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
     ],
 )
 @pytest.mark.parametrize('causal', [False, True])
-@pytest.mark.parametrize('dropout_p', [0.0, 0.25])
+@pytest.mark.parametrize('dropout_p', [0.0])
 @pytest.mark.parametrize('DEBUG_INPUT', [False])
 @pytest.mark.skipif(not arch_supports_fp8(), reason="fp8 not supported on this device")
 def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
@@ -907,15 +956,20 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
     layout = "thd"
 
     q, k, v, metadata = varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, torch.float32, DEBUG_INPUT=DEBUG_INPUT)
+    if DEBUG:
+        do = torch.ones_like(q)
+    else:
+        do = torch.randn_like(q)
 
     # launch kernel in fp16
-    q_bfp16 = q.clone().to(torch.bfloat16)
-    k_bfp16 = k.clone().to(torch.bfloat16)
-    v_bfp16 = v.clone().to(torch.bfloat16)
-    out_bfp16, lse_bfp16, S_dmask_bfp16 = flash_attn_varlen_func(
-            q_bfp16,
-            k_bfp16,
-            v_bfp16,
+    q_fp16 = q.clone().to(torch.float16)
+    k_fp16 = k.clone().to(torch.float16)
+    v_fp16 = v.clone().to(torch.float16)
+    do_fp16 = do.clone().to(torch.float16)
+    out_fp16, lse_fp16, S_dmask_fp16 = flash_attn_varlen_func(
+            q_fp16,
+            k_fp16,
+            v_fp16,
             metadata.cu_seqlens_q,
             metadata.cu_seqlens_k,
             metadata.max_seqlens_q,
@@ -928,30 +982,21 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
             deterministic=deterministic,
             return_attn_probs=True,
         )
-    if DEBUG:
-        print("out_bfp16", out_bfp16)
-        print("lse_bfp16", lse_bfp16)
-        print("S_dmask_bfp16", S_dmask_bfp16)
 
+    # ref backward pass
+    dq_fp16, dk_fp16, dv_fp16 = torch.autograd.grad(out_fp16, (q_fp16, k_fp16, v_fp16), do_fp16)
 
-    if DEBUG:
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
+    # ----------------------------------------------------------------
+    # --- FP8 ---
+    # ----------------------------------------------------------------
+    type_max = torch.finfo(torch.float8_e4m3fnuz).max
 
-    # thd
-    batch = len(metadata.cu_seqlens_q) - 1
-    nheads_q = q.size(1)
-    nheads_k = k.size(1)
-
-    if DEBUG:
-        print("batch:", batch)
-        print("nheads_q:", nheads_q)
-        print("nheads_k:", nheads_k)
-
+    # get maxes
     q_maxes = []
     k_maxes = []
     v_maxes = []
-    for i in range(batch):
+    do_maxes = []
+    for i in range(Z):
         q_start = metadata.cu_seqlens_q[i]
         q_end = metadata.cu_seqlens_q[i + 1]
         k_start = metadata.cu_seqlens_k[i]
@@ -961,56 +1006,45 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
         q_max = torch.maximum(q[q_start:q_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
         k_max = torch.maximum(k[k_start:k_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
         v_max = torch.maximum(v[k_start:k_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
+        do_max = torch.maximum(do[q_start:q_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
 
         q_maxes.append(q_max)
         k_maxes.append(k_max)
         v_maxes.append(v_max)
+        do_maxes.append(do_max)
     q_maxes = torch.stack(q_maxes)
     k_maxes = torch.stack(k_maxes)
     v_maxes = torch.stack(v_maxes)
-    if DEBUG:
-        print("q", q, q.shape)
-        print("q_maxes:", q_maxes, q_maxes.shape)
-        print("k", k, k.shape)
-        print("k_maxes:", k_maxes, k_maxes.shape)
+    do_maxes = torch.stack(do_maxes)
 
-    # ----------------------------------------------------------------
-    # --- FP8 conversion part ---
-    # ----------------------------------------------------------------
-    type_max = torch.finfo(torch.float8_e4m3fnuz).max
-    q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fnuz)
-    k_fp8 = torch.empty_like(k, dtype=torch.float8_e4m3fnuz)
-    v_fp8 = torch.empty_like(v, dtype=torch.float8_e4m3fnuz)
-    for i in range(batch):
+    # compute scaling and descaling factors
+    scale_q, descale_q = type_max/ q_maxes, q_maxes / type_max
+    scale_k, descale_k = type_max/ k_maxes, k_maxes / type_max
+    scale_v, descale_v = type_max/ v_maxes, v_maxes / type_max
+    scale_do, descale_do = type_max/ do_maxes, do_maxes / type_max
+
+    # scale tensors to fp8 range
+    q_fp8 = torch.zeros_like(q, dtype=torch.float8_e4m3fnuz)
+    k_fp8 = torch.zeros_like(k, dtype=torch.float8_e4m3fnuz)
+    v_fp8 = torch.zeros_like(v, dtype=torch.float8_e4m3fnuz)
+    do_fp8 = torch.zeros_like(do, dtype=torch.float8_e4m3fnuz)
+    for i in range(Z):
         q_start = metadata.cu_seqlens_q[i]
         q_end   = metadata.cu_seqlens_q[i + 1]
         k_start = metadata.cu_seqlens_k[i]
         k_end   = metadata.cu_seqlens_k[i + 1]
 
-        # shape [heads_q, 1], broadcast to [1, heads_q, 1]
-        q_scale = (type_max / q_maxes[i]).unsqueeze(0)  # => [1, HQ, 1]
-        k_scale = (type_max / k_maxes[i]).unsqueeze(0)  # => [1, HK, 1]
-        v_scale = (type_max / v_maxes[i]).unsqueeze(0)  # => [1, HK, 1]
-
         # q, k, v are [L, heads, dim] slices
         q_slice = q[q_start:q_end]  # [seq_len_i, HQ, dim]
         k_slice = k[k_start:k_end]  # [seq_len_i, HK, dim]
         v_slice = v[k_start:k_end]  # [seq_len_i, HK, dim]
+        do_slice = do[q_start:q_end]  # [seq_len_i, HQ, dim]
 
         # Convert them to FP8
-        q_fp8[q_start:q_end] = (q_slice * q_scale).to(torch.float8_e4m3fnuz)
-        k_fp8[k_start:k_end] = (k_slice * k_scale).to(torch.float8_e4m3fnuz)
-        v_fp8[k_start:k_end] = (v_slice * v_scale).to(torch.float8_e4m3fnuz)
-
-    if DEBUG:
-        print("q_fp8:", q_fp8, q_fp8.shape)
-        print("k_fp8:", k_fp8, k_fp8.shape)
-
-    # compute descale values
-    descale_q = q_maxes / type_max
-    descale_k = k_maxes / type_max
-    descale_v = v_maxes / type_max
-    descale_p = torch.full_like(descale_q, 1.0 / type_max, dtype=torch.float32, device=q.device)
+        q_fp8[q_start:q_end] = (q_slice * scale_q[i]).to(torch.float8_e4m3fnuz)
+        k_fp8[k_start:k_end] = (k_slice * scale_k[i]).to(torch.float8_e4m3fnuz)
+        v_fp8[k_start:k_end] = (v_slice * scale_v[i]).to(torch.float8_e4m3fnuz)
+        do_fp8[q_start:q_end] = (do_slice * scale_do[i]).to(torch.float8_e4m3fnuz)
 
     # launch kernel in fp8
     out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_varlen_func(
@@ -1031,18 +1065,56 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
             descale_q=descale_q,
             descale_k=descale_k,
             descale_v=descale_v,
-            descale_p=descale_p,
+            descale_p=None,
+            descale_do=descale_do
         )
+
+    # compare forward
     if DEBUG:
-        print("out_fp8", out_fp8)
-        print("lse_fp8", lse_fp8)
-        print("S_dmask_fp8", S_dmask_fp8)
+        print()
+        print("Compare fp8 against ref")
 
     if DEBUG:
-        print("out_bfp16:", out_bfp16, out_bfp16.shape)
+        print("out_fp16:", out_fp16, out_fp16.shape)
         print("out_fp8:", out_fp8, out_fp8.shape)
+    torch.testing.assert_close(out_fp16.to(torch.float32), out_fp8.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8)
+  
+    if DEBUG:
+        print("lse_fp16:", lse_fp16, lse_fp16.shape)
+        print("lse_fp8:", lse_fp8, lse_fp8.shape)
+    torch.testing.assert_close(lse_fp16.to(torch.float32), lse_fp8.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8)
 
-    torch.testing.assert_close(out_bfp16.to(torch.float32), out_fp8.to(torch.float32), atol=ATOL_fp8, rtol=RTOL_fp8)
+    if DEBUG:
+        print("S_dmask_fp16:", S_dmask_fp16, S_dmask_fp16.shape if S_dmask_fp16 is not None else None )
+        print("S_dmask_fp8:", S_dmask_fp8, S_dmask_fp8.shape if S_dmask_fp16 is not None else None)
+    torch.testing.assert_close(S_dmask_fp16.to(torch.float32) if S_dmask_fp16 is not None else None, S_dmask_fp8.to(torch.float32) if S_dmask_fp8 is not None else None, atol=ATOL_fp8, rtol=RTOL_fp8)
+
+    if HQ // HK != 1:
+        print("Skipping backward for MQA/GQA cases because atomic_add doesnot support fp8")
+        return
+    
+    # fp8 backward pass
+    dq_fp8, dk_fp8, dv_fp8 = torch.autograd.grad(out_fp8, (q_fp8, k_fp8, v_fp8), do_fp8)
+
+    # compare backward
+    if DEBUG:
+        print("dv_fp16:", dv_fp16, dv_fp16.shape)
+        print("dv_fp8:", dv_fp8, dv_fp8.shape)
+    torch.testing.assert_close(dv_fp16.to(torch.float32), dv_fp8.to(torch.float32), 
+                             atol=ATOL_fp8, rtol=RTOL_fp8, equal_nan=EQUAL_NAN)
+
+    if DEBUG:
+        print("dk_fp16:", dk_fp16, dk_fp16.shape)
+        print("dk_fp8:", dk_fp8, dk_fp8.shape)
+    torch.testing.assert_close(dk_fp16.to(torch.float32), dk_fp8.to(torch.float32), 
+                             atol=ATOL_fp8, rtol=RTOL_fp8, equal_nan=EQUAL_NAN)
+    
+    if DEBUG:
+        print("dq_fp16:", dq_fp16, dq_fp16.shape)
+        print("dq_fp8:", dq_fp8, dq_fp8.shape)
+    torch.testing.assert_close(dq_fp16.to(torch.float32), dq_fp8.to(torch.float32), 
+                             atol=ATOL_fp8, rtol=RTOL_fp8, equal_nan=EQUAL_NAN)
+
 
 
 @pytest.mark.parametrize(

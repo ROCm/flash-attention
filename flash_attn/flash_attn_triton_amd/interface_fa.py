@@ -150,6 +150,11 @@ def bwd(
     deterministic,
     gen_,
     rng_state,
+    descale_q,
+    descale_k,
+    descale_v,
+    descale_p,
+    descale_do
 ):
     # NOTE: this might have perf costs
     dq.zero_()
@@ -241,6 +246,11 @@ def bwd(
             philox_seed,
             philox_offset,
             False,
+            descale_q = descale_q,
+            descale_k = descale_k,
+            descale_v = descale_v,
+            descale_p = descale_p,
+            descale_do = descale_do
         )
         delta = delta_triton
 
@@ -405,6 +415,11 @@ def varlen_bwd(
     deterministic,
     gen_,
     rng_state,
+    descale_q,
+    descale_k,
+    descale_v,
+    descale_p,
+    descale_do
 ):
     if DEBUG:
         print()
@@ -493,6 +508,11 @@ def varlen_bwd(
             philox_seed,
             philox_offset,
             False,
+            descale_q = descale_q,
+            descale_k = descale_k,
+            descale_v = descale_v,
+            descale_p = descale_p,
+            descale_do = descale_do
         )
         delta = delta_triton
 
