@@ -69,6 +69,7 @@ class MetaData():
                 f"  v_new={self.v_new},\n"
                 f"  dropout_p={self.dropout_p},\n"
                 f"  return_scores={self.return_scores}\n"
+                f"  use_exp2={self.use_exp2}\n"
                 f")")
 
     def __init__(self, sm_scale=1.0):

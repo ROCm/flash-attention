@@ -48,7 +48,8 @@ class _attention_prefill(torch.autograd.Function):
         if USE_SINGLE_BWD_KERNEL:
             bwd = attention_prefill_backward_triton_impl
         else:
-            bwd = attention_prefill_backward_triton_split_impl
+            # bwd = attention_prefill_backward_triton_split_impl
+            bwd = attention_prefill_backward_triton_split_oneKernel_impl
         return bwd(
             do,
             q,

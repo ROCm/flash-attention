@@ -7,6 +7,7 @@ from .fwd_ref import attention_forward_pytorch_ref_impl
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill import attention_prefill_backward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
+from .bwd_prefill_split_oneKernel import attention_prefill_backward_triton_split_oneKernel_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .fwd_decode import dequantize_kv_fp16, quantize_kv_int4
 torch.set_printoptions(linewidth=5e5, edgeitems=10, sci_mode=False)
@@ -1211,7 +1212,8 @@ def test_op_prefill_bwd_split_impl(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, 
     # =============================================== Triton ==============================================================
     o = output_ref.clone().contiguous()
     softmax_lse = softmax_lse_ref.clone().contiguous()
-    dq_triton, dk_triton, dv_triton, delta_triton, _, _ = attention_prefill_backward_triton_split_impl(
+    # dq_triton, dk_triton, dv_triton, delta_triton, _, _ = attention_prefill_backward_triton_split_impl(
+    dq_triton, dk_triton, dv_triton, delta_triton, _, _ = attention_prefill_backward_triton_split_oneKernel_impl(
         do,
         q,
         k,

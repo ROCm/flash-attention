@@ -48,23 +48,23 @@ def get_benchmark_configs(args, varlen=False):
     else:
         return [
             (16, 16, 16, 1024, 1024),
-            (8, 16, 16, 2048, 2048),
-            (4, 16, 16, 4096, 4096),
-            (1, 8, 8, 8192, 8192),
-            (1, 2, 2, 16384, 16384),
-            (2, 48, 48, 1024, 1024),
-            (2, 48, 48, 2048, 1024),
-            (1, 8, 8, 4096, 8192),
-            (1, 8, 8, 8192, 4096),
-            (2, 4, 4, 16384, 8192),
-            (2, 8, 8, 1989, 15344),
-            (4, 16, 16, 4097, 163),
-            (2, 16, 16, 8122, 2159),
-            (1, 16, 16, 16281, 7),
-            (2, 48, 48, 1021, 1020),
-            (2, 48, 48, 2001, 2048),
-            (2, 8, 8, 3996, 9639),
-            (2, 8, 8, 8181, 1021),
+            # (8, 16, 16, 2048, 2048),
+            # (4, 16, 16, 4096, 4096),
+            # (1, 8, 8, 8192, 8192),
+            # (1, 2, 2, 16384, 16384),
+            # (2, 48, 48, 1024, 1024),
+            # (2, 48, 48, 2048, 1024),
+            # (1, 8, 8, 4096, 8192),
+            # (1, 8, 8, 8192, 4096),
+            # (2, 4, 4, 16384, 8192),
+            # (2, 8, 8, 1989, 15344),
+            # (4, 16, 16, 4097, 163),
+            # (2, 16, 16, 8122, 2159),
+            # (1, 16, 16, 16281, 7),
+            # (2, 48, 48, 1021, 1020),
+            # (2, 48, 48, 2001, 2048),
+            # (2, 8, 8, 3996, 9639),
+            # (2, 8, 8, 8181, 1021),
         ]
 
 def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device, layout, causal):
@@ -110,13 +110,15 @@ def gen_fn_inputs(fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, devic
         ).expand(-1, -1, -1, HQ // HK, -1)
         input_metadata = MetaData(sm_scale=1.3)
         input_metadata.layout = "bsghd"
-        
+
         # Adjust flops calculation if needed
         flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
 
         input_data = (q, k, v, input_metadata)
     else:
         raise ValueError("Unsupported benchmark function")
+
+    input_metadata.use_exp2 = True
     return input_data, flops_per_matmul
 
 def run_benchmark(args, fn_name, fn, mode):
@@ -167,6 +169,7 @@ def run_benchmark(args, fn_name, fn, mode):
         fn_inputs, flops_per_matmul = gen_fn_inputs(
             fn_name, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device, args.layout, causal
         )
+        print(fn_inputs[4])
 
         # define the function to benchmark
         if mode == "fwd":
