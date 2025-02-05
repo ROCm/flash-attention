@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Optional
 from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, arch_supports_fp8, get_shape_from_layout, get_strides_from_layout, is_cdna, is_rdna, write_dropout_mask, create_dropout_mask
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -569,10 +570,11 @@ def attention_prefill_forward_triton_impl(
                                         return_softmax,
                                         use_exp2,
                                         # fp8
-                                        descale_q=None,
-                                        descale_k=None,
-                                        descale_v=None,
-                                        descale_p=None):
+                                        descale_q: Optional[torch.Tensor] = None,
+                                        descale_k: Optional[torch.Tensor] = None,
+                                        descale_v: Optional[torch.Tensor] = None,
+                                        descale_p: Optional[torch.Tensor] = None
+):
 
     if DEBUG:
         print()

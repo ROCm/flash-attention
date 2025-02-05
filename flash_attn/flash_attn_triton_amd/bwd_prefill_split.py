@@ -1,6 +1,7 @@
 import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
+from typing import Optional
 from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, \
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen
 
@@ -897,6 +898,12 @@ def attention_prefill_backward_triton_split_impl(
     philox_seed,
     philox_offset,
     use_exp2: bool,
+    # fp8
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    descale_p: Optional[torch.Tensor] = None,
+    descale_do: Optional[torch.Tensor] = None,
     DEBUG_TRITON: bool = False,
     DEBUG_TRITON_DETAIL: bool = False,
 ):
