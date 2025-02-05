@@ -91,10 +91,10 @@ def _flash_attn_forward(
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
-    descale_q: Optional[torch.Tensor],
-    descale_k: Optional[torch.Tensor],
-    descale_v: Optional[torch.Tensor],
-    descale_p: Optional[torch.Tensor]
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    descale_p: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
