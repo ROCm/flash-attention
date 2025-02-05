@@ -3,7 +3,8 @@ import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Optional
 from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, \
-    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen
+    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, \
+    arch_supports_fp8
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
@@ -25,7 +26,8 @@ def _bwd_preprocess(
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
+    IS_FP8: tl.constexpr
 ):
     pid_m = tl.program_id(0)
     bid = tl.program_id(1)
@@ -85,7 +87,9 @@ def _bwd_dkdv_inner(
     start_n, start_m, num_steps,  # iteration numbers
     MASK: tl.constexpr,  # causal masking, only apply to tiles on mask diagonal
     ENABLE_DROPOUT: tl.constexpr,  # activate dropout
-    USE_EXP2: tl.constexpr,  # activate dropout
+    USE_EXP2: tl.constexpr,  # activate exp2
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -215,6 +219,8 @@ def _bwd_kernel_dkdv(
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -398,6 +404,8 @@ def _bwd_dq_inner(
     MASK: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -505,6 +513,8 @@ def _bwd_kernel_dq(
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -668,6 +678,8 @@ def _bwd_kernel_dkdv_noncausal(
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -749,6 +761,8 @@ def _bwd_kernel_dkdv_noncausal(
             MASK=False,  # causal masking
             ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
             USE_EXP2=USE_EXP2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -783,6 +797,8 @@ def _bwd_kernel_dq_noncausal(
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
 ):
@@ -866,6 +882,8 @@ def _bwd_kernel_dq_noncausal(
             MASK=False,  #
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             USE_EXP2=USE_EXP2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -907,15 +925,18 @@ def attention_prefill_backward_triton_split_impl(
     DEBUG_TRITON: bool = False,
     DEBUG_TRITON_DETAIL: bool = False,
 ):
+    IS_FP8 = arch_supports_fp8() and q.dtype in {torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e5m2fnuz}
+    if IS_FP8:
+        FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
+    else:
+        FP8_MAX = None
+
     if dq is None:
-        dq = torch.empty_like(q)
+        dq = torch.zeros_like(q)
     if dk is None:
-        dk = torch.empty_like(k)
+        dk = torch.zeros_like(k)
     if dv is None:
-        dv = torch.empty_like(v)
-    dq.zero_()
-    dk.zero_()
-    dv.zero_()
+        dv = torch.zeros_like(v)
 
     # get strides and shape
     batch, nheads_q, nheads_k, head_size, max_seqlen_q, max_seqlen_k = \
@@ -967,7 +988,8 @@ def attention_prefill_backward_triton_split_impl(
         BLOCK_M=PRE_BLOCK,
         HEAD_DIM=HEAD_DIM,
         ACTUAL_HEAD_DIM=ACTUAL_HEAD_DIM,
-        IS_VARLEN=IS_VARLEN
+        IS_VARLEN=IS_VARLEN,
+        IS_FP8=IS_FP8
     )
 
     # dropout mask tensor for debugging. We dump the dropout mask created in
@@ -1019,6 +1041,8 @@ def attention_prefill_backward_triton_split_impl(
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_EXP2=use_exp2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
@@ -1045,6 +1069,8 @@ def attention_prefill_backward_triton_split_impl(
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_EXP2=use_exp2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
@@ -1070,6 +1096,8 @@ def attention_prefill_backward_triton_split_impl(
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_EXP2=use_exp2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
@@ -1095,6 +1123,8 @@ def attention_prefill_backward_triton_split_impl(
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_EXP2=use_exp2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu = WAVES_PER_EU,
