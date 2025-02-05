@@ -757,7 +757,7 @@ def attention_prefill_backward_triton_impl(
         do,
         delta,
         stride_oz, stride_oh, stride_om, stride_ok,
-        stride_oz, stride_oh, stride_om, stride_ok,
+        stride_oz, stride_oh, stride_om, stride_ok, # FIXME: don't share strides with derivatives this was causing a lot of issues
         stride_deltaz, stride_deltah, stride_deltam,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -796,7 +796,7 @@ def attention_prefill_backward_triton_impl(
         descale_v,
         descale_do,
         stride_dq_all,
-        stride_qz, stride_qh, stride_qm, stride_qk,
+        stride_qz, stride_qh, stride_qm, stride_qk, # FIXME: don't share strides with derivatives this was causing a lot of issues
         stride_kz, stride_kh, stride_kn, stride_kk,
         stride_vz, stride_vh, stride_vn, stride_vk,
         stride_deltaz, stride_deltah, stride_deltam,
@@ -830,7 +830,7 @@ def attention_prefill_backward_triton_impl(
 
     if sequence_parallel:
         if is_fp8:
-            dq = dq.to(torch.float32).sum(dim=0).to(dq_og.dtype)
+            dq = dq.to(torch.float32).sum(dim=0).to(q.dtype)
         else:
             dq = dq.sum(dim=0)
 
@@ -839,7 +839,6 @@ def attention_prefill_backward_triton_impl(
         print("dv:", dv, dv.shape)
         print("dk:", dk, dk.shape)
         print("dq:", dq, dq.shape)
-        print("copy_back:", copy_back)
         if use_dropout:
             print("dropout_mask:", dropout_mask, dropout_mask.shape if dropout_mask is not None else None)
             print("dropout_fraction bwd:", 1.0 - (dropout_mask.sum()/ dropout_mask.numel()).item())
