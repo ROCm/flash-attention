@@ -784,7 +784,7 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
 def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
     device = "cuda"
     window_size =  (-1, -1)
-    softcap = None
+    softcap = 0.0
     alibi_slopes = None
     deterministic = False
     layout = "bshd"
@@ -905,7 +905,7 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
 def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
     device = "cuda"
     window_size =  (-1, -1)
-    softcap = None
+    softcap = 0.0
     alibi_slopes = None
     deterministic = False
     layout = "thd"
