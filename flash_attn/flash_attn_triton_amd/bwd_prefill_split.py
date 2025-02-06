@@ -123,6 +123,7 @@ def _bwd_dkdv_inner(
     curr_philox_offset = batch_philox_offset
     curr_dropout_offset = dropout_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
+
     for blk_idx in range(num_steps):
         if DEBUG_TRITON: print(f"iter {blk_idx}: curr_m = {curr_m}")  # noqa: E701
         offs_m = curr_m + tl.arange(0, BLOCK_M)
@@ -184,19 +185,17 @@ def _bwd_dkdv_inner(
         # Compute dV.
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            pT_dropout = pT_dropout.to(do.type.element_ty)
             if IS_FP8:
                 scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(pT_dropout, FP8_MAX)
-                dv += (tl.dot(pT_dropout * scale_p_dropout, do)* descale_p_dropout * descale_do)
+                dv += (tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)* descale_p_dropout * descale_do)
             else:
-                dv += tl.dot(pT_dropout, do)
+                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
-            pT = pT.to(tl.float16)
             if IS_FP8:
                 scale_p, descale_p = compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (tl.dot(pT * scale_p, do) * descale_p * descale_do)
+                dv += (tl.dot((pT * scale_p).to(do.type.element_ty), do) * descale_p * descale_do)
             else:
-                dv += tl.dot(pT, do)
+                dv += tl.dot(pT.to(do.type.element_ty), do)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -212,12 +211,11 @@ def _bwd_dkdv_inner(
         if ENABLE_DROPOUT:
             dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(qT.type.element_ty)
         if IS_FP8:
             scale_ds, descale_ds = compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (tl.dot(dsT * scale_ds, tl.trans(qT)* descale_ds * descale_q))
+            dk += (tl.dot((dsT * scale_ds).to(qT.type.element_ty), tl.trans(qT)) * descale_ds * descale_q)
         else:
-            dk += tl.dot(dsT, tl.trans(qT))
+            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -240,7 +238,7 @@ def _bwd_kernel_dkdv(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
-    descale_q, descale_k, descale_v, descale_do,
+    Descale_q, Descale_k, Descale_v, Descale_do,
     BLOCK_M: tl.constexpr,  # 32
     BLOCK_N: tl.constexpr,  # 128
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -358,6 +356,18 @@ def _bwd_kernel_dkdv(
         # when q < k, we may skip the initial masked op
         if pid < num_blocks_skip:
             num_steps = 0
+
+        if IS_FP8:
+            # TODO: pass in strides. assuming strides leads to subtle bugs
+            stride_descale_q_z = HQ
+            stride_descale_kv_z = HK
+
+            descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+        else:
+            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
         # if start_m is negative, the current N-tile has no block on the
         #   diagonal of causal mask, so everything have no causal mask
@@ -500,7 +510,7 @@ def _bwd_dq_inner(
             dropout_scale = 1 / (1 - dropout_p)
 
         if IS_FP8:
-            qk += (tl.dot(q, kT) * descale_q * descale_k)
+            qk = (tl.dot(q, kT) * descale_q * descale_k)
         else:
             qk = tl.dot(q, kT)
         if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk * sm_scale)  # noqa: E701
@@ -523,14 +533,13 @@ def _bwd_dq_inner(
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
         ds = p * (dp - Di[:, None])
-        ds = ds.to(kT.type.element_ty)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
             scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
-            dq += (tl.dot(ds * scale_ds, tl.trans(kT)) * descale_ds * descale_k)
+            dq += (tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT)) * descale_ds * descale_k)
         else:
-            dq += tl.dot(ds, tl.trans(kT))
+            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
@@ -553,7 +562,7 @@ def _bwd_kernel_dq(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
-    descale_q, descale_k, descale_v, descale_do,
+    Descale_q, Descale_k, Descale_v, Descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -652,6 +661,17 @@ def _bwd_kernel_dq(
         start_n = max(end_n - BLOCK_M, 0)
         num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N)
 
+        if IS_FP8:
+            stride_descale_q_z = HQ
+            stride_descale_kv_z = HK
+            
+            descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+        else:
+            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+
         dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
         if DEBUG_TRITON: print(f"pid: {pid}; end_n: {end_n}, start_m: {start_m}")  # noqa: E701
         # Compute dQ for masked (diagonal) blocks.
@@ -725,7 +745,7 @@ def _bwd_kernel_dkdv_noncausal(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
-    descale_q, descale_k, descale_v, descale_do,
+    Descale_q, Descale_k, Descale_v, Descale_do,
     BLOCK_M: tl.constexpr,  # 32
     BLOCK_N: tl.constexpr,  # 128
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -798,6 +818,17 @@ def _bwd_kernel_dkdv_noncausal(
                                   hqid * stride_dropouth
             dropout_offset = dropout_mask + bid * stride_dropoutb + \
                              hqid * stride_dropouth
+            
+        if IS_FP8:
+            stride_descale_q_z = HQ
+            stride_descale_kv_z = HK
+            
+            descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+        else:
+            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
         # because there is no causal, we always start from the beginning
         start_m = 0
@@ -846,7 +877,7 @@ def _bwd_kernel_dq_noncausal(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
-    descale_q, descale_k, descale_v, descale_do,
+    Descale_q, Descale_k, Descale_v, Descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -920,11 +951,21 @@ def _bwd_kernel_dq_noncausal(
                     mask=offs_m < seqlen_q)
         m = m[:, None]
 
+        if IS_FP8:
+            stride_descale_q_z = HQ
+            stride_descale_kv_z = HK
+            
+            descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+        else:
+            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+
         # start can only be 0 at minimum
         start_n = 0
         end_n = seqlen_k
         num_steps = tl.cdiv(seqlen_k, BLOCK_N)
-
         dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
         dq = _bwd_dq_inner(
             dq,
