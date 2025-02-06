@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Optional
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, arch_supports_fp8, get_shape_from_layout, get_strides_from_layout, is_cdna, is_rdna, write_dropout_mask, create_dropout_mask
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, arch_supports_fp8, compute_fp8_scaling_factors, get_shape_from_layout, get_strides_from_layout, is_cdna, is_rdna, write_dropout_mask, create_dropout_mask
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
@@ -180,13 +180,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
         m_i = m_ij
 
         if IS_FP8:
-            # compute descale_p
-            p_amax = tl.max(tl.abs(p)) 
-            p_amax = tl.where(p_amax <= 1e-9, 1e-9, p_amax)
-            scale_p = FP8_MAX / p_amax
-            descale_p = p_amax / FP8_MAX
-
-            # NOTE: put p into fp8 range and multiple by do which is already in the fp8 range by the user
+            scale_p, descale_p = compute_fp8_scaling_factors(p, FP8_MAX)
             acc += (tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v)
         else:
             acc += tl.dot(p.to(v.type.element_ty), v)
@@ -280,7 +274,7 @@ autotune_configs, autotune_keys = get_autotune_configs()
 )
 @triton.jit
 def attn_fwd(Q, K, V, bias,
-             DESCALE_Q, DESCALE_K, DESCALE_V, DESCALE_P, stride_descale_q_z, stride_descale_kv_z, stride_descale_p_z,
+             DESCALE_Q, DESCALE_K, DESCALE_V, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z,
              SM_SCALE: tl.constexpr, LSE, Out, stride_qz, stride_qh, stride_qm, stride_qk,
              stride_kz, stride_kh, stride_kn, stride_kk, stride_vz, stride_vh, stride_vk, stride_vn,
              stride_oz, stride_oh, stride_om, stride_on, stride_bz, stride_bh, stride_bm, stride_bn, stride_az, stride_ah,
@@ -422,8 +416,8 @@ def attn_fwd(Q, K, V, bias,
     # Load scale factors if IS_FP8.
     if IS_FP8:
         descale_q = tl.load(DESCALE_Q + off_z * stride_descale_q_z + off_h_q)
-        descale_k = tl.load(DESCALE_K + off_z * stride_descale_kv_z + off_h_k)
-        descale_v = tl.load(DESCALE_V + off_z * stride_descale_kv_z + off_h_k)
+        descale_k = tl.load(DESCALE_K + off_z * stride_descale_k_z + off_h_k)
+        descale_v = tl.load(DESCALE_V + off_z * stride_descale_v_z + off_h_k)
     else:
         descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
@@ -572,8 +566,7 @@ def attention_prefill_forward_triton_impl(
                                         # fp8
                                         descale_q: Optional[torch.Tensor] = None,
                                         descale_k: Optional[torch.Tensor] = None,
-                                        descale_v: Optional[torch.Tensor] = None,
-                                        descale_p: Optional[torch.Tensor] = None
+                                        descale_v: Optional[torch.Tensor] = None
 ):
 
     if DEBUG:
@@ -619,9 +612,8 @@ def attention_prefill_forward_triton_impl(
         descale_k_stride_z = descale_k.stride(0)
         descale_v_stride_z = descale_v.stride(0)
     else:
-        # For non-FP8 types, use dummy values (no scaling needed)
-        descale_q = descale_k = descale_v = descale_p = 1
-        descale_q_stride_z = descale_k_stride_z = descale_v_stride_z = 0
+        descale_q = descale_k = descale_v = None
+        descale_q_stride_z = descale_k_stride_z = descale_v_stride_z = None
        
 
     if DEBUG:
@@ -629,7 +621,6 @@ def attention_prefill_forward_triton_impl(
         print("descale_q:", descale_q)
         print("descale_k:", descale_k)
         print("descale_v:", descale_v)
-        print("descale_p:", descale_p)
         print("descale_q_stride_z:", descale_q_stride_z)
         print("descale_k_stride_z:", descale_k_stride_z)
         print("descale_v_stride_z:", descale_v_stride_z)
@@ -696,7 +687,7 @@ def attention_prefill_forward_triton_impl(
 
 
     attn_fwd[grid](q, k, v, bias,
-                    descale_q, descale_k, descale_v, None, descale_q_stride_z, descale_k_stride_z, None,
+                    descale_q, descale_k, descale_v, descale_q_stride_z, descale_k_stride_z, descale_v_stride_z,
                     sm_scale, softmax_lse, o, *q_strides, *k_strides, *v_strides, *o_strides,
                     *bias_strides, *alibi_strides, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
                     dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 

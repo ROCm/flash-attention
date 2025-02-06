@@ -2,7 +2,7 @@ import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Optional
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, \
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shape_from_layout, \
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, \
     arch_supports_fp8
 
@@ -75,15 +75,6 @@ def _bwd_preprocess(
     delta_offset = Delta + bid * stride_deltab + hid * stride_deltah + q_start * stride_deltam
     tl.store(delta_offset + offs_m * stride_deltam, delta, mask=mask_m)
 
-
-@triton.jit
-def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
-    # compute fp8 scaling and descaling factor for a block
-    x_amax = tl.max(tl.abs(x))
-    x_amax = tl.where(x_amax <= 1e-9, 1e-9, x_amax)
-    scale_x = fp8_max / x_amax
-    descale_x = x_amax / fp8_max
-    return scale_x, descale_x
 
 # The main inner-loop logic for computing dK and dV.
 @triton.jit
@@ -1019,7 +1010,6 @@ def attention_prefill_backward_triton_split_impl(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
-    descale_p: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     DEBUG_TRITON: bool = False,
     DEBUG_TRITON_DETAIL: bool = False,

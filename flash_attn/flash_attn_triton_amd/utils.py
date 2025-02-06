@@ -379,6 +379,15 @@ def get_input_shapes():
              for i in range(8, 18)] + [(max(1, 2**(16 - i)), 1, 2**i, 16, 2, 128) for i in range(8, 18)]
     return cases
 
+@triton.jit
+def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
+    # compute fp8 scaling and descaling factor for a block
+    x_amax = tl.max(tl.abs(x)) # NOTE: abs deals with negative values
+    x_amax = tl.where(x_amax <= 1e-9, 1e-9, x_amax)
+    scale_x = fp8_max / x_amax
+    descale_x = x_amax / fp8_max
+    return scale_x, descale_x
+
 @functools.cache
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"

@@ -27,8 +27,7 @@ def fwd(q,
         gen_,
         descale_q,
         descale_k,
-        descale_v,
-        descale_p):
+        descale_v):
 
     if DEBUG:
         print()
@@ -119,8 +118,7 @@ def fwd(q,
                                                 metadata.use_exp2,
                                                 descale_q,
                                                 descale_k,
-                                                descale_v,
-                                                descale_p)
+                                                descale_v)
 
     if DEBUG:
         print("fwd outputs")
@@ -153,7 +151,6 @@ def bwd(
     descale_q,
     descale_k,
     descale_v,
-    descale_p,
     descale_do
 ):
     # NOTE: this might have perf costs
@@ -249,7 +246,6 @@ def bwd(
             descale_q = descale_q,
             descale_k = descale_k,
             descale_v = descale_v,
-            descale_p = descale_p,
             descale_do = descale_do
         )
         delta = delta_triton
@@ -285,8 +281,7 @@ def varlen_fwd(
         gen_,
         descale_q,
         descale_k,
-        descale_v,
-        descale_p):
+        descale_v):
 
     if DEBUG:
         print()
@@ -379,8 +374,7 @@ def varlen_fwd(
                                                             metadata.use_exp2,
                                                             descale_q,
                                                             descale_k,
-                                                            descale_v,
-                                                            descale_p)
+                                                            descale_v)
     if DEBUG:
         print("varlen_fwd outputs")
         print("o:", o, o.shape)
@@ -418,7 +412,6 @@ def varlen_bwd(
     descale_q,
     descale_k,
     descale_v,
-    descale_p,
     descale_do
 ):
     if DEBUG:
@@ -511,7 +504,6 @@ def varlen_bwd(
             descale_q = descale_q,
             descale_k = descale_k,
             descale_v = descale_v,
-            descale_p = descale_p,
             descale_do = descale_do
         )
         delta = delta_triton

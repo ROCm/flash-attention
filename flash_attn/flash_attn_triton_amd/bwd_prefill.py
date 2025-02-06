@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, get_strides_from_layout, write_dropout_mask, create_dropout_mask, arch_supports_fp8
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shape_from_layout, get_strides_from_layout, write_dropout_mask, create_dropout_mask, arch_supports_fp8
 
 # TODO: move this into utils.py so it's shared among kernels
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -246,14 +246,8 @@ def _bwd_kernel_one_col_block(
 
             # compute dv
             if IS_FP8:
-                # compute descale_p
-                p_amax = tl.max(tl.abs(p_drop_scaled))
-                p_amax = tl.where(p_amax <= 1e-9, 1e-9, p_amax)
-                scale_p = FP8_MAX / p_amax
-                descale_p = p_amax / FP8_MAX
-
-                # NOTE: put p into fp8 range and multiple by do which is already in the fp8 range by the user
-                dv +=  (tl.dot(tl.trans(p * scale_p).to(do.type.element_ty), do) * descale_p * descale_do)
+                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(p_drop_scaled, FP8_MAX)
+                dv +=  (tl.dot(tl.trans(p_drop_scaled * scale_p_dropout).to(do.type.element_ty), do) * descale_p_dropout * descale_do)
             else:
                 dv += tl.dot(tl.trans(p_drop_scaled).to(do.type.element_ty), do)
 
@@ -267,13 +261,7 @@ def _bwd_kernel_one_col_block(
 
             # compute dv
             if IS_FP8:
-                # compute descale_p
-                p_amax = tl.max(tl.abs(p))
-                p_amax = tl.where(p_amax <= 1e-9, 1e-9, p_amax)
-                scale_p = FP8_MAX / p_amax
-                descale_p = p_amax / FP8_MAX
-
-                # NOTE: put p into fp8 range and multiple by do which is already in the fp8 range by the user
+                scale_p, descale_p = compute_fp8_scaling_factors(p, FP8_MAX)
                 dv +=  (tl.dot(tl.trans(p * scale_p).to(do.type.element_ty), do) * descale_p * descale_do)
             else:
                 dv += tl.dot(tl.trans(p).to(do.type.element_ty), do)
@@ -296,10 +284,7 @@ def _bwd_kernel_one_col_block(
         
         # compute descale_ds
         if IS_FP8:
-            ds_amax = tl.max(tl.abs(ds)) # NOTE: ds can be negative so if we get a negative max value. It will screw things up.
-            ds_amax = tl.where(ds_amax <= 1e-9, 1e-9, ds_amax)
-            scale_ds = FP8_MAX / ds_amax
-            descale_ds = ds_amax / FP8_MAX
+            scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
         else:
             scale_ds, descale_ds = 1.0, 1.0
         
@@ -619,7 +604,6 @@ def attention_prefill_backward_triton_impl(
     descale_q=None,
     descale_k=None,
     descale_v=None,
-    descale_p=None,
     descale_do=None
 ):
     if DEBUG:
