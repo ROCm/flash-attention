@@ -2,7 +2,7 @@ import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Optional
-from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, \
+from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shape_from_layout, \
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, \
     arch_supports_fp8
 
@@ -22,7 +22,7 @@ def _bwd_preprocess(
     Delta,
     stride_ob, stride_oh, stride_om, stride_ok,
     stride_deltab, stride_deltah, stride_deltam,
-    stride_descale_q_z,
+    descale_do_stride_z,
     cu_seqlens_q, max_seqlen_q,
     Descale_do,
     BLOCK_M: tl.constexpr,
@@ -66,7 +66,7 @@ def _bwd_preprocess(
     do = tl.load(do_ptrs, mask=mask_md, other=0.0)
     # compute and write-back to delta
     if IS_FP8:
-        descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hid)
+        descale_do = tl.load(Descale_do + bid * descale_do_stride_z + hid)
 
         # NOTE: do is scaled into the fp8 range and o is in fp8 but should be in the same scale as fp32
         delta = tl.sum(o.to(tl.float32) * (do * descale_do).to(tl.float32), axis=1)
@@ -1039,9 +1039,10 @@ def attention_prefill_backward_triton_split_impl(
         descale_q_stride_z = descale_q.stride(0)
         descale_k_stride_z = descale_k.stride(0)
         descale_v_stride_z = descale_v.stride(0)
+        descale_do_stride_z = descale_q.stride(0)
     else:
         FP8_MAX = None
-        descale_q_stride_z = descale_k_stride_z = descale_v_stride_z = None
+        descale_q_stride_z = descale_k_stride_z = descale_v_stride_z = descale_do_stride_z = None
 
     if dq is None:
         dq = torch.zeros_like(q)
@@ -1096,15 +1097,18 @@ def attention_prefill_backward_triton_split_impl(
         delta,
         stride_ob, stride_oh, stride_om, stride_ok,
         stride_deltab, stride_deltah, stride_deltam,
-        descale_q_stride_z,
+        descale_do_stride_z,
         cu_seqlens_q, max_seqlen_q,
-        descale_q,
+        descale_do,
         BLOCK_M=PRE_BLOCK,
         HEAD_DIM=HEAD_DIM,
         ACTUAL_HEAD_DIM=ACTUAL_HEAD_DIM,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8
     )
+    
+    if DEBUG:
+        print("delta:", delta)
 
     # dropout mask tensor for debugging. We dump the dropout mask created in
     #   the kernel for testing
