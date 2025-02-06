@@ -22,7 +22,7 @@ def _bwd_preprocess(
     Delta,
     stride_ob, stride_oh, stride_om, stride_ok,
     stride_deltab, stride_deltah, stride_deltam,
-    descale_do_stride_z,
+    stride_descale_do_z,
     cu_seqlens_q, max_seqlen_q,
     Descale_do,
     BLOCK_M: tl.constexpr,
@@ -66,7 +66,7 @@ def _bwd_preprocess(
     do = tl.load(do_ptrs, mask=mask_md, other=0.0)
     # compute and write-back to delta
     if IS_FP8:
-        descale_do = tl.load(Descale_do + bid * descale_do_stride_z + hid)
+        descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hid)
 
         # NOTE: do is scaled into the fp8 range and o is in fp8 but should be in the same scale as fp32
         delta = tl.sum(o.to(tl.float32) * (do * descale_do).to(tl.float32), axis=1)
@@ -242,6 +242,7 @@ def _bwd_kernel_dkdv(
     stride_deltab, stride_deltah, stride_deltam,
     stride_dob, stride_doh, stride_dom, stride_dok,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+    stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
@@ -366,14 +367,10 @@ def _bwd_kernel_dkdv(
             num_steps = 0
 
         if IS_FP8:
-            # TODO: pass in strides. assuming strides leads to subtle bugs
-            stride_descale_q_z = HQ
-            stride_descale_kv_z = HK
-
             descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
-            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
-            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
         else:
             descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
@@ -566,6 +563,7 @@ def _bwd_kernel_dq(
     stride_deltab, stride_deltah, stride_deltam,
     stride_dob, stride_doh, stride_dom, stride_dok,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+    stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
@@ -670,13 +668,10 @@ def _bwd_kernel_dq(
         num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N)
 
         if IS_FP8:
-            stride_descale_q_z = HQ
-            stride_descale_kv_z = HK
-            
             descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
-            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
-            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
         else:
             descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
@@ -749,6 +744,7 @@ def _bwd_kernel_dkdv_noncausal(
     stride_deltab, stride_deltah, stride_deltam,
     stride_dob, stride_doh, stride_dom, stride_dok,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+    stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
@@ -828,13 +824,10 @@ def _bwd_kernel_dkdv_noncausal(
                              hqid * stride_dropouth
             
         if IS_FP8:
-            stride_descale_q_z = HQ
-            stride_descale_kv_z = HK
-            
             descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
-            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
-            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
         else:
             descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
@@ -881,6 +874,7 @@ def _bwd_kernel_dq_noncausal(
     stride_deltab, stride_deltah, stride_deltam,
     stride_dob, stride_doh, stride_dom, stride_dok,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+    stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
@@ -960,13 +954,10 @@ def _bwd_kernel_dq_noncausal(
         m = m[:, None]
 
         if IS_FP8:
-            stride_descale_q_z = HQ
-            stride_descale_kv_z = HK
-            
             descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
-            descale_k = tl.load(Descale_k + bid * stride_descale_kv_z + hkid)
-            descale_v = tl.load(Descale_v + bid * stride_descale_kv_z + hkid)
-            descale_do = tl.load(Descale_do + bid * stride_descale_q_z + hqid)
+            descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+            descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+            descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
         else:
             descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
@@ -1036,13 +1027,13 @@ def attention_prefill_backward_triton_split_impl(
     IS_FP8 = arch_supports_fp8() and q.dtype in {torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e5m2fnuz}
     if IS_FP8:
         FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
-        descale_q_stride_z = descale_q.stride(0)
-        descale_k_stride_z = descale_k.stride(0)
-        descale_v_stride_z = descale_v.stride(0)
-        descale_do_stride_z = descale_q.stride(0)
+        stride_descale_q_z = descale_q.stride(0)
+        stride_descale_k_z = descale_k.stride(0)
+        stride_descale_v_z = descale_v.stride(0)
+        stride_descale_do_z = descale_q.stride(0)
     else:
         FP8_MAX = None
-        descale_q_stride_z = descale_k_stride_z = descale_v_stride_z = descale_do_stride_z = None
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_do_z = None
 
     if dq is None:
         dq = torch.zeros_like(q)
@@ -1097,7 +1088,7 @@ def attention_prefill_backward_triton_split_impl(
         delta,
         stride_ob, stride_oh, stride_om, stride_ok,
         stride_deltab, stride_deltah, stride_deltam,
-        descale_do_stride_z,
+        stride_descale_do_z,
         cu_seqlens_q, max_seqlen_q,
         descale_do,
         BLOCK_M=PRE_BLOCK,
@@ -1150,6 +1141,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_deltab, stride_deltah, stride_deltam,
             stride_dob, stride_doh, stride_dom, stride_dok,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+            stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
@@ -1179,6 +1171,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_deltab, stride_deltah, stride_deltam,
             stride_dob, stride_doh, stride_dom, stride_dok,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+            stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
@@ -1207,6 +1200,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_deltab, stride_deltah, stride_deltam,
             stride_dob, stride_doh, stride_dom, stride_dok,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+            stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
@@ -1235,6 +1229,7 @@ def attention_prefill_backward_triton_split_impl(
             stride_deltab, stride_deltah, stride_deltam,
             stride_dob, stride_doh, stride_dom, stride_dok,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
+            stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
