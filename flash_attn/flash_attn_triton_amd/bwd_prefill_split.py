@@ -1064,7 +1064,7 @@ def attention_prefill_backward_triton_split_impl(
 
     # get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (head_size - 1).bit_length()
-    padded_d_model = max(padded_d_model, 16)
+    padded_d_model = max(padded_d_model, 32) # NOTE: the causal path expects a min of 32. It will cause a compiler assert.
     HEAD_DIM = padded_d_model
     ACTUAL_HEAD_DIM = head_size
     # meta-parameters
