@@ -791,7 +791,7 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
     layout = "bshd"
 
     q, k, v, metadata = input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, torch.float32, layout, device=device, DEBUG_INPUT=DEBUG_INPUT)
-    if DEBUG:
+    if DEBUG_INPUT:
         do = torch.ones_like(q)
     else:
         do = torch.randn_like(q)
@@ -952,7 +952,7 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
     layout = "thd"
 
     q, k, v, metadata = varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, torch.float32, DEBUG_INPUT=DEBUG_INPUT)
-    if DEBUG:
+    if DEBUG_INPUT:
         do = torch.ones_like(q)
     else:
         do = torch.randn_like(q)
