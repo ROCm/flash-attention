@@ -68,6 +68,15 @@ def _bwd_preprocess(
     tl.store(delta_offset + offs_m * stride_deltam, delta, mask=mask_m)
 
 
+@triton.jit
+def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
+    # compute fp8 scaling and descaling factor for a block
+    x_amax = tl.max(tl.abs(x))
+    x_amax = tl.where(x_amax <= 1e-9, 1e-9, x_amax)
+    scale_x = fp8_max / x_amax
+    descale_x = x_amax / fp8_max
+    return scale_x, descale_x
+
 # The main inner-loop logic for computing dK and dV.
 @triton.jit
 def _bwd_dkdv_inner(
@@ -85,6 +94,7 @@ def _bwd_dkdv_inner(
     seqlen_q, seqlen_k,  # max sequence length for q and k
     # Filled in by the wrapper.
     start_n, start_m, num_steps,  # iteration numbers
+    descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
     MASK: tl.constexpr,  # causal masking, only apply to tiles on mask diagonal
     ENABLE_DROPOUT: tl.constexpr,  # activate dropout
     USE_EXP2: tl.constexpr,  # activate exp2
@@ -144,7 +154,10 @@ def _bwd_dkdv_inner(
             dropout_scale = 1.0 / (1 - dropout_p)
         # Load m before computing qk to reduce pipeline stall.
         m = tl.load(M + offs_m * stride_deltam, mask=mask_m, other=0.0)
-        qkT = tl.dot(k, qT)
+        if IS_FP8:
+            qkT = (tl.dot(k, qT) * descale_q * descale_k)
+        else:
+            qkT = tl.dot(k, qT)
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
                 print(f"qT: {qT.shape}\n", qT)
@@ -171,11 +184,19 @@ def _bwd_dkdv_inner(
         # Compute dV.
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            pT_dropout = pT_dropout.to(tl.float16)
-            dv += tl.dot(pT_dropout, do)
+            pT_dropout = pT_dropout.to(do.type.element_ty)
+            if IS_FP8:
+                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(pT_dropout, FP8_MAX)
+                dv += (tl.dot(pT_dropout * scale_p_dropout, do)* descale_p_dropout * descale_do)
+            else:
+                dv += tl.dot(pT_dropout, do)
         else:
             pT = pT.to(tl.float16)
-            dv += tl.dot(pT, do)
+            if IS_FP8:
+                scale_p, descale_p = compute_fp8_scaling_factors(pT, FP8_MAX)
+                dv += (tl.dot(pT * scale_p, do) * descale_p * descale_do)
+            else:
+                dv += tl.dot(pT, do)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -183,12 +204,20 @@ def _bwd_dkdv_inner(
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
         # Compute dP and dS.
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        if IS_FP8:
+            dpT = (tl.dot(v, tl.trans(do)) * descale_v * descale_do)
+        else:
+            dpT = tl.dot(v, tl.trans(do))
+        dpT=dpT.to(tl.float32)
         if ENABLE_DROPOUT:
             dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
-        dk += tl.dot(dsT, tl.trans(qT))
+        dsT = dsT.to(qT.type.element_ty)
+        if IS_FP8:
+            scale_ds, descale_ds = compute_fp8_scaling_factors(dsT, FP8_MAX)
+            dk += (tl.dot(dsT * scale_ds, tl.trans(qT)* descale_ds * descale_q))
+        else:
+            dk += tl.dot(dsT, tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -211,6 +240,7 @@ def _bwd_kernel_dkdv(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
+    descale_q, descale_k, descale_v, descale_do,
     BLOCK_M: tl.constexpr,  # 32
     BLOCK_N: tl.constexpr,  # 128
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -344,9 +374,12 @@ def _bwd_kernel_dkdv(
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
             seqlen_q, seqlen_k,  # max sequence length for q and k
             start_n, start_m, num_steps,  # iteration numbers
+            descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user 
             MASK=True,  # causal masking
             ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
             USE_EXP2=USE_EXP2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -369,9 +402,12 @@ def _bwd_kernel_dkdv(
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
             seqlen_q, seqlen_k,  # max sequence length for q and k
             start_n, start_m, num_steps,  # iteration numbers
+            descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
             MASK=False,  # causal masking
             ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
             USE_EXP2=USE_EXP2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -401,6 +437,7 @@ def _bwd_dq_inner(
     dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
     # Filled in by the wrapper.
     start_m, start_n, end_n, num_steps,  #
+    descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
     MASK: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -462,7 +499,10 @@ def _bwd_dq_inner(
                 dropout_mask = rand_vals > dropout_p
             dropout_scale = 1 / (1 - dropout_p)
 
-        qk = tl.dot(q, kT)
+        if IS_FP8:
+            qk += (tl.dot(q, kT) * descale_q * descale_k)
+        else:
+            qk = tl.dot(q, kT)
         if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk * sm_scale)  # noqa: E701
         if USE_EXP2:
             p = tl.math.exp2(qk * sm_scale * RCP_LN2 - m * RCP_LN2)
@@ -475,14 +515,22 @@ def _bwd_dq_inner(
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
-        dp = tl.dot(do, vT).to(tl.float32)
+        if IS_FP8:
+            dp = (tl.dot(do, vT) * descale_do * descale_v)
+        else:
+            dp = tl.dot(do, vT)
+        dp = dp.to(tl.float32)
         if ENABLE_DROPOUT:
             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
+        ds = ds.to(kT.type.element_ty)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
-        dq += tl.dot(ds, tl.trans(kT))
+        if IS_FP8:
+            scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
+            dq += (tl.dot(ds * scale_ds, tl.trans(kT)) * descale_ds * descale_k)
+        else:
+            dq += tl.dot(ds, tl.trans(kT))
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
@@ -505,6 +553,7 @@ def _bwd_kernel_dq(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
+    descale_q, descale_k, descale_v, descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -613,18 +662,21 @@ def _bwd_kernel_dq(
         if DEBUG_TRITON: print(f"Masked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}")  # noqa: E701
         dq = _bwd_dq_inner(
             dq,
-            q, K, V, do, m, Delta_ptr, sm_scale, #
+            q, K, V, do, m, Delta_ptr, sm_scale,
             stride_qm, stride_qk, stride_kn,
-            stride_dropoutm, stride_dropoutn,  #
+            stride_dropoutm, stride_dropoutn,
             stride_deltam,
-            seqlen_q, seqlen_k,  #
-            BLOCK_M, MASK_BLOCK_N,  #
-            HEAD_DIM, ACTUAL_HEAD_DIM,  #
-            dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
-            start_m, start_n, end_n, num_steps,  #
-            MASK=True,  #
+            seqlen_q, seqlen_k,
+            BLOCK_M, MASK_BLOCK_N,
+            HEAD_DIM, ACTUAL_HEAD_DIM,
+            dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+            start_m, start_n, end_n, num_steps,
+            descale_q, descale_k, descale_v, descale_do,
+            MASK=True,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             USE_EXP2=USE_EXP2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -633,19 +685,22 @@ def _bwd_kernel_dq(
         start_n = max(end_n - num_steps * BLOCK_N, 0)
         if DEBUG_TRITON: print(f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}")  # noqa: E701
         dq = _bwd_dq_inner(
-            dq,  #
-            q, K, V, do, m, Delta_ptr, sm_scale, #
-            stride_qm, stride_qk, stride_kn,  #
-            stride_dropoutm, stride_dropoutn,  #
+            dq,
+            q, K, V, do, m, Delta_ptr, sm_scale,
+            stride_qm, stride_qk, stride_kn,
+            stride_dropoutm, stride_dropoutn,
             stride_deltam,
-            seqlen_q, seqlen_k,  #
-            BLOCK_M, BLOCK_N,  #
-            HEAD_DIM, ACTUAL_HEAD_DIM,  #
-            dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
-            start_m, start_n, end_n, num_steps,  #
-            MASK=False,  #
+            seqlen_q, seqlen_k,
+            BLOCK_M, BLOCK_N,
+            HEAD_DIM, ACTUAL_HEAD_DIM,
+            dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+            start_m, start_n, end_n, num_steps,
+            descale_q, descale_k, descale_v, descale_do,
+            MASK=False,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             USE_EXP2=USE_EXP2,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -670,6 +725,7 @@ def _bwd_kernel_dkdv_noncausal(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
+    descale_q, descale_k, descale_v, descale_do,
     BLOCK_M: tl.constexpr,  # 32
     BLOCK_N: tl.constexpr,  # 128
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -758,6 +814,7 @@ def _bwd_kernel_dkdv_noncausal(
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
             seqlen_q, seqlen_k,  # max sequence length for q and k
             start_n, start_m, num_steps,  # iteration numbers
+            descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
             MASK=False,  # causal masking
             ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
             USE_EXP2=USE_EXP2,
@@ -789,6 +846,7 @@ def _bwd_kernel_dq_noncausal(
     cu_seqlens_q, cu_seqlens_k,
     max_seqlen_q, max_seqlen_k,
     dropout_mask, dropout_p, philox_seed, philox_offset_base,
+    descale_q, descale_k, descale_v, descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLK_SLICE_FACTOR: tl.constexpr,
@@ -869,17 +927,18 @@ def _bwd_kernel_dq_noncausal(
 
         dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
         dq = _bwd_dq_inner(
-            dq,  #
-            q, K, V, do, m, Delta_ptr, sm_scale, #
-            stride_qm, stride_qk, stride_kn,  #
-            stride_dropoutm, stride_dropoutn,  #
+            dq,
+            q, K, V, do, m, Delta_ptr, sm_scale,
+            stride_qm, stride_qk, stride_kn,
+            stride_dropoutm, stride_dropoutn,
             stride_deltam,
-            seqlen_q, seqlen_k,  #
-            BLOCK_M, BLOCK_N,  #
-            HEAD_DIM, ACTUAL_HEAD_DIM,  #
-            dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
-            start_m, start_n, end_n, num_steps,  #
-            MASK=False,  #
+            seqlen_q, seqlen_k,
+            BLOCK_M, BLOCK_N,
+            HEAD_DIM, ACTUAL_HEAD_DIM,
+            dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+            start_m, start_n, end_n, num_steps,
+            descale_q, descale_k, descale_v, descale_do,
+            MASK=False,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             USE_EXP2=USE_EXP2,
             IS_FP8=IS_FP8,
@@ -1036,6 +1095,7 @@ def attention_prefill_backward_triton_split_impl(
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
+            descale_q, descale_k, descale_v, descale_do, 
             BLOCK_M1, BLOCK_N1, BLK_SLICE_FACTOR,
             HEAD_DIM, ACTUAL_HEAD_DIM,
             ENABLE_DROPOUT=use_dropout,
@@ -1064,6 +1124,7 @@ def attention_prefill_backward_triton_split_impl(
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
+            descale_q, descale_k, descale_v, descale_do, 
             BLOCK_M2, BLOCK_N2, BLK_SLICE_FACTOR,
             HEAD_DIM, ACTUAL_HEAD_DIM,
             ENABLE_DROPOUT=use_dropout,
@@ -1091,6 +1152,7 @@ def attention_prefill_backward_triton_split_impl(
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
+            descale_q, descale_k, descale_v, descale_do, 
             BLOCK_M1, BLOCK_N1, BLK_SLICE_FACTOR,
             HEAD_DIM, ACTUAL_HEAD_DIM,
             ENABLE_DROPOUT=use_dropout,
@@ -1118,6 +1180,7 @@ def attention_prefill_backward_triton_split_impl(
             cu_seqlens_q, cu_seqlens_k,
             max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
+            descale_q, descale_k, descale_v, descale_do, 
             BLOCK_M2, BLOCK_N2, BLK_SLICE_FACTOR,
             HEAD_DIM, ACTUAL_HEAD_DIM,
             ENABLE_DROPOUT=use_dropout,
