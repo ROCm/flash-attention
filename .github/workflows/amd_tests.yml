@@ -13,7 +13,6 @@ permissions: read-all
 
 jobs:
   Integration-Tests-AMD:
-    if: false
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
