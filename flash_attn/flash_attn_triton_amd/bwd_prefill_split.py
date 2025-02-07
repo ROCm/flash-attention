@@ -191,8 +191,8 @@ def _bwd_dkdv_inner(
                 dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             if IS_FP8:
-                scale_p, descale_p = compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (tl.dot((pT * scale_p).to(do.type.element_ty), do) * descale_p * descale_do)
+                scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
+                dv += (tl.dot((pT * scale_pT).to(do.type.element_ty), do) * descale_pT * descale_do)
             else:
                 dv += tl.dot(pT.to(do.type.element_ty), do)
 
@@ -211,8 +211,8 @@ def _bwd_dkdv_inner(
             dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
         dsT = pT * (dpT - Di[None, :])
         if IS_FP8:
-            scale_ds, descale_ds = compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (tl.dot((dsT * scale_ds).to(qT.type.element_ty), tl.trans(qT)) * descale_ds * descale_q)
+            scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
+            dk += (tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT)) * descale_dsT * descale_q)
         else:
             dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
         # Increment pointers.

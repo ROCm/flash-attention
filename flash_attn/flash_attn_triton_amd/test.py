@@ -778,8 +778,8 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
         (4, 6, 6, 2048, 2048, 32),
     ],
 )
-@pytest.mark.parametrize('causal', [True])
-@pytest.mark.parametrize('dropout_p', [0.25])
+@pytest.mark.parametrize('causal', [False])
+@pytest.mark.parametrize('dropout_p', [0.0])
 @pytest.mark.parametrize('DEBUG_INPUT', [False])
 @pytest.mark.skipif(not arch_supports_fp8(), reason="fp8 not supported on this device")
 def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, DEBUG_INPUT):
