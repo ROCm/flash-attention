@@ -83,4 +83,6 @@ jobs:
         if: matrix.runner == 'gfx1100'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          pytest tests/test_flash_attn_triton_amd.py::test_flash_attn_output tests/test_flash_attn_triton_amd.py::test_flash_attn_varlen_output tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache
+          
+          # NOTE: this exceeds 6 hrs on "gfx1100" so sample a subset of the tests. The full suite is run on a CDNA machine.
+          pytest --randomly-seed=42 --randomly-sample=0.10 tests/test_flash_attn_triton_amd.py
