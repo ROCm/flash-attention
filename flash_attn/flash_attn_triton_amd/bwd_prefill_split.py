@@ -224,7 +224,7 @@ def _bwd_dkdv_inner(
 
 # grid = (max_seqlen_k // BLOCK_N, batch, nheads_q)
 @triton.jit
-def _bwd_kernel_dkdv(
+def _bwd_kernel_dkdv_causal(
     Q, K, V, sm_scale, DO, DK, DV,
     M, Delta,
     stride_qb, stride_qh, stride_qm, stride_qk,
@@ -545,7 +545,7 @@ def _bwd_dq_inner(
 
 # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
 @triton.jit
-def _bwd_kernel_dq(
+def _bwd_kernel_dq_causal(
     Q, K, V, sm_scale, DO, DQ,
     M, Delta,
     stride_qb, stride_qh, stride_qm, stride_qk,
@@ -1122,7 +1122,7 @@ def attention_prefill_backward_triton_split_impl(
     grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, nheads_k)
     if causal:
         if DEBUG_TRITON: print(f"_bwd_kernel_dkdv: grid = {grid_dkdv}, block_size = ({BLOCK_M1, BLOCK_N1})", )  # noqa: E701
-        _bwd_kernel_dkdv[grid_dkdv](
+        _bwd_kernel_dkdv_causal[grid_dkdv](
             q, k, v, sm_scale, do, dk, dv,
             softmax_lse, delta,
             stride_qb, stride_qh, stride_qm, stride_qk,
@@ -1152,7 +1152,7 @@ def attention_prefill_backward_triton_split_impl(
         )
 
         if DEBUG_TRITON: print(f"\n_bwd_kernel_dq: grid = {grid_dq}, block_size = ({BLOCK_M2, BLOCK_N2})", )  # noqa: E701
-        _bwd_kernel_dq[grid_dq](
+        _bwd_kernel_dq_causal[grid_dq](
             q, k, v, sm_scale, do, dq,
             softmax_lse, delta,
             stride_qb, stride_qh, stride_qm, stride_qk,
