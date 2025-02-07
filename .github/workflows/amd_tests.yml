@@ -70,9 +70,13 @@ jobs:
       #   if: matrix.runner == 'linux-mi300-gpu-1'
       #   run: |
       #     export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-      
-      #     # bench with autotune
-      #     FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1 python flash_attn/flash_attn_triton_amd/bench.py
+      #     python flash_attn/flash_attn_triton_amd/bench.py
+      # - name: AMD Bench with Autotune
+      #   if: matrix.runner == 'linux-mi300-gpu-1'
+      #   run: |
+      #     export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+      #     export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1
+      #     python flash_attn/flash_attn_triton_amd/bench.py
       
       # RDNA Tests
       - name: Flash Attention RDNA Tests
