@@ -70,10 +70,7 @@ jobs:
       #   if: matrix.runner == 'linux-mi300-gpu-1'
       #   run: |
       #     export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-
-      #     # bench without autotune
-      #     python flash_attn/flash_attn_triton_amd/bench.py
-
+      
       #     # bench with autotune
       #     FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1 python flash_attn/flash_attn_triton_amd/bench.py
       
