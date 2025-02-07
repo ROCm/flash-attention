@@ -24,14 +24,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      
       - name: Show Device Info
         run: |
           rocminfo | grep gfx
+      
       - name: Uninstall Triton
         run : |
           pip uninstall -y triton
           rm -rf ~/.triton
           rm -rf ./triton/python/build
+      
       - name: Install Triton
         run: |
           git clone https://github.com/triton-lang/triton
@@ -41,42 +44,41 @@ jobs:
           pip install matplotlib pandas pytest # triton bench dependencies
           pip install --verbose --no-build-isolation ./python
           cd ..
+      
       - name: Show Triton version
         run: |
           pip show triton
+      
       - name: Build
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           python setup.py install
 
-      # CDNA Tests
-      - name: Flash Attention Tests Using Reference Impl
+      - name: Flash Attention Tests using Pytorch reference implementation
         if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          export FLASH_ATTENTION_TRITON_AMD_REF=1
-          pytest tests/test_flash_attn_triton_amd.py
+          FLASH_ATTENTION_TRITON_AMD_REF=1 pytest tests/test_flash_attn_triton_amd.py
+      
+      # CDNA Tests
       - name: Flash Attention CDNA Tests
         if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           pytest tests/test_flash_attn_triton_amd.py
+      
+      # FIXME: run the full suite
       - name: AMD Tests
         if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           pytest -v -s flash_attn/flash_attn_triton_amd/test.py::test_op_prefill_fp8 flash_attn/flash_attn_triton_amd/test.py::test_op_prefill_varlen_fp8
+
       - name: AMD Bench
         if: matrix.runner == 'linux-mi300-gpu-1'
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          python flash_attn/flash_attn_triton_amd/bench.py
-      - name: AMD Bench with Autotune
-        if: matrix.runner == 'linux-mi300-gpu-1'
-        run: |
-          export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-          export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1
-          python flash_attn/flash_attn_triton_amd/bench.py
+          FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=1 python flash_attn/flash_attn_triton_amd/bench.py
       
       # RDNA Tests
       - name: Flash Attention RDNA Tests
