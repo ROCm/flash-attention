@@ -3,6 +3,7 @@ import torch
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill import attention_prefill_backward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
+from .bwd_prefill_split_oneKernel import attention_prefill_backward_triton_split_oneKernel_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .utils import USE_SINGLE_BWD_KERNEL
 
@@ -11,20 +12,20 @@ class _attention_prefill(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, o, metadata):
         output, softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
-                                                q, 
-                                                k, 
-                                                v, 
-                                                o, 
-                                                metadata.sm_scale, 
-                                                metadata.alibi_slopes, 
-                                                metadata.causal, 
+                                                q,
+                                                k,
+                                                v,
+                                                o,
+                                                metadata.sm_scale,
+                                                metadata.alibi_slopes,
+                                                metadata.causal,
                                                 metadata.bias,
-                                                metadata.layout, 
-                                                metadata.cu_seqlens_q, 
+                                                metadata.layout,
+                                                metadata.cu_seqlens_q,
                                                 metadata.cu_seqlens_k,
-                                                metadata.max_seqlens_q, 
+                                                metadata.max_seqlens_q,
                                                 metadata.max_seqlens_k,
-                                                metadata.dropout_p, 
+                                                metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.return_scores,
@@ -48,8 +49,8 @@ class _attention_prefill(torch.autograd.Function):
         if USE_SINGLE_BWD_KERNEL:
             bwd = attention_prefill_backward_triton_impl
         else:
-            # bwd = attention_prefill_backward_triton_split_impl
             bwd = attention_prefill_backward_triton_split_oneKernel_impl
+            # bwd = attention_prefill_backward_triton_split_impl
         return bwd(
             do,
             q,
@@ -68,8 +69,8 @@ class _attention_prefill(torch.autograd.Function):
             None,
             None,
             None,
-            ctx.dropout_p, 
-            ctx.philox_seed, 
+            ctx.dropout_p,
+            ctx.philox_seed,
             ctx.philox_offset,
             ctx.use_exp2
         )
