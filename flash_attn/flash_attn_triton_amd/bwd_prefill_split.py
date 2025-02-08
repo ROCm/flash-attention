@@ -274,7 +274,7 @@ def _bwd_kernel_dkdv(
         mask_kv &= mask_k[None, :]
     offs_kv = offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
 
-    GROUP_SIZE = HQ // HK
+    GROUP_SIZE: tl.constexpr = HQ // HK
     # K/V tensors not changed for the group
     adj_kv = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
     # load K and V: they stay in SRAM throughout the inner loop.
@@ -556,7 +556,7 @@ def _bwd_kernel_dq(
     K +=  adj_kv
     V +=  adj_kv
     # If MQA / GQA, set the K and V head offsets appropriately.
-    GROUP_SIZE = HQ // HK
+    GROUP_SIZE: tl.constexpr = HQ // HK
     for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
         # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
         #   for every M-tile
@@ -704,7 +704,7 @@ def _bwd_kernel_dkdv_noncausal(
         mask_kv &= mask_k[None, :]
     offs_kv = offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
 
-    GROUP_SIZE = HQ // HK
+    GROUP_SIZE: tl.constexpr = HQ // HK
     # K/V tensors not changed for the group
     adj_kv = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
     # load K and V: they stay in SRAM throughout the inner loop.
@@ -820,7 +820,7 @@ def _bwd_kernel_dq_noncausal(
     K +=  adj_kv
     V +=  adj_kv
     # If MQA / GQA, set the K and V head offsets appropriately.
-    GROUP_SIZE = HQ // HK
+    GROUP_SIZE: tl.constexpr = HQ // HK
     for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
         # offset input and output tensor by batch and Q/K heads
         adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
