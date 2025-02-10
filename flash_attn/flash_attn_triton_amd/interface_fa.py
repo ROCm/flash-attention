@@ -27,8 +27,7 @@ def fwd(q,
         gen_,
         descale_q,
         descale_k,
-        descale_v,
-        descale_p):
+        descale_v):
 
     if DEBUG:
         print()
@@ -119,8 +118,7 @@ def fwd(q,
                                                 metadata.use_exp2,
                                                 descale_q,
                                                 descale_k,
-                                                descale_v,
-                                                descale_p)
+                                                descale_v)
 
     if DEBUG:
         print("fwd outputs")
@@ -150,6 +148,10 @@ def bwd(
     deterministic,
     gen_,
     rng_state,
+    descale_q,
+    descale_k,
+    descale_v,
+    descale_do
 ):
     # NOTE: this might have perf costs
     dq.zero_()
@@ -241,6 +243,10 @@ def bwd(
             philox_seed,
             philox_offset,
             False,
+            descale_q = descale_q,
+            descale_k = descale_k,
+            descale_v = descale_v,
+            descale_do = descale_do
         )
         delta = delta_triton
 
@@ -275,8 +281,7 @@ def varlen_fwd(
         gen_,
         descale_q,
         descale_k,
-        descale_v,
-        descale_p):
+        descale_v):
 
     if DEBUG:
         print()
@@ -369,8 +374,7 @@ def varlen_fwd(
                                                             metadata.use_exp2,
                                                             descale_q,
                                                             descale_k,
-                                                            descale_v,
-                                                            descale_p)
+                                                            descale_v)
     if DEBUG:
         print("varlen_fwd outputs")
         print("o:", o, o.shape)
@@ -405,6 +409,10 @@ def varlen_bwd(
     deterministic,
     gen_,
     rng_state,
+    descale_q,
+    descale_k,
+    descale_v,
+    descale_do
 ):
     if DEBUG:
         print()
@@ -493,6 +501,10 @@ def varlen_bwd(
             philox_seed,
             philox_offset,
             False,
+            descale_q = descale_q,
+            descale_k = descale_k,
+            descale_v = descale_v,
+            descale_do = descale_do
         )
         delta = delta_triton
 
