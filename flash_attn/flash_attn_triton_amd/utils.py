@@ -258,7 +258,7 @@ def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device="cuda
     return q, k, v, input_metadata
 
 
-def cast_to_fp8(
+def cast_nonvarlen_to_fp8(
     x: torch.Tensor,
     fp8_dtype,
     layout,
@@ -272,24 +272,75 @@ def cast_to_fp8(
         raise ValueError("unknown layout")
 
     # compute the absolute max along reduce_dims, clamped to avoid 0-scale
-    t_abs_max = x.abs().amax(dim=reduce_dims)
-    t_abs_max = torch.maximum(t_abs_max, x.new_tensor(clamp_val))
+    x_abs_max = x.abs().amax(dim=reduce_dims)
+    x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
 
     # unsqueeze back to a shape suitable for broadcast
     #    e.g. for (Z, N_CTX, H, D_HEAD) and reduce_dims=(1,3),
     #    we get shape (Z, 1, H, 1)
     for d in sorted(reduce_dims):
-        t_abs_max = t_abs_max.unsqueeze(d)
+        x_abs_max = x_abs_max.unsqueeze(d)
 
     # compute scale and descale
     fp8_max = torch.finfo(fp8_dtype).max
-    scale = fp8_max / t_abs_max
-    descale_factor = t_abs_max / fp8_max
+    scale = fp8_max / x_abs_max
+    descale_factor = x_abs_max / fp8_max
 
     # cast to FP8, optionally setting requires_grad
-    fp8_tensor = (x * scale).to(fp8_dtype)
+    x_fp8 = (x * scale).to(fp8_dtype)
 
-    return fp8_tensor, descale_factor
+    return x_fp8, descale_factor
+
+def cast_varlen_to_fp8(
+    x: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    cu_seqlens,
+    clamp_val: float = 1e-9,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # params
+    batch = cu_seqlens.shape[0] - 1
+    num_heads = x.shape[1]
+    fp8_max = torch.finfo(fp8_dtype).max
+   
+    # compute scale and descale factors per sequence
+    x_fp8 = torch.empty_like(x, dtype=fp8_dtype)
+    descale_factors = torch.empty((batch, num_heads), device=x.device, dtype=torch.float32)
+    for i in range(batch):
+        start = cu_seqlens[i]
+        end   = cu_seqlens[i + 1]
+        x_slice = x[start:end]  # [seq_len_i, heads, dim]
+
+        # compute per-head max across seqlens & dims amax shape will be [heads]
+        x_abs_max = x_slice.abs().amax(dim=(0, 2))
+        x_abs_max = torch.maximum(x_abs_max, x.new_tensor(clamp_val))
+
+        # scale per head
+        scale_i = fp8_max / x_abs_max
+        descale_i = x_abs_max / fp8_max
+
+        # cast to fp8. we unsqueeze x to broadcast scale to [1, heads, 1]
+        x_fp8[start:end] = (x_slice * scale_i.unsqueeze(0).unsqueeze(-1)).to(fp8_dtype)
+
+        # store descale_factors
+        descale_factors[i, :] = descale_i
+
+    return x_fp8, descale_factors
+
+def cast_to_fp8(
+    x: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    layout: str,
+    clamp_val: float = 1e-9,
+    cu_seqlens=None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if layout in ("bshd", "bhsd"):
+        return cast_nonvarlen_to_fp8(x, fp8_dtype, layout, clamp_val)
+    elif layout == "thd":
+        if cu_seqlens is None:
+            raise ValueError("cu_seqlens must be provided for varlen (thd) layout")
+        return cast_varlen_to_fp8(x, fp8_dtype, cu_seqlens, clamp_val)
+    else:
+        raise ValueError(f"Unknown layout: {layout}")
 
 def get_shape_from_layout(q, k, layout, cu_seqlens_q = None, cu_seqlens_k = None, max_seqlen_q=None, max_seqlen_k=None):
     if layout == 'bhsd':

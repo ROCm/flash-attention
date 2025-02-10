@@ -843,6 +843,9 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
             descale_v=descale_v,
             descale_do=descale_do
         )
+    
+    # fp8 backward pass
+    dq_fp8, dk_fp8, dv_fp8 = torch.autograd.grad(out_fp8, (q_fp8, k_fp8, v_fp8), do_fp8)
 
     # compare forward
     if DEBUG:
@@ -863,10 +866,6 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
         print("S_dmask_fp16:", S_dmask_fp16, S_dmask_fp16.shape if S_dmask_fp16 is not None else None )
         print("S_dmask_fp8:", S_dmask_fp8, S_dmask_fp8.shape if S_dmask_fp16 is not None else None)
     torch.testing.assert_close(S_dmask_fp16.to(torch.float32) if S_dmask_fp16 is not None else None, S_dmask_fp8.to(torch.float32) if S_dmask_fp8 is not None else None, atol=ATOL_fp8, rtol=RTOL_fp8)
-    
-    # fp8 backward pass
-    dq_fp8, dk_fp8, dv_fp8 = torch.autograd.grad(out_fp8, (q_fp8, k_fp8, v_fp8), do_fp8)
-
     # compare backward
     if DEBUG:
         print("dv_fp16:", dv_fp16, dv_fp16.shape)
@@ -969,62 +968,11 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
     # ----------------------------------------------------------------
     # --- FP8 ---
     # ----------------------------------------------------------------
-    type_max = torch.finfo(torch.float8_e4m3fnuz).max
-
-    # get maxes
-    q_maxes = []
-    k_maxes = []
-    v_maxes = []
-    do_maxes = []
-    for i in range(Z):
-        q_start = metadata.cu_seqlens_q[i]
-        q_end = metadata.cu_seqlens_q[i + 1]
-        k_start = metadata.cu_seqlens_k[i]
-        k_end = metadata.cu_seqlens_k[i + 1]
-
-        # compute max for each batch-head pair across seqlen and dim
-        q_max = torch.maximum(q[q_start:q_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
-        k_max = torch.maximum(k[k_start:k_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
-        v_max = torch.maximum(v[k_start:k_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
-        do_max = torch.maximum(do[q_start:q_end].abs().amax(dim=(0,2)), torch.tensor(1e-9)).unsqueeze(-1)
-
-        q_maxes.append(q_max)
-        k_maxes.append(k_max)
-        v_maxes.append(v_max)
-        do_maxes.append(do_max)
-    q_maxes = torch.stack(q_maxes)
-    k_maxes = torch.stack(k_maxes)
-    v_maxes = torch.stack(v_maxes)
-    do_maxes = torch.stack(do_maxes)
-
-    # compute scaling and descaling factors
-    scale_q, descale_q = type_max/ q_maxes, q_maxes / type_max
-    scale_k, descale_k = type_max/ k_maxes, k_maxes / type_max
-    scale_v, descale_v = type_max/ v_maxes, v_maxes / type_max
-    scale_do, descale_do = type_max/ do_maxes, do_maxes / type_max
-
-    # scale tensors to fp8 range
-    q_fp8 = torch.zeros_like(q, dtype=torch.float8_e4m3fnuz)
-    k_fp8 = torch.zeros_like(k, dtype=torch.float8_e4m3fnuz)
-    v_fp8 = torch.zeros_like(v, dtype=torch.float8_e4m3fnuz)
-    do_fp8 = torch.zeros_like(do, dtype=torch.float8_e4m3fnuz)
-    for i in range(Z):
-        q_start = metadata.cu_seqlens_q[i]
-        q_end   = metadata.cu_seqlens_q[i + 1]
-        k_start = metadata.cu_seqlens_k[i]
-        k_end   = metadata.cu_seqlens_k[i + 1]
-
-        # q, k, v are [L, heads, dim] slices
-        q_slice = q[q_start:q_end]  # [seq_len_i, HQ, dim]
-        k_slice = k[k_start:k_end]  # [seq_len_i, HK, dim]
-        v_slice = v[k_start:k_end]  # [seq_len_i, HK, dim]
-        do_slice = do[q_start:q_end]  # [seq_len_i, HQ, dim]
-
-        # Convert them to FP8
-        q_fp8[q_start:q_end] = (q_slice * scale_q[i]).to(torch.float8_e4m3fnuz)
-        k_fp8[k_start:k_end] = (k_slice * scale_k[i]).to(torch.float8_e4m3fnuz)
-        v_fp8[k_start:k_end] = (v_slice * scale_v[i]).to(torch.float8_e4m3fnuz)
-        do_fp8[q_start:q_end] = (do_slice * scale_do[i]).to(torch.float8_e4m3fnuz)
+    # cast to fp8
+    q_fp8, descale_q = cast_to_fp8(q, torch.float8_e4m3fnuz, layout, cu_seqlens=metadata.cu_seqlens_q)
+    k_fp8, descale_k = cast_to_fp8(k, torch.float8_e4m3fnuz, layout, cu_seqlens=metadata.cu_seqlens_k)
+    v_fp8, descale_v = cast_to_fp8(v, torch.float8_e4m3fnuz, layout, cu_seqlens=metadata.cu_seqlens_k)
+    do_fp8, descale_do = cast_to_fp8(do, torch.float8_e4m3fnuz, layout, cu_seqlens=metadata.cu_seqlens_q)
 
     # launch kernel in fp8
     out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_varlen_func(
@@ -1047,6 +995,9 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
             descale_v=descale_v,
             descale_do=descale_do
         )
+    
+    # fp8 backward pass
+    dq_fp8, dk_fp8, dv_fp8 = torch.autograd.grad(out_fp8, (q_fp8, k_fp8, v_fp8), do_fp8)
 
     # compare forward
     if DEBUG:
@@ -1068,9 +1019,6 @@ def test_op_prefill_varlen_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, drop
         print("S_dmask_fp8:", S_dmask_fp8, S_dmask_fp8.shape if S_dmask_fp16 is not None else None)
     torch.testing.assert_close(S_dmask_fp16.to(torch.float32) if S_dmask_fp16 is not None else None, S_dmask_fp8.to(torch.float32) if S_dmask_fp8 is not None else None, atol=ATOL_fp8, rtol=RTOL_fp8)
     
-    # fp8 backward pass
-    dq_fp8, dk_fp8, dv_fp8 = torch.autograd.grad(out_fp8, (q_fp8, k_fp8, v_fp8), do_fp8)
-
     # compare backward
     if DEBUG:
         print("dv_fp16:", dv_fp16, dv_fp16.shape)
