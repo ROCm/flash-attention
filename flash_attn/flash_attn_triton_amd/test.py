@@ -3,7 +3,7 @@ import pytest
 import numpy as np
 from flash_attn import flash_attn_func, flash_attn_varlen_func
 
-from .utils import DEBUG, DEBUG_TRITON, DEBUG_TRITON_DETAIL, MetaData, get_input_shapes, input_helper, varlen_input_helper, compute_alibi_tensor_ref, get_arch, arch_supports_fp8
+from .utils import DEBUG, DEBUG_TRITON, DEBUG_TRITON_DETAIL, MetaData, cast_to_fp8, get_input_shapes, input_helper, varlen_input_helper, compute_alibi_tensor_ref, get_arch, arch_supports_fp8
 from .interface_torch import attention_prefill, attention_decode
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .fwd_prefill import attention_prefill_forward_triton_impl
@@ -740,7 +740,6 @@ def test_op_fwd_decode_int4_kv(B, Mq, Mkv, Hq, Hkv, K, dtype=torch.float16):
     dq_ref_out = dq_attn @ dqv
     torch.testing.assert_close(dq_ref_out, tri_out, atol=1e-3, rtol=0)
 
-
 @pytest.mark.parametrize(
     "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
     [
@@ -821,31 +820,17 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
     # ----------------------------------------------------------------
     # --- FP8 ---
     # ----------------------------------------------------------------
-    type_max = torch.finfo(torch.float8_e4m3fnuz).max
-
-    # compute max for each batch-head pair across seqlen and dim
-    q_max = torch.maximum(q.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
-    k_max = torch.maximum(k.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
-    v_max = torch.maximum(v.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
-    do_max = torch.maximum(do.abs().amax(dim=(1, 3)), torch.tensor(1e-9)).unsqueeze(1).unsqueeze(-1)
-
-    # compute scaling and descaling factors
-    scale_q, descale_q = type_max/ q_max, q_max / type_max
-    scale_k, descale_k = type_max/ k_max, k_max / type_max
-    scale_v, descale_v = type_max/ v_max, v_max / type_max
-    scale_do, descale_do = type_max/ do_max, do_max / type_max
-
-    # scale values to fp8 range
-    q_fp8 = (q.clone() * scale_q).to(torch.float8_e4m3fnuz).requires_grad_()
-    k_fp8 = (k.clone() * scale_k).to(torch.float8_e4m3fnuz).requires_grad_()
-    v_fp8 = (v.clone() * scale_v).to(torch.float8_e4m3fnuz).requires_grad_()
-    do_fp8 = (do.clone() * scale_do).to(torch.float8_e4m3fnuz)
+    # cast to fp8
+    q_fp8, descale_q= cast_to_fp8(q, torch.float8_e4m3fnuz, layout)
+    k_fp8, descale_k = cast_to_fp8(k, torch.float8_e4m3fnuz, layout)
+    v_fp8, descale_v = cast_to_fp8(v, torch.float8_e4m3fnuz, layout)
+    do_fp8, descale_do = cast_to_fp8(do, torch.float8_e4m3fnuz, layout)
 
     # fp8 forward pass
     out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_func(
-            q_fp8,
-            k_fp8,
-            v_fp8,
+            q_fp8.requires_grad_(),
+            k_fp8.requires_grad_(),
+            v_fp8.requires_grad_(),
             dropout_p,
             causal=causal,
             window_size=window_size,
@@ -905,37 +890,37 @@ def test_op_prefill_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, 
 @pytest.mark.parametrize(
     "Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
     [
-        # (1, 1, 1, 1, 1, 1),
-        # (1, 1, 1, 2, 4, 16),
-        # (1, 2, 2, 2, 4, 16),
-        # (1, 4, 1, 2, 4, 16),
-        # (1, 4, 2, 2, 4, 16),
-        # (1, 1, 1, 4, 2, 16),
-        # (1, 1, 1, 4, 4, 16),
-        # (1, 2, 2, 4, 4, 16),
-        # (2, 1, 1, 4, 4, 16),
-        # (2, 2, 2, 4, 4, 16),
-        # (1, 1, 1, 128, 64, 16),
-        # (2, 2, 2, 2, 128, 1),
-        # (2, 3, 3, 2, 128, 16),
-        # (3, 2, 2, 256, 512, 16),
-        # (3, 3, 3, 128, 128, 64),
-        # (2, 4, 4, 1024, 1024, 64),
-        # (4, 6, 6, 108, 256, 224),
-        # (4, 8, 8, 2048, 2048, 128),
-        # (4, 16, 16, 4096, 4096, 64),
-        # (2, 4, 4, 8192, 8192, 32),
+        (1, 1, 1, 1, 1, 1),
+        (1, 1, 1, 2, 4, 16),
+        (1, 2, 2, 2, 4, 16),
+        (1, 4, 1, 2, 4, 16),
+        (1, 4, 2, 2, 4, 16),
+        (1, 1, 1, 4, 2, 16),
+        (1, 1, 1, 4, 4, 16),
+        (1, 2, 2, 4, 4, 16),
+        (2, 1, 1, 4, 4, 16),
+        (2, 2, 2, 4, 4, 16),
+        (1, 1, 1, 128, 64, 16),
+        (2, 2, 2, 2, 128, 1),
+        (2, 3, 3, 2, 128, 16),
+        (3, 2, 2, 256, 512, 16),
+        (3, 3, 3, 128, 128, 64),
+        (2, 4, 4, 1024, 1024, 64),
+        (4, 6, 6, 108, 256, 224),
+        (4, 8, 8, 2048, 2048, 128),
+        (4, 16, 16, 4096, 4096, 64),
+        (2, 4, 4, 8192, 8192, 32),
         # fa configs
-        # (4, 6, 1, 113, 203, 256),
-        (2, 3, 1, 128, 217, 32),
-        # (4, 6, 2, 113, 211, 128),
-        # (4, 6, 2, 108, 256, 128),
-        # (4, 6, 1, 256, 512, 64),
-        # (4, 6, 1, 512, 256, 64),
-        # (4, 6, 2, 1024, 1024, 32),
-        # (4, 6, 2, 1023, 1024, 32),
-        # (4, 6, 6, 1024, 1023, 32),
-        # (4, 6, 6, 2048, 2048, 32),
+        (4, 6, 1, 113, 203, 256),
+        (4, 6, 1, 128, 217, 256),
+        (4, 6, 2, 113, 211, 128),
+        (4, 6, 2, 108, 256, 128),
+        (4, 6, 1, 256, 512, 64),
+        (4, 6, 1, 512, 256, 64),
+        (4, 6, 2, 1024, 1024, 32),
+        (4, 6, 2, 1023, 1024, 32),
+        (4, 6, 6, 1024, 1023, 32),
+        (4, 6, 6, 2048, 2048, 32),
     ],
 )
 @pytest.mark.parametrize('causal', [False])

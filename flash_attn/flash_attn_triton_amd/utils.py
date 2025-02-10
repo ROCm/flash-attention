@@ -258,6 +258,39 @@ def varlen_input_helper(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, device="cuda
     return q, k, v, input_metadata
 
 
+def cast_to_fp8(
+    x: torch.Tensor,
+    fp8_dtype,
+    layout,
+    clamp_val=1e-9,
+):
+    if layout == "bshd":
+        reduce_dims = (1, 3)
+    elif layout == "bhsd":
+        reduce_dims = (2, 3)
+    else:
+        raise ValueError("unknown layout")
+
+    # compute the absolute max along reduce_dims, clamped to avoid 0-scale
+    t_abs_max = x.abs().amax(dim=reduce_dims)
+    t_abs_max = torch.maximum(t_abs_max, x.new_tensor(clamp_val))
+
+    # unsqueeze back to a shape suitable for broadcast
+    #    e.g. for (Z, N_CTX, H, D_HEAD) and reduce_dims=(1,3),
+    #    we get shape (Z, 1, H, 1)
+    for d in sorted(reduce_dims):
+        t_abs_max = t_abs_max.unsqueeze(d)
+
+    # compute scale and descale
+    fp8_max = torch.finfo(fp8_dtype).max
+    scale = fp8_max / t_abs_max
+    descale_factor = t_abs_max / fp8_max
+
+    # cast to FP8, optionally setting requires_grad
+    fp8_tensor = (x * scale).to(fp8_dtype)
+
+    return fp8_tensor, descale_factor
+
 def get_shape_from_layout(q, k, layout, cu_seqlens_q = None, cu_seqlens_k = None, max_seqlen_q=None, max_seqlen_k=None):
     if layout == 'bhsd':
         batch_q, nheads_q, max_seqlen_q, head_size_q = q.shape
