@@ -41,7 +41,7 @@ jobs:
           cd triton
           git checkout 3ca2f498e98ed7249b82722587c511a5610e00c4
           pip install ninja cmake wheel pybind11 # build-time dependencies
-          pip install matplotlib pandas pytest pytest-randomly # triton bench dependencies
+          pip install matplotlib pandas pytest # triton bench dependencies
           pip install --verbose --no-build-isolation ./python
           cd ..
       
@@ -86,5 +86,5 @@ jobs:
         run: |
           export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
           
-          # NOTE: this exceeds 6 hrs on "gfx1100" so sample a subset of the tests. The full suite is run on a CDNA machine.
-          pytest --randomly-seed=42 --randomly-sample=0.10 tests/test_flash_attn_triton_amd.py
+          # NOTE: this exceeds 6 hrs on "gfx1100" so we are testing a subset of the tests. The full suite is run on a CDNA machine.
+          pytest tests/test_flash_attn_triton_amd.py::test_flash_attn_output
