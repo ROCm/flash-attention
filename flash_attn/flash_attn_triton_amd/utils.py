@@ -318,7 +318,7 @@ def cast_varlen_to_fp8(
         scale_i = fp8_max / x_abs_max
         descale_i = x_abs_max / fp8_max
 
-        # cast to fp8. we unsqueeze x to broadcast scale to [1, heads, 1]
+        # cast to fp8. NOTE: we unsqueeze scale to [1, heads, 1] so that we can to broadcast to x
         x_fp8[start:end] = (x_slice * scale_i.unsqueeze(0).unsqueeze(-1)).to(fp8_dtype)
 
         # store descale_factors
