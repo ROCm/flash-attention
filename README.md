@@ -142,12 +142,13 @@ These features are supported in Fwd and Bwd
 7) Rotary embeddings
 
 These features are supported in Fwd for now. We will add them to backward soon.
-2) ALiBi and matrix bias
+1) ALiBi
 
 These features are in development
-1) Paged Attention 
+1) FP8
+2) Paged Attention 
 2) Sliding Window
-5) Performance Improvements
+3) Performance Improvements
 
 ##### Getting Started
 To get started with the triton backend for AMD, follow the steps below.
@@ -160,15 +161,14 @@ pip install triton==3.2.0
 Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
 ```
-export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 cd flash-attention
 git checkout main_perf
-python setup.py install
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
 ```
 
 To test that things are working, you can run our tests. These tests take hours so you don't need to run the full thing.
 ```
-pytest tests/test_flash_attn_triton_amd.py
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
 ```
 
 ###### Docker
@@ -202,8 +202,6 @@ To run the docker image
 ```
 docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
 ```
-
-
 
 ## How to use FlashAttention
 
