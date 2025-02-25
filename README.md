@@ -157,21 +157,44 @@ First install the recommended Triton version
 ```
 pip install triton==3.2.0
 ```
-Then install and test Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
+Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
 ```
 export FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 cd flash-attention
+git checkout main_perf
 python setup.py install
+```
+
+To test that things are working, you can run our tests. These tests take hours so you don't need to run the full thing.
+```
 pytest tests/test_flash_attn_triton_amd.py
 ```
 
 ###### Docker
-We have also created a Dockerfile.
+You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
+```
+FROM rocm/pytorch:rocm6.3.2_ubuntu22.04_py3.10_pytorch_release_2.4.0
+
+WORKDIR /workspace
+
+# install triton
+RUN pip install triton=3.2.0
+
+# install flash attention
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+
+RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
+    cd flash-attention &&\
+    git checkout main_perf &&\
+    python setup.py install
+
+# set working dir
+WORKDIR /workspace/flash-attention
+```
 
 To build the docker file
 ```
-cd flash_attn/flash_attn_triton_amd
 docker build -t fa_triton .
 ```
 
@@ -179,10 +202,7 @@ To run the docker image
 ```
 docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
 ```
-Inside the docker, it should open to the flash attention repo with everything installed. You can run the following command to test things.
-```
-pytest tests/test_flash_attn_triton_amd.py
-```
+
 
 
 ## How to use FlashAttention
