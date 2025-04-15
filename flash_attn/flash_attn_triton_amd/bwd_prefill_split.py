@@ -6,8 +6,8 @@ from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
-tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
-tl_DROPOUT_DUMP: tl.constexpr = DROPOUT_DUMP
+tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
+tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 # This function computes delta given output Out and gradient DO
 # Here is the I/O shape:

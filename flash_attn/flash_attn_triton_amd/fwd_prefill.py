@@ -5,8 +5,8 @@ from typing import Literal, Optional, Union
 from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_fp8_scaling_factors, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, write_dropout_mask, create_dropout_mask
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
-tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
-tl_DROPOUT_DUMP: tl.constexpr = DROPOUT_DUMP
+tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
+tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 # Convenience function to load with optional boundary checks.
 # "First" is the major dim, "second" is the minor dim.

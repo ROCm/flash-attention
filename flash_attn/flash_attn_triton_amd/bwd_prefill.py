@@ -6,8 +6,8 @@ from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling
 
 # TODO: move this into utils.py so it's shared among kernels
 # NOTE: triton fails to import tl.constexprs so create them here for the file
-tl_DROPOUT_USE_PYTORCH: tl.constexpr = DROPOUT_USE_PYTORCH
-tl_DROPOUT_DUMP: tl.constexpr = DROPOUT_DUMP
+tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
+tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 @triton.jit
 def _bwd_preprocess(
