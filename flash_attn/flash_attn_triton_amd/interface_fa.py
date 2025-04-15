@@ -372,7 +372,8 @@ def varlen_fwd(
         gen_: Optional[torch.Tensor] = None,
         descale_q: Optional[torch.Tensor] = None,
         descale_k: Optional[torch.Tensor] = None,
-        descale_v: Optional[torch.Tensor] = None
+        descale_v: Optional[torch.Tensor] = None,
+        descale_o: Optional[torch.Tensor] = None
     ):
 
     if DEBUG:
@@ -475,7 +476,7 @@ def varlen_fwd(
                                                             descale_q,
                                                             descale_k,
                                                             descale_v,
-                                                            None)
+                                                            descale_o)
         softmax_lse=softmax_lse_triton
         sd_mask=sd_mask_triton
 
@@ -516,7 +517,11 @@ def varlen_bwd(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
+    descale_o: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
+    descale_dq: Optional[torch.Tensor] = None,
+    descale_dk: Optional[torch.Tensor] = None,
+    descale_dv: Optional[torch.Tensor] = None,
 ):
     if DEBUG:
         print()
@@ -610,11 +615,11 @@ def varlen_bwd(
             descale_q,
             descale_k,
             descale_v,
-            None,
+            descale_o,
             descale_do,
-            None,
-            None,
-            None,
+            descale_dq,
+            descale_dk,
+            descale_dv,
         )
         delta = delta_triton
 

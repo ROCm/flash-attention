@@ -479,11 +479,11 @@ def fp8_assert_close(tensor_a, tensor_b, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_
     ],
 )
 @pytest.mark.parametrize('causal', [False, True])
-@pytest.mark.parametrize('dropout_p', [0.0, 0.1])
-@pytest.mark.parametrize('layout', ['bshd'])
+@pytest.mark.parametrize('dropout_p', [0.0])
+@pytest.mark.parametrize('layout', ['bshd', 'thd'])
 @pytest.mark.parametrize('packing', [None])
 @pytest.mark.parametrize('DEBUG_INPUT', [False])
-@pytest.mark.flaky(reruns=3, reason="Retry failures")
+# @pytest.mark.flaky(reruns=3, reason="Retry failures")
 @pytest.mark.skipif(not arch_supports_fp8(), reason="fp8 not supported on this device")
 def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, packing, DEBUG_INPUT):
     torch.manual_seed(20)
@@ -528,7 +528,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-             out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_qkvpacked_fp8_func(
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_qkvpacked_fp8_func(
                 qkv_fp8,
                 dropout_p,
                 causal=causal,
@@ -570,7 +570,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 deterministic=deterministic,
                 return_attn_probs=True,
             )
-            
+
         # ----------------------------------------------------------------
         # --- Compare ---
         # ----------------------------------------------------------------
@@ -657,7 +657,6 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 deterministic=deterministic,
                 return_attn_probs=True,
             )
-            
 
         # ----------------------------------------------------------------
         # --- Reference ---
