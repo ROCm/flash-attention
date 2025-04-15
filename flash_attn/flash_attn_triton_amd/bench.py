@@ -89,7 +89,7 @@ def get_fn_params(fn_name):
     supported_dtypes = SUPPORTED_DTYPES.get(fn_name, [torch.float16])  # default to float16 if not found
     supported_backends = [backend for backend in SUPPORTED_BACKENDS.get(fn_name, ["triton"]) if backend in available_backends()]  # default to triton backend
     supports_backward = False if fn_name in ["flash_attn_with_kvcache"] else True
-    supported_modes = ["bwd"] # SUPPORTED_MODES.get(fn_name, ["fwd"])
+    supported_modes = SUPPORTED_MODES.get(fn_name, ["fwd"])
     device = "cuda"
 
     # check backward pass support
@@ -142,7 +142,7 @@ def estimate_memory(config):
     memory_estimate = batch * (hq * sq + hk * sk) * d_head * 4  # bytes
     return memory_estimate
 
-def generate_benchmark_configs(is_varlen, packing):
+def generate_benchmark_configs(is_varlen: bool, packing: Optional[Literal["kv", "qkv"]]):
     """
     generates a small number of configs that cover the parameter space well
     """
@@ -168,7 +168,7 @@ def generate_benchmark_configs(is_varlen, packing):
     dropout_values = [0.0]
     
     # generate all fn_configs without inputs
-    fn_configs = []
+    input_configs = []
     
     # one big loop to generate configs
     for batch in batch_sizes:
@@ -180,10 +180,10 @@ def generate_benchmark_configs(is_varlen, packing):
                             for causal in causal_values:
                                 for dropout in dropout_values:
                                     # filter configs
-                                    fn_config = (batch, hq, hk, sq, sk, d_head, causal, dropout)
+                                    input_config = (batch, hq, hk, sq, sk, d_head, causal, dropout)
 
                                     # skip if memory usage would be too high
-                                    if estimate_memory(fn_config) > 8 * 1024 * 1024 * 1024:  # 8 GB limit
+                                    if estimate_memory(input_config) > 8 * 1024 * 1024 * 1024:  # 8 GB limit
                                         continue
 
                                     # we need hq to be a multiple of hk
@@ -194,9 +194,9 @@ def generate_benchmark_configs(is_varlen, packing):
                                     if packing == "qkv" and (sq != sk or hq != hk):
                                         continue
                                     
-                                    fn_configs.append(fn_config)
+                                    input_configs.append(input_config)
     
-    return fn_configs
+    return input_configs
 
 def create_benchmark_fn(
     flash_attn,
@@ -261,13 +261,27 @@ def create_benchmark_fn(
                 dq, dk, dv = torch.autograd.grad(out, (q, k, v), do, retain_graph=True)
                 return dq, dk, dv
         else:
-            raise ValueError(f"Unknown benchmarking mode: {mode}")
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
 
         return flash_attn_bench_fn
 
     elif fn_name == "flash_attn_kvpacked_func":
         q, kv, do, metadata = fn_input
-        def flash_attn_kvpacked_bench_fn():
+        if mode == "fwd":
+            def flash_attn_kvpacked_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_kvpacked_func(
+                    q,
+                    kv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out
+        elif mode == "bwd":
             out, lse, S_dmask = flash_attn.flash_attn_kvpacked_func(
                 q,
                 kv,
@@ -279,52 +293,161 @@ def create_benchmark_fn(
                 deterministic=False,
                 return_attn_probs=True,
             )
-            if mode == "full":
-                dq, dkv = torch.autograd.grad(out, (q, kv), do)
+            def flash_attn_kvpacked_bench_fn():
+                dq, dkv = torch.autograd.grad(out, (q, kv), do, retain_graph=True)
+                return dq, dkv
+        elif mode == "full":
+            def flash_attn_kvpacked_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_kvpacked_func(
+                    q,
+                    kv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dq, dkv = torch.autograd.grad(out, (q, kv), do, retain_graph=True)
+                return dq, dkv
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
 
         return flash_attn_kvpacked_bench_fn
     elif fn_name == "flash_attn_qkvpacked_func":
         qkv, do, metadata = fn_input
-        def flash_attn_qkvpacked_bench_fn():
+        if mode == "fwd":
+            def flash_attn_qkvpacked_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_func(
+                    qkv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out
+        elif mode == "bwd":
             out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_func(
-                qkv,
-                metadata.dropout_p,
-                causal=metadata.causal,
-                window_size=(-1, -1),
-                softcap=0.0,
-                alibi_slopes=None,
-                deterministic=False,
-                return_attn_probs=True,
-            )
-            if mode == "full":
-                dqkv = torch.autograd.grad(out, (qkv), do)
+                    qkv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+            def flash_attn_qkvpacked_bench_fn():
+                dqkv = torch.autograd.grad(out, (qkv), do, retain_graph=True)
+                return dqkv
+        elif mode == "full":
+            def flash_attn_qkvpacked_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_func(
+                    qkv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dqkv = torch.autograd.grad(out, (qkv), do, retain_graph=True)
+                return dqkv
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
 
-        return flash_attn_qkvpacked_bench_fn   
+        return flash_attn_qkvpacked_bench_fn
     elif fn_name == "flash_attn_varlen_func":
         q_unpad, k_unpad, v_unpad, do_unpad, metadata = fn_input
-        def flash_attn_varlen_bench_fn():
+        if mode == "fwd":
+            def flash_attn_varlen_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_func(
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out
+        elif mode == "bwd":
             out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_func(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                metadata.cu_seqlens_q,
-                metadata.cu_seqlens_k,
-                metadata.max_seqlens_q,
-                metadata.max_seqlens_k,
-                metadata.dropout_p,
-                causal=metadata.causal,
-                window_size=(-1, -1),
-                softcap=0.0 ,
-                alibi_slopes=None,
-                deterministic=False,
-                return_attn_probs=True,
-            )
-            if mode == "full":
-                dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), do_unpad)
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+            def flash_attn_varlen_bench_fn():
+                dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), do_unpad, retain_graph=True)
+                return dq_unpad, dk_unpad, dv_unpad
+        elif mode == "full":
+            def flash_attn_varlen_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_func(
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), do_unpad, retain_graph=True)
+                return dq_unpad, dk_unpad, dv_unpad
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
+
         return flash_attn_varlen_bench_fn
     elif fn_name == "flash_attn_varlen_kvpacked_func":
         q_unpad, kv_unpad, do_unpad, metadata = fn_input
-        def flash_attn_varlen_kvpacked_bench_fn():
+        if mode == "fwd":
+            def flash_attn_varlen_kvpacked_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_kvpacked_func(
+                    q_unpad,
+                    kv_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out_unpad
+        elif mode == "bwd":
             out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_kvpacked_func(
                 q_unpad,
                 kv_unpad,
@@ -340,12 +463,50 @@ def create_benchmark_fn(
                 deterministic=False,
                 return_attn_probs=True,
             )
-            if mode == "full":
-                dq_unpad, dkv_unpad = torch.autograd.grad(out_unpad, (q_unpad, kv_unpad), do_unpad)
+            def flash_attn_varlen_kvpacked_bench_fn():
+                dq_unpad, dkv_unpad = torch.autograd.grad(out_unpad, (q_unpad, kv_unpad), do_unpad, retain_graph=True)
+                return dq_unpad, dkv_unpad
+        elif mode == "full":
+            def flash_attn_varlen_kvpacked_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_kvpacked_func(
+                    q_unpad,
+                    kv_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dq_unpad, dkv_unpad = torch.autograd.grad(out_unpad, (q_unpad, kv_unpad), do_unpad, retain_graph=True)
+                return dq_unpad, dkv_unpad
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
+
         return flash_attn_varlen_kvpacked_bench_fn
     elif fn_name == "flash_attn_varlen_qkvpacked_func":
         qkv_unpad, do_unpad, metadata = fn_input
-        def flash_attn_varlen_qkvpacked_bench_fn():
+        if mode == "fwd":
+            def flash_attn_varlen_qkvpacked_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_func(
+                    qkv_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.max_seqlens_q,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out
+        elif mode == "bwd":
             out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_func(
                 qkv_unpad,
                 metadata.cu_seqlens_q,
@@ -358,34 +519,74 @@ def create_benchmark_fn(
                 deterministic=False,
                 return_attn_probs=True,
             )
-            if mode == "full":
-                dqkv_unpad = torch.autograd.grad(out_unpad, (qkv_unpad), do_unpad)
+            def flash_attn_varlen_qkvpacked_bench_fn():
+                dqkv_unpad = torch.autograd.grad(out_unpad, (qkv_unpad), do_unpad, retain_graph=True)
+                return dqkv_unpad
+        elif mode == "full":
+            def flash_attn_varlen_qkvpacked_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_func(
+                    qkv_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.max_seqlens_q,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dqkv_unpad = torch.autograd.grad(out_unpad, (qkv_unpad), do_unpad, retain_graph=True)
+                return dqkv_unpad
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
+
         return flash_attn_varlen_qkvpacked_bench_fn
     elif fn_name == "flash_attn_with_kvcache":
         q, k_cache, v_cache, _, metadata = fn_input
-        def flash_attn_with_kvcache_bench_fn():
-            out = flash_attn.flash_attn_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                None,
-                None,
-                rotary_cos=None,
-                rotary_sin=None,
-                cache_seqlens=None,
-                cache_batch_idx=None,
-                cache_leftpad=None,
-                block_table=None,
-                causal=metadata.causal,
-                window_size=(-1, -1),
-                rotary_interleaved=False,
-                alibi_slopes=None,
-                num_splits=0,
-            )
+        if mode == "fwd":
+            def flash_attn_with_kvcache_bench_fn():
+                out = flash_attn.flash_attn_with_kvcache(
+                    q,
+                    k_cache,
+                    v_cache,
+                    None,
+                    None,
+                    rotary_cos=None,
+                    rotary_sin=None,
+                    cache_seqlens=None,
+                    cache_batch_idx=None,
+                    cache_leftpad=None,
+                    block_table=None,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    rotary_interleaved=False,
+                    alibi_slopes=None,
+                    num_splits=0,
+                )
+                return out
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
+
         return flash_attn_with_kvcache_bench_fn
     elif fn_name == "flash_attn_fp8_func":
         (q, descale_q), (k, descale_k), (v, descale_v), (do, descale_do), metadata = fn_input
-        def flash_attn_f8_bench_fn():
+        if mode == "fwd":
+            def flash_attn_f8_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_fp8_func(
+                    q,
+                    k,
+                    v,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out
+        elif mode == "bwd":
             out, lse, S_dmask = flash_attn.flash_attn_fp8_func(
                 q,
                 k,
@@ -397,57 +598,160 @@ def create_benchmark_fn(
                 alibi_slopes=None,
                 deterministic=False,
                 return_attn_probs=True,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_do=descale_do,
             )
-            if mode == "full":
-                dq, dk, dv = torch.autograd.grad(out, (q, k, v), do)
+            def flash_attn_f8_bench_fn():
+                dq, dk, dv = torch.autograd.grad(out, (q, k, v), do, retain_graph=True)
+                return dq, dk, dv
+        elif mode == "full":
+            def flash_attn_f8_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_fp8_func(
+                    q,
+                    k,
+                    v,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dq, dk, dv = torch.autograd.grad(out, (q, k, v), do, retain_graph=True)
+                return dq, dk, dv
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
 
         return flash_attn_f8_bench_fn
     elif fn_name == "flash_attn_qkvpacked_fp8_func":
         qkv, do, metadata = fn_input
-        def flash_attn_qkvpacked_fp8_bench_fn():
+        if mode == "fwd":
+            def flash_attn_qkvpacked_fp8_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_fp8_func(
+                    qkv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out
+        elif mode == "bwd":
             out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_fp8_func(
-                qkv,
-                metadata.dropout_p,
-                causal=metadata.causal,
-                window_size=(-1, -1),
-                softcap=0.0,
-                alibi_slopes=None,
-                deterministic=False,
-                return_attn_probs=True,
-            )
-            if mode == "full":
-                dqkv = torch.autograd.grad(out, (qkv), do)
+                    qkv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+            def flash_attn_qkvpacked_fp8_bench_fn():
+                dqkv = torch.autograd.grad(out, (qkv), do, retain_graph=True)
+                return dqkv
+        elif mode == "full":
+            def flash_attn_qkvpacked_fp8_bench_fn():
+                out, lse, S_dmask = flash_attn.flash_attn_qkvpacked_fp8_func(
+                    qkv,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dqkv = torch.autograd.grad(out, (qkv), do, retain_graph=True)
+                return dqkv
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
 
-        return flash_attn_qkvpacked_fp8_bench_fn   
+        return flash_attn_qkvpacked_fp8_bench_fn
     elif fn_name == "flash_attn_varlen_fp8_func":
         (q_unpad, descale_q), (k_unpad, descale_k), (v_unpad, descale_v), (do_unpad, descale_do), metadata = fn_input
-        def flash_attn_varlen_fp8_bench_fn():
+        if mode == "fwd":
+            def flash_attn_varlen_fp8_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_fp8_func(
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out_unpad
+        elif mode == "bwd":
             out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_fp8_func(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                metadata.cu_seqlens_q,
-                metadata.cu_seqlens_k,
-                metadata.max_seqlens_q,
-                metadata.max_seqlens_k,
-                metadata.dropout_p,
-                causal=metadata.causal,
-                window_size=(-1, -1),
-                softcap=0.0 ,
-                alibi_slopes=None,
-                deterministic=False,
-                return_attn_probs=True,
-            )
-            if mode == "full":
-                dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), do_unpad)
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+            def flash_attn_varlen_fp8_bench_fn():
+                dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), do_unpad, retain_graph=True)
+                return dq_unpad, dk_unpad, dv_unpad
+        elif mode == "full":
+            def flash_attn_varlen_fp8_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_fp8_func(
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.cu_seqlens_k,
+                    metadata.max_seqlens_q,
+                    metadata.max_seqlens_k,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), do_unpad, retain_graph=True)
+                return dq_unpad, dk_unpad, dv_unpad
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
+
         return flash_attn_varlen_fp8_bench_fn
     elif fn_name == "flash_attn_varlen_qkvpacked_fp8_func":
         qkv_unpad, do_unpad, metadata = fn_input
-        def flash_attn_varlen_qkvpacked_fp8_bench_fn():
+        if mode == "fwd":
+            def flash_attn_varlen_qkvpacked_fp8_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_fp8_func(
+                    qkv_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.max_seqlens_q,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                return out_unpad
+        elif mode == "bwd":
             out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_fp8_func(
                 qkv_unpad,
                 metadata.cu_seqlens_q,
@@ -460,8 +764,28 @@ def create_benchmark_fn(
                 deterministic=False,
                 return_attn_probs=True,
             )
-            if mode == "full":
-                dqkv_unpad = torch.autograd.grad(out_unpad, (qkv_unpad), do_unpad)
+            def flash_attn_varlen_qkvpacked_fp8_bench_fn():
+                dqkv_unpad = torch.autograd.grad(out_unpad, (qkv_unpad), do_unpad, retain_graph=True)
+                return dqkv_unpad
+        elif mode == "full":
+            def flash_attn_varlen_qkvpacked_fp8_bench_fn():
+                out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_fp8_func(
+                    qkv_unpad,
+                    metadata.cu_seqlens_q,
+                    metadata.max_seqlens_q,
+                    metadata.dropout_p,
+                    causal=metadata.causal,
+                    window_size=(-1, -1),
+                    softcap=0.0 ,
+                    alibi_slopes=None,
+                    deterministic=False,
+                    return_attn_probs=True,
+                )
+                dqkv_unpad = torch.autograd.grad(out_unpad, (qkv_unpad), do_unpad, retain_graph=True)
+                return dqkv_unpad
+        else:
+            raise ValueError(f"Unsupported benchmarking mode: {mode}")
+
         return flash_attn_varlen_qkvpacked_fp8_bench_fn
     else:
         valid_fn_names = ", ".join(FUNCTIONS)
@@ -672,7 +996,7 @@ def process_args():
             dropout = args.dropout if args.dropout is not None else 0.0
             input_configs = [(batch, hq, hk, sq, sk, d_head, causal, dropout)]
         else:
-            config_type = "llama"
+            config_type = None
             if config_type == "llama":
                 # batch, hq, hk, sq, sk, d_head, causal, dropout
                 input_configs = [
