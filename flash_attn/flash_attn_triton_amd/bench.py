@@ -14,31 +14,43 @@ DEBUG = False
 
 ENV_FLAGS = ["FLASH_ATTENTION_TRITON_AMD_ENABLE", "FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "FLASH_ATTENTION_TRITON_AMD_DEBUG"]
 
+FUNCTIONS = [
+    "flash_attn_func",
+    "flash_attn_fp8_func",
+    "flash_attn_kvpacked_func",
+    "flash_attn_qkvpacked_func",
+    "flash_attn_qkvpacked_fp8_func",
+    "flash_attn_varlen_func",
+    "flash_attn_varlen_fp8_func",
+    "flash_attn_varlen_kvpacked_func",
+    "flash_attn_varlen_qkvpacked_func",
+    "flash_attn_varlen_qkvpacked_fp8_func",
+    "flash_attn_with_kvcache",
+]
+
 SUPPORTED_DTYPES = {
     "flash_attn_func": [torch.float16],
     "flash_attn_fp8_func": [torch.float8_e4m3fnuz],
     "flash_attn_kvpacked_func": [torch.float16],
+    "flash_attn_qkvpacked_func": [torch.float16],
+    "flash_attn_qkvpacked_fp8_func": [torch.float16],
     "flash_attn_varlen_func": [torch.float16],
     "flash_attn_varlen_fp8_func": [torch.float8_e4m3fnuz],
     "flash_attn_varlen_kvpacked_func": [torch.float16],
-    "flash_attn_qkvpacked_func": [torch.float16],
-    "flash_attn_qkvpacked_fp8_func": [torch.float16],
     "flash_attn_varlen_qkvpacked_func": [torch.float16],
     "flash_attn_varlen_qkvpacked_fp8_func": [torch.float16],
     "flash_attn_with_kvcache": [torch.float16],
 }
 
-FUNCTIONS = SUPPORTED_DTYPES.keys()
-
 SUPPORTED_BACKENDS = {
     "flash_attn_func": ["ck", "triton"],
     "flash_attn_fp8_func": ["triton"],
     "flash_attn_kvpacked_func": ["ck", "triton"],
+    "flash_attn_qkvpacked_func": ["ck", "triton"],
+    "flash_attn_qkvpacked_fp8_func": ["triton"],
     "flash_attn_varlen_func": ["ck", "triton"],
     "flash_attn_varlen_fp8_func": ["triton"],
     "flash_attn_varlen_kvpacked_func": ["ck", "triton"],
-    "flash_attn_qkvpacked_func": ["ck", "triton"],
-    "flash_attn_qkvpacked_fp8_func": ["triton"],
     "flash_attn_varlen_qkvpacked_func": ["ck", "triton"],
     "flash_attn_varlen_qkvpacked_fp8_func": ["triton"],
     "flash_attn_with_kvcache": ["ck", "triton"],
@@ -48,11 +60,11 @@ SUPPORTED_MODES = {
     "flash_attn_func": ["fwd", "bwd", "full"],
     "flash_attn_fp8_func": ["fwd", "bwd", "full"],
     "flash_attn_kvpacked_func": ["fwd", "bwd", "full"],
+    "flash_attn_qkvpacked_func": ["fwd", "bwd", "full"],
+    "flash_attn_qkvpacked_fp8_func": ["fwd", "bwd", "full"],
     "flash_attn_varlen_func": ["fwd", "bwd", "full"],
     "flash_attn_varlen_fp8_func": ["fwd", "bwd", "full"],
     "flash_attn_varlen_kvpacked_func": ["fwd", "bwd", "full"],
-    "flash_attn_qkvpacked_func": ["fwd", "bwd", "full"],
-    "flash_attn_qkvpacked_fp8_func": ["fwd", "bwd", "full"],
     "flash_attn_varlen_qkvpacked_func": ["fwd", "bwd", "full"],
     "flash_attn_varlen_qkvpacked_fp8_func": ["fwd", "bwd", "full"],
     "flash_attn_with_kvcache": ["fwd"],
@@ -382,7 +394,7 @@ def create_benchmark_fn(
                     deterministic=False,
                     return_attn_probs=True,
                 )
-                return out
+                return out_unpad
         elif mode == "bwd":
             out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_func(
                     q_unpad,
@@ -505,7 +517,7 @@ def create_benchmark_fn(
                     deterministic=False,
                     return_attn_probs=True,
                 )
-                return out
+                return out_unpad
         elif mode == "bwd":
             out_unpad, lse, S_dmask = flash_attn.flash_attn_varlen_qkvpacked_func(
                 qkv_unpad,
@@ -966,7 +978,7 @@ def process_args():
 
     # determine the functions to benchmark
     if args.benchmark_fn is None or len(args.benchmark_fn) == 0:
-        benchmark_fns = FUNCTIONS
+        raise ValueError(f"Provide a function to benchmark from this list: {FUNCTIONS}")
     else:
         for fn_name in args.benchmark_fn:
             if fn_name not in FUNCTIONS:
@@ -996,7 +1008,7 @@ def process_args():
             dropout = args.dropout if args.dropout is not None else 0.0
             input_configs = [(batch, hq, hk, sq, sk, d_head, causal, dropout)]
         else:
-            config_type = None
+            config_type = "llama"
             if config_type == "llama":
                 # batch, hq, hk, sq, sk, d_head, causal, dropout
                 input_configs = [
