@@ -307,7 +307,7 @@ def bwd(
                 True,
             )
             delta = delta_triton
-        elif BWD_MODE == "one":
+        elif BWD_MODE == "jingning":
             delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
                 dout,
                 q,
