@@ -514,9 +514,11 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         qkv_fp8 = qkv.clone()
         do_fp8= do.clone()
 
-        if not is_varlen:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_qkvpacked_fp8_func(
+        if is_varlen:
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_varlen_qkvpacked_fp8_func(
                 qkv_fp8,
+                metadata.cu_seqlens_q,
+                metadata.max_seqlens_q,
                 dropout_p,
                 causal=causal,
                 window_size=window_size,
@@ -526,10 +528,8 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_varlen_qkvpacked_fp8_func(
+             out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_qkvpacked_fp8_func(
                 qkv_fp8,
-                metadata.cu_seqlens_q,
-                metadata.max_seqlens_q,
                 dropout_p,
                 causal=causal,
                 window_size=window_size,
@@ -546,18 +546,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         qkv_ref = qkv.clone()
         do_ref= do.clone()
 
-        if not is_varlen:
-            out_ref, lse_ref, S_dmask_ref = flash_attn_qkvpacked_func(
-                qkv_ref,
-                dropout_p,
-                causal=causal,
-                window_size=window_size,
-                softcap=softcap,
-                alibi_slopes=alibi_slopes,
-                deterministic=deterministic,
-                return_attn_probs=True,
-            )
-        else:
+        if is_varlen:
             out_ref, lse_ref, S_dmask_ref = flash_attn_varlen_qkvpacked_func(
                 qkv_ref,
                 metadata.cu_seqlens_q,
@@ -570,7 +559,18 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 deterministic=deterministic,
                 return_attn_probs=True,
             )
-
+        else:
+            out_ref, lse_ref, S_dmask_ref = flash_attn_qkvpacked_func(
+                qkv_ref,
+                dropout_p,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=True,
+            )
+            
         # ----------------------------------------------------------------
         # --- Compare ---
         # ----------------------------------------------------------------
@@ -627,20 +627,7 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         v_fp8 = v.clone()
         do_fp8= do.clone()
 
-        if not is_varlen:
-            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_fp8_func(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                dropout_p,
-                causal=causal,
-                window_size=window_size,
-                softcap=softcap,
-                alibi_slopes=alibi_slopes,
-                deterministic=deterministic,
-                return_attn_probs=True,
-            )
-        else:
+        if is_varlen:
             out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_varlen_fp8_func(
                 q_fp8,
                 k_fp8,
@@ -657,6 +644,20 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 deterministic=deterministic,
                 return_attn_probs=True,
             )
+        else:
+            out_fp8, lse_fp8, S_dmask_fp8 = flash_attn_fp8_func(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                dropout_p,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                return_attn_probs=True,
+            )
+            
 
         # ----------------------------------------------------------------
         # --- Reference ---
@@ -670,11 +671,15 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
         v_ref = v.clone()
         do_ref = do.clone()
 
-        if not is_varlen:
-            out_ref, lse_ref, S_dmask_ref = flash_attn_func(
+        if is_varlen:
+            out_ref, lse_ref, S_dmask_ref = flash_attn_varlen_func(
                 q_ref,
                 k_ref,
                 v_ref,
+                metadata.cu_seqlens_q,
+                metadata.cu_seqlens_k,
+                metadata.max_seqlens_q,
+                metadata.max_seqlens_k,
                 dropout_p,
                 causal=causal,
                 window_size=window_size,
@@ -684,14 +689,10 @@ def test_fp8(Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, pac
                 return_attn_probs=True,
             )
         else:
-            out_ref, lse_ref, S_dmask_ref = flash_attn_varlen_func(
+            out_ref, lse_ref, S_dmask_ref = flash_attn_func(
                 q_ref,
                 k_ref,
                 v_ref,
-                metadata.cu_seqlens_q,
-                metadata.cu_seqlens_k,
-                metadata.max_seqlens_q,
-                metadata.max_seqlens_k,
                 dropout_p,
                 causal=causal,
                 window_size=window_size,
