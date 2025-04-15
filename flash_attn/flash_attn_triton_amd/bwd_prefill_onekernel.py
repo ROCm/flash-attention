@@ -11,7 +11,7 @@ tl_DROPOUT_DUMP: tl.constexpr = DROPOUT_DUMP
 
 
 def get_autotune_configs():
-    if AUTOTUNE:
+    if False:
         if is_cdna():
             # shared meta-parameters
             NUM_STAGES = 1
