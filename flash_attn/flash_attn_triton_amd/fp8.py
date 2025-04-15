@@ -398,6 +398,10 @@ class FlashAttnQKVPackedFP8Func(torch.autograd.Function):
         deterministic,
         return_softmax,
         is_grad_enabled,
+        descale_q: Optional[torch.Tensor] = None,
+        descale_k: Optional[torch.Tensor] = None,
+        descale_v: Optional[torch.Tensor] = None,
+        descale_do: Optional[torch.Tensor] = None
     ):
         is_grad = is_grad_enabled and qkv.requires_grad
         if softmax_scale is None:
@@ -409,12 +413,20 @@ class FlashAttnQKVPackedFP8Func(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
 
-        # cast input to fp8
-        fp8_dtype = torch.float8_e4m3fnuz 
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "bshd")
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "bshd")
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "bshd")
-        out_fp8, descale_o = torch.zeros_like(q_fp8, dtype=torch.float32), None
+        # figure out fwd parameters
+        if is_fp8(q) or is_fp8(k) or is_fp8(v): # fp8 input and output
+            raise ValueError("fp8 input and out not supported yet for this function.")
+            assert (descale_q is not None) and (descale_k is not None) and (descale_v is not None), f"You need to pass descale factors for q, k and v"
+            q_fp8 = q
+            k_fp8 = k
+            v_fp8 = v
+            out_fp8, descale_o = torch.zeros_like(q_fp8), torch.zeros_like(descale_q)
+        else: # cast to fp8 and return output in the fp32. (accumulator type) 
+            assert (descale_q is None) and (descale_k is None) and (descale_v is None), f"Found {q.dtype} input tensor with descale factors. In this case, we cast to fp8 and compute the descale factors. You can pass an fp8 tensor with its descale factors if desired."
+            q_fp8, descale_q = cast_to_fp8(q, torch.float8_e4m3fnuz, "bshd")
+            k_fp8, descale_k = cast_to_fp8(k, torch.float8_e4m3fnuz, "bshd")
+            v_fp8, descale_v = cast_to_fp8(v, torch.float8_e4m3fnuz, "bshd")
+            out_fp8, descale_o = torch.zeros_like(q_fp8, dtype=torch.float32), None
 
         q_fp8, k_fp8, v_fp8 = [maybe_contiguous(x) for x in (q_fp8, k_fp8, v_fp8)]
         _, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
@@ -436,7 +448,7 @@ class FlashAttnQKVPackedFP8Func(torch.autograd.Function):
             descale_o=descale_o,
         )
         if is_grad:
-            ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out_fp8, softmax_lse, rng_state, descale_q, descale_k, descale_v, descale_o)
+            ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out_fp8, softmax_lse, rng_state, descale_q, descale_k, descale_v, descale_o, descale_do)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -449,22 +461,27 @@ class FlashAttnQKVPackedFP8Func(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, rng_state, descale_q, descale_k, descale_v, descale_o = ctx.saved_tensors
+        q_fp8, k_fp8, v_fp8, out_fp8, softmax_lse, rng_state, descale_q, descale_k, descale_v, descale_o, descale_do = ctx.saved_tensors
         qkv_shape = q_fp8.shape[:-2] + (3, *q_fp8.shape[-2:])
-        # for fp8 we accumlate in fp32
-        dqkv = torch.empty(qkv_shape, dtype=torch.float32, device=q_fp8.device)
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
         
-        # scale grads
-        fp8_dtype = torch.float8_e4m3fnuz 
-        dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, fp8_dtype, "bshd")
+        # figure out bwd parameters
+        if is_fp8(dout): # fp8 input and output
+            raise ValueError("fp8 input and out not supported yet for this function.")
+            assert (descale_do is not None), f"You need to pass descale factors for do"
+            dout_padded_fp8 = dout_padded
+            dqkv, descale_dqkv = torch.zeros(qkv_shape, device=q_fp8.device), torch.zeros_like(descale_q)
+        else: # cast to fp8 and return output in the fp32. (accumulator type) 
+            assert (descale_do is None), f"Found {dout.dtype} input tensor with descale factors. In this case, we cast to fp8 and compute the descale factors. You can pass an fp8 tensor with its descale factors if desired."
+            dout_padded_fp8, descale_do = cast_to_fp8(dout_padded, torch.float8_e4m3fnuz, "bshd")
+            dqkv, descale_dqkv = torch.zeros(qkv_shape, dtype=torch.float32, device=q_fp8.device), None
         
         
         # dq, dk, dv are allocated by us so they should already be contiguous
-        dout_padded_fp8, q_fp8, q_fp8, v_fp8, out_fp8 = [maybe_contiguous(x) for x in (dout, q_fp8, k_fp8, v_fp8, out_fp8)]
+        dout_padded_fp8, q_fp8, k_fp8, v_fp8, out_fp8 = [maybe_contiguous(x) for x in (dout_padded_fp8, q_fp8, k_fp8, v_fp8, out_fp8)]
         flash_attn_gpu.bwd(
             dout_padded_fp8,
             q_fp8,
