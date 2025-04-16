@@ -1088,4 +1088,4 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
 
-    return dq, dk, dv, delta, None, None
+    return delta
