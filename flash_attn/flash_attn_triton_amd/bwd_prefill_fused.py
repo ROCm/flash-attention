@@ -549,7 +549,7 @@ def _attn_fwd(q_ptr: torch.Tensor,
                                         block_min, block_max, 0, 0, 0, alibi_slope, 
                                         descale_q, descale_k, descale_v,
                                         offs_m, offs_n, BLOCK_M, BLOCK_N, BLOCK_DMODEL,BLOCK_DMODEL_POW2,
-                                        sm_scale, IS_CAUSAL, MASK_STEPS=False, ENABLE_DROPOUT=ENABLE_DROPOUT, 
+                                        sm_scale, False, MASK_STEPS=False, ENABLE_DROPOUT=ENABLE_DROPOUT, 
                                         RETURN_SCORES=RETURN_SCORES, PADDED_HEAD=BLOCK_DMODEL!=BLOCK_DMODEL_POW2,
                                         IS_FP8=IS_FP8, FP8_MAX=FP8_MAX
                                         )
@@ -726,8 +726,17 @@ def _flash_attn_forward(
         dropout_mask = None
 
 
-    BLOCK_M = 32 #TODO. Add config/tuning support
-    BLOCK_N = 32 #TODO Add config/tuning support
+    # Best config from ROCm/triton/python/perf-kernels/flash_attention.py::attn_fwd autotuning is BLOCK_M: 128, BLOCK_N: 64, waves_per_eu: 2, num_warps: 4, num_ctas: 1, num_stages: 1
+    # Tuned for MI300x
+    config = {
+        'BLOCK_M': 128,
+        'BLOCK_N': 32, # BLOCK_N: 64 spills for _attn_fwd
+        'waves_per_eu': 2,
+        'num_warps': 4,
+        'num_ctas': 1,
+        'num_stages': 1,
+    }
+
     grid = lambda META:(triton.cdiv(seqlen_q, META['BLOCK_M']), num_q_heads, batch)
     _attn_fwd[grid](q,
                     k,
@@ -767,8 +776,6 @@ def _flash_attn_forward(
                     IS_CAUSAL=causal,
                     NUM_Q_HEADS=num_q_heads,
                     NUM_K_HEADS=num_k_heads,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
                     BLOCK_DMODEL=head_sz,
                     BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
                     RETURN_SCORES=return_softmax,
@@ -776,6 +783,7 @@ def _flash_attn_forward(
                     IS_FP8=IS_FP8,
                     FP8_MAX=FP8_MAX,
                     VARLEN=is_varlen,
+                    **config
     )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset 
@@ -1403,9 +1411,11 @@ def _bwd_kernel_dkdvdq_causal(
         # bound the masked operation to q len so it does not have to wast cycles
         len_m = min(len_m, seqlen_q)
         num_steps = tl.cdiv(len_m, MASK_BLOCK_M)
+        
+        
         # when q < k, we may skip the initial masked op
-        if seq_k_blk_idx < num_blocks_skip:
-            num_steps = 0
+        # if seq_k_blk_idx < num_blocks_skip:
+        #     num_steps = 0
 
         if IS_FP8:
             descale_q = tl.load(descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx)
@@ -2265,8 +2275,6 @@ def _flash_attn_backward(
     descale_do: Optional[torch.Tensor] = None,
     fused: bool = False,
 ):
-    # print("Running backward in fused mode:", fused)
-
     IS_FP8 = is_fp8(q)
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
@@ -2317,7 +2325,7 @@ def _flash_attn_backward(
     WAVES_PER_EU = 1
     PRE_BLOCK = 128
     #BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16 
+    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 16 
     BLK_SLICE_FACTOR = 2
 
     #init delta
@@ -2362,16 +2370,23 @@ def _flash_attn_backward(
     grid_dkdv = ((max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, num_k_heads)
     grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, num_k_heads)
     
-    if fused:
-        BLOCK_M1, BLOCK_N1 = 64, 64
-        # change the launch order of blocks to first go over in batch dim, then in head dim, and only then in seqlen dim (where we have contention in dq atomic updates)
-        # grid_dkdv = (batch, num_k_heads, (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1) 
-        num_k_pids = (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1
+    if fused: # fuses dk, dv, dq computations into one kernel by computing the dq using atomic adds between workgroups
         
-        grid_dkdv = (batch * num_k_heads * num_k_pids,) 
+        BLOCK_N = 128
+        config = {
+            "BLOCK_M": 32,
+            "BLOCK_N": BLOCK_N,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+            "BLK_SLICE_FACTOR": 2,
+        }
         
+        num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
+        grid_dkdvdq = (batch * num_k_heads * num_k_pids,) 
+
         if causal:
-            _bwd_kernel_dkdvdq_causal[grid_dkdv](
+            _bwd_kernel_dkdvdq_causal[grid_dkdvdq](
                 q, k, v, sm_scale, do, dk, dv, dq,
                 softmax_lse, delta,
                 *q_strides,
@@ -2391,21 +2406,16 @@ def _flash_attn_backward(
                 NUM_K_HEADS=num_k_heads,
                 BATCH=batch,
                 NUM_K_PIDS=num_k_pids, 
-                BLOCK_M=BLOCK_M1,
-                BLOCK_N=BLOCK_N1,
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
                 BLOCK_D_MODEL=head_sz,
                 BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
                 ENABLE_DROPOUT=use_dropout,
                 IS_VARLEN=IS_VARLEN,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
-                num_warps=NUM_WARPS,
-                num_stages=NUM_STAGES,
-                waves_per_eu=WAVES_PER_EU,
+                **config,
             )
         else:
-            _bwd_kernel_dkdvdq_noncausal[grid_dkdv](
+            _bwd_kernel_dkdvdq_noncausal[grid_dkdvdq](
                 q, k, v, sm_scale, do, dk, dv, dq,
                 softmax_lse, delta,
                 *q_strides,
@@ -2425,25 +2435,19 @@ def _flash_attn_backward(
                 NUM_K_HEADS=num_k_heads,
                 BATCH=batch,
                 NUM_K_PIDS=num_k_pids,
-                BLOCK_M=BLOCK_M1,
-                BLOCK_N=BLOCK_N1,
-                BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
                 BLOCK_D_MODEL=head_sz,
                 BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
                 ENABLE_DROPOUT=use_dropout,
                 IS_VARLEN=IS_VARLEN,
                 IS_FP8=IS_FP8,
                 FP8_MAX=FP8_MAX,
-                num_warps=NUM_WARPS,
-                num_stages=NUM_STAGES,
-                waves_per_eu=WAVES_PER_EU,
+                **config,
             )
-        
         
         return delta
     
-    
-    
+    # split kernels solution: one kernel computes dk, dv and the other computes dq
+
     if causal:
         _bwd_kernel_dkdv_causal[grid_dkdv](
             q, k, v, sm_scale, do, dk, dv,
@@ -2597,6 +2601,8 @@ class FlashAttnFunc(torch.autograd.Function):
         )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+    
+        
         head_size_og = q.size(3)
         if head_size_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
