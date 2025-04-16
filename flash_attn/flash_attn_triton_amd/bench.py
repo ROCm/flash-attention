@@ -98,7 +98,7 @@ class FunctionConfig:
         if "torch." in dtype_str:
             dtype_str = dtype_str.split(".")[-1]
 
-        if len(self.env_configs) > 1:
+        if len(self.env_configs) > 0:
             env_str = ""
             for env_key, env_value in self.env_configs.items():
                 env_str += f"{env_key}={env_value}"
