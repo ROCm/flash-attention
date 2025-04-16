@@ -50,7 +50,7 @@ jobs:
 
       - name: Install dependencies for bench and misc
         run: |
-          pip install matplotlib pandas pytest
+          pip install numpy==1.24 matplotlib pandas tabulate
 
       - name: AMD Internal Tests
         run: |
