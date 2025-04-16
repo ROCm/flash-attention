@@ -8,6 +8,7 @@ import itertools
 import pandas as pd
 from logging import warning
 from typing import Dict, List, Literal, Optional, Tuple
+from dataclasses import dataclass
 from functools import lru_cache
 from utils import get_arch, input_helper
 
@@ -72,9 +73,42 @@ SUPPORTED_MODES = {
     "flash_attn_with_kvcache": ["fwd"],
 }
 
-ENV_VARIATION_PARAMS = {
-    "BWD_MODE": ["split", "fused", "jingning"],
-}
+@dataclass
+class EnvVariableConfig:
+    key: str
+    values: List[str]
+    backend: Optional[Literal["triton", "ck"]] = None
+
+ENV_VARIABLE_CONFIGS : List[EnvVariableConfig] = [
+    EnvVariableConfig(key="BWD_MODE", values=["split", "fused", "jingning"], backend="triton"),
+]
+
+class FunctionConfig:
+    def __init__(self, fn_name: str, mode: Literal["fwd", "bwd", "full"], dtype, backend: Literal["triton", "ck"], env_config: Dict):
+        self.fn_name = fn_name
+        self.mode: Literal["fwd", "bwd", "full"] = mode
+        self.dtype = dtype
+        self.backend: Literal["triton", "ck"] = backend
+        self.arch = get_arch()
+        self.env_configs = env_config
+    
+    def __str__(self):
+        # extract base dtype name if it's a torch dtype
+        dtype_str = str(self.dtype)
+        if "torch." in dtype_str:
+            dtype_str = dtype_str.split(".")[-1]
+
+        if len(self.env_configs) > 1:
+            env_str = ""
+            for env_key, env_value in self.env_configs.items():
+                env_str += f"{env_key}={env_value}"
+            return f"{self.fn_name}_{self.mode}_{dtype_str}_{self.backend}_{self.arch}_{env_str}"
+        else:
+            return f"{self.fn_name}_{self.mode}_{dtype_str}_{self.backend}_{self.arch}"
+    
+    def column_name(self):
+        return f"{self}_ms"
+
 
 @lru_cache()
 def available_backends():
@@ -109,12 +143,17 @@ def get_fn_params(fn_name):
     supports_backward = False if fn_name in ["flash_attn_with_kvcache"] else True
     supported_modes = SUPPORTED_MODES.get(fn_name, ["fwd"])
     device = "cuda"
+    
+    # get supported env configs for each backend
+    supported_env_configs = {}
+    for backend in supported_backends:
+        supported_env_configs[backend] = get_env_value_combinations(backend)
 
     # check backward pass support
     if not supports_backward:
         warning(f"{fn_name} does not have a backward pass so benching forward pass only.")
 
-    return is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes, device
+    return is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes, supported_env_configs, device
 
 def generate_fn_inputs(
     fn_name: str,
@@ -819,29 +858,6 @@ def get_packing_type(fn_name: str) -> Optional[Literal["kv", "qkv"]]:
 
     return packing
 
-class FunctionConfig:
-    def __init__(self, fn_name: str, mode: Literal["fwd", "bwd", "full"], dtype, backend: Literal["triton", "ck"], env_config: Dict):
-        self.fn_name = fn_name
-        self.mode: Literal["fwd", "bwd", "full"] = mode
-        self.dtype = dtype
-        self.backend: Literal["triton", "ck"] = backend
-        self.arch = get_arch()
-        self.env_configs = env_config
-    
-    def __str__(self):
-        # extract base dtype name if it's a torch dtype
-        dtype_str = str(self.dtype)
-        if "torch." in dtype_str:
-            dtype_str = dtype_str.split(".")[-1]
-
-        env_str = ""
-        for env_key, env_value in self.env_configs.items():
-            env_str += f"{env_key}={env_value}"
-        return f"{self.fn_name}_{self.mode}_{dtype_str}_{env_str}_{self.backend}_{self.arch}"
-    
-    def column_name(self):
-        return f"{self}_ms"
-
 def load_flash_attn_module(backend: Literal["triton", "ck"], env_configs: Dict = {}, verbose = False):
     """
     Load the flash_attn module with the specified backend configuration
@@ -973,13 +989,27 @@ def filter_modes(requested_modes, fn_name, supported_modes_for_fn):
         modes_to_run = ["full" if "full" in supported_modes_for_fn else "fwd"]
     return modes_to_run
 
-def get_env_value_combinations():
-    env_variation_items = list(ENV_VARIATION_PARAMS.items())
-    env_keys = [item[0] for item in env_variation_items]
-    env_value_combinations = list(itertools.product(*[item[1] for item in env_variation_items]))
-    if not env_value_combinations:
-        env_value_combinations = [()]
-    return env_keys, env_value_combinations
+def get_env_value_combinations(current_backend: Optional[Literal["triton", "ck"]]) -> List[Dict[str, str]]:
+    # filter environment variations applicable to the current backend
+    applicable_variations = [
+        var_config for var_config in ENV_VARIABLE_CONFIGS
+        if var_config.backend is None or var_config.backend == current_backend
+    ]
+
+    if not applicable_variations:
+        # no applicable variations, return list with empty dict
+        return [{}]  
+
+    # prepare keys and value lists
+    variation_keys = [v.key for v in applicable_variations]
+    variation_value_lists = [v.values for v in applicable_variations]
+    
+    # generate all combinations as dictionaries directly
+    env_configs = []
+    for value_combination in itertools.product(*variation_value_lists):
+        env_configs.append(dict(zip(variation_keys, value_combination)))
+    
+    return env_configs
 
 def get_input_config_set(config_type):
     if config_type == "llama":
@@ -1042,12 +1072,8 @@ def process_args():
     # fenerate function configurations and input configurations separately
     all_function_configs = []
     all_input_configs = {}  # Maps function config -> input configs
-
-    # get environment variation combinations
-    env_keys, env_value_combinations = get_env_value_combinations()
-    
     for fn_name in benchmark_fns:
-        is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes_for_fn, device = get_fn_params(fn_name)
+        is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes_for_fn, supported_env_configs, device = get_fn_params(fn_name)
         
         # Generate or use custom input configurations
         if args.b or args.hq or args.hk or args.sq or args.sk or args.d:
@@ -1080,8 +1106,7 @@ def process_args():
         for backend in supported_backends:
             for dtype in supported_dtypes:
                 for mode in modes_to_run:
-                    for env_value_combination in env_value_combinations:
-                        env_config = dict(zip(env_keys, env_value_combination))
+                    for env_config in supported_env_configs[backend]:
                         func_config = FunctionConfig(fn_name, mode, dtype, backend, env_config)
                         all_function_configs.append(func_config)
                         
