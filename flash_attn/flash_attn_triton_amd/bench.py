@@ -1,9 +1,10 @@
-import argparse
 import os
 import sys
 import torch
 import triton
 import time
+import argparse
+import itertools
 import pandas as pd
 from logging import warning
 from typing import Dict, List, Literal, Optional, Tuple
@@ -69,6 +70,10 @@ SUPPORTED_MODES = {
     "flash_attn_varlen_qkvpacked_func": ["fwd", "bwd", "full"],
     "flash_attn_varlen_qkvpacked_fp8_func": ["fwd", "bwd", "full"],
     "flash_attn_with_kvcache": ["fwd"],
+}
+
+ENV_VARIATION_PARAMS = {
+    "BWD_MODE": ["split", "fused", "jingning"],
 }
 
 @lru_cache()
@@ -814,7 +819,30 @@ def get_packing_type(fn_name: str) -> Optional[Literal["kv", "qkv"]]:
 
     return packing
 
-def load_flash_attn_module(backend: Literal["triton", "ck"], verbose = False):
+class FunctionConfig:
+    def __init__(self, fn_name: str, mode: Literal["fwd", "bwd", "full"], dtype, backend: Literal["triton", "ck"], env_config: Dict):
+        self.fn_name = fn_name
+        self.mode: Literal["fwd", "bwd", "full"] = mode
+        self.dtype = dtype
+        self.backend: Literal["triton", "ck"] = backend
+        self.arch = get_arch()
+        self.env_configs = env_config
+    
+    def __str__(self):
+        # extract base dtype name if it's a torch dtype
+        dtype_str = str(self.dtype)
+        if "torch." in dtype_str:
+            dtype_str = dtype_str.split(".")[-1]
+
+        env_str = ""
+        for env_key, env_value in self.env_configs.items():
+            env_str += f"{env_key}={env_value}"
+        return f"{self.fn_name}_{self.mode}_{dtype_str}_{env_str}_{self.backend}_{self.arch}"
+    
+    def column_name(self):
+        return f"{self}_ms"
+
+def load_flash_attn_module(backend: Literal["triton", "ck"], env_configs: Dict = {}, verbose = False):
     """
     Load the flash_attn module with the specified backend configuration
     """
@@ -827,12 +855,15 @@ def load_flash_attn_module(backend: Literal["triton", "ck"], verbose = False):
     # set environment variable for the desired backend
     if backend == "triton":
         os.environ["FLASH_ATTENTION_TRITON_AMD_ENABLE"] = "TRUE"
-        os.environ["FLASH_ATTENTION_TRITON_AMD_AUTOTUNE"] = "1"
+        os.environ["FLASH_ATTENTION_TRITON_AMD_AUTOTUNE"] = "0"
         os.environ["FLASH_ATTENTION_TRITON_AMD_DEBUG"] = "0"
     elif backend == "ck":
         os.environ["FLASH_ATTENTION_TRITON_AMD_ENABLE"] = "FALSE"
     else:
         raise ValueError(f"Unknown backend {backend}")
+    
+    # add custom env configs
+    add_env_configs(env_configs)
     
     if verbose:
         print(f"Loading flash_attn module with {backend} backend.")
@@ -850,7 +881,13 @@ def load_flash_attn_module(backend: Literal["triton", "ck"], verbose = False):
     
     return flash_attn
 
-def run_benchmark(func_config, input_configs):
+def add_env_configs(env_config: Dict):
+    for env_key, env_value in env_config.items():
+        if env_key in os.environ:
+            del os.environ[env_key] # remove previous version so that env key is the latest key added
+        os.environ[env_key] = env_value   
+
+def run_benchmark(func_config: FunctionConfig, input_configs):
     """
     Runs the benchmark for the provided function configuration with the given input configurations.
     """
@@ -866,18 +903,13 @@ def run_benchmark(func_config, input_configs):
     backend = func_config.backend
 
     # load flash attention module
-    flash_attn_module = load_flash_attn_module(backend, verbose=True)
+    flash_attn_module = load_flash_attn_module(backend, func_config.env_configs, verbose=True)
  
     # start timing the benchmark
     start_time = time.time()
 
     # print bench fn
-    mode_text_dict = {
-        "fwd": "forward",
-        "bwd": "backward",
-        "full": "forward and backward"
-    }
-    print(f"Benchmarking {fn_name} {mode_text_dict[mode]} with {len(input_configs)} configs in {dtype} on the {backend} backend ...")
+    print(f"Benchmarking {func_config} ...")
 
     # Setup benchmark configurations
     bench_configs = [
@@ -929,23 +961,40 @@ def run_benchmark(func_config, input_configs):
 
     return df
 
-class FunctionConfig:
-    def __init__(self, fn_name: str, mode: Literal["fwd", "bwd", "full"], dtype, backend: Literal["triton", "ck"]):
-        self.fn_name = fn_name
-        self.mode: Literal["fwd", "bwd", "full"] = mode
-        self.dtype = dtype
-        self.backend: Literal["triton", "ck"] = backend
-        self.arch = get_arch()
+def filter_modes(requested_modes, fn_name, supported_modes_for_fn):
+    modes_to_run = []
+    if requested_modes:
+        for mode in requested_modes:
+            if mode in supported_modes_for_fn:
+                modes_to_run.append(mode)
+            else:
+                warning(f"Mode '{mode}' requested but not supported by function '{fn_name}'. Skipping this mode for this function.")
+    else:
+        modes_to_run = ["full" if "full" in supported_modes_for_fn else "fwd"]
+    return modes_to_run
+
+def get_env_value_combinations():
+    env_variation_items = list(ENV_VARIATION_PARAMS.items())
+    env_keys = [item[0] for item in env_variation_items]
+    env_value_combinations = list(itertools.product(*[item[1] for item in env_variation_items]))
+    if not env_value_combinations:
+        env_value_combinations = [()]
+    return env_keys, env_value_combinations
+
+def get_input_config_set(config_type):
+    if config_type == "llama":
+        # batch, hq, hk, sq, sk, d_head, causal, dropout
+        input_configs = [
+            # LLaMA 3 8B
+            (1, 32, 8, 8192, 8192, 128, True, 0.0),
+            # LLaMA 3 70B
+            (1, 64, 8, 8192, 8192, 128, True, 0.0),
+        ]
+    else:
+        raise ValueError(f"Unknown input config: {config_type}")
     
-    def __str__(self):
-        # extract base dtype name if it's a torch dtype
-        dtype_str = str(self.dtype)
-        if "torch." in dtype_str:
-            dtype_str = dtype_str.split(".")[-1]
-        return f"{self.fn_name}_{self.mode}_{dtype_str}_{self.backend}_{self.arch}"
-    
-    def column_name(self):
-        return f"{self}_ms"
+    return input_configs
+
 
 def process_args():
     """
@@ -991,8 +1040,11 @@ def process_args():
     requested_modes = args.mode 
 
     # fenerate function configurations and input configurations separately
-    function_configs = []
+    all_function_configs = []
     all_input_configs = {}  # Maps function config -> input configs
+
+    # get environment variation combinations
+    env_keys, env_value_combinations = get_env_value_combinations()
     
     for fn_name in benchmark_fns:
         is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes_for_fn, device = get_fn_params(fn_name)
@@ -1013,28 +1065,13 @@ def process_args():
             dropout = args.dropout if args.dropout is not None else 0.0
             input_configs = [(batch, hq, hk, sq, sk, d_head, causal, dropout)]
         else:
-            config_type = "llama"
-            if config_type == "llama":
-                # batch, hq, hk, sq, sk, d_head, causal, dropout
-                input_configs = [
-                    # LLaMA 3 8B
-                    (1, 32, 8, 8192, 8192, 128, True, 0.0),
-                    # LLaMA 3 70B
-                    (1, 64, 8, 8192, 8192, 128, True, 0.0),
-                ]
+            if True:
+                input_configs = get_input_config_set("llama")
             else:
                 input_configs = generate_benchmark_configs(is_varlen, packing)
 
         # filter by mode
-        modes_to_run = []
-        if requested_modes:
-            for mode in requested_modes:
-                if mode in supported_modes_for_fn:
-                    modes_to_run.append(mode)
-                else:
-                    warning(f"Mode '{mode}' requested but not supported by function '{fn_name}'. Skipping this mode for this function.")
-        else:
-            modes_to_run = ["full" if "full" in supported_modes_for_fn else "fwd"]
+        modes_to_run = filter_modes(requested_modes, fn_name, supported_modes_for_fn)
         if not modes_to_run:
             warning(f"No valid modes to run for function '{fn_name}' based on request and function support. Skipping this function.")
             continue
@@ -1043,17 +1080,19 @@ def process_args():
         for backend in supported_backends:
             for dtype in supported_dtypes:
                 for mode in modes_to_run:
-                    func_config = FunctionConfig(fn_name, mode, dtype, backend)
-                    function_configs.append(func_config)
-                    
-                    # Generate inputs for this function configuration
-                    fn_inputs = {}
-                    for input_config in input_configs:
-                        fn_inputs[input_config] = generate_fn_inputs(fn_name, *input_config, dtype, device)
-                    
-                    all_input_configs[func_config] = fn_inputs
+                    for env_value_combination in env_value_combinations:
+                        env_config = dict(zip(env_keys, env_value_combination))
+                        func_config = FunctionConfig(fn_name, mode, dtype, backend, env_config)
+                        all_function_configs.append(func_config)
+                        
+                        # Generate inputs for this function configuration
+                        fn_inputs = {}
+                        for input_config in input_configs:
+                            fn_inputs[input_config] = generate_fn_inputs(fn_name, *input_config, dtype, device)
+                        
+                        all_input_configs[func_config] = fn_inputs
 
-    return function_configs, all_input_configs
+    return all_function_configs, all_input_configs
 
 def check_environment_variables():
     for key in ENV_FLAGS:
