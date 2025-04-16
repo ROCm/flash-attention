@@ -56,6 +56,7 @@ SUPPORTED_BACKENDS = {
     "flash_attn_with_kvcache": ["ck", "triton"],
 }
 
+VALID_MODES = ['fwd', 'bwd', 'full']
 SUPPORTED_MODES = {
     "flash_attn_func": ["fwd", "bwd", "full"],
     "flash_attn_fp8_func": ["fwd", "bwd", "full"],
@@ -176,8 +177,8 @@ def generate_benchmark_configs(is_varlen: bool, packing: Optional[Literal["kv", 
             sq_values = [4, 4096]
             sk_values = [4096, 16384] # test large k values for inference perf
     d_head_values = [64, 128]
-    causal_values = [True] # most models usual causal True
-    dropout_values = [0.0]
+    causal_values = [True, False] # most models usual causal True
+    dropout_values = [0.0, 0.1]
     
     # generate all fn_configs without inputs
     input_configs = []
@@ -961,7 +962,16 @@ def process_args():
         type=str,
         nargs="*",
         choices=FUNCTIONS,
+        required=True,
         help=f"Function(s) to benchmark",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        nargs='*',
+        choices=VALID_MODES,
+        default=None,
+        help=f"Benchmarking mode(s) to run. If omitted, runs all supported modes for each function.",
     )
     # config
     parser.add_argument("-b", type=int, default=None, help="Batch size")
@@ -976,21 +986,16 @@ def process_args():
     # parse args
     args = parser.parse_args()
 
-    # determine the functions to benchmark
-    if args.benchmark_fn is None or len(args.benchmark_fn) == 0:
-        raise ValueError(f"Provide a function to benchmark from this list: {FUNCTIONS}")
-    else:
-        for fn_name in args.benchmark_fn:
-            if fn_name not in FUNCTIONS:
-                raise ValueError(f"invalid benchmark function specified: {fn_name}")
-        benchmark_fns = args.benchmark_fn
+    # parse function args
+    benchmark_fns = args.benchmark_fn
+    requested_modes = args.mode 
 
     # fenerate function configurations and input configurations separately
     function_configs = []
     all_input_configs = {}  # Maps function config -> input configs
     
     for fn_name in benchmark_fns:
-        is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes, device = get_fn_params(fn_name)
+        is_varlen, is_fp8, packing, supported_dtypes, supported_backends, supported_modes_for_fn, device = get_fn_params(fn_name)
         
         # Generate or use custom input configurations
         if args.b or args.hq or args.hk or args.sq or args.sk or args.d:
@@ -1016,20 +1021,28 @@ def process_args():
                     (1, 32, 8, 8192, 8192, 128, True, 0.0),
                     # LLaMA 3 70B
                     (1, 64, 8, 8192, 8192, 128, True, 0.0),
-                    # # LLaMA 3.1 8B
-                    # (1, 32, 8, 128000, 128000, 128, True, 0.1),
-                    # # LLaMA 3.1 70B
-                    # (1, 64, 8, 128000, 128000, 128, True, 0.1),
-                    # # LLaMA 3.1 405B
-                    # (1, 128, 16, 128000, 128000, 128, True, 0.1),
                 ]
             else:
                 input_configs = generate_benchmark_configs(is_varlen, packing)
+
+        # filter by mode
+        modes_to_run = []
+        if requested_modes:
+            for mode in requested_modes:
+                if mode in supported_modes_for_fn:
+                    modes_to_run.append(mode)
+                else:
+                    warning(f"Mode '{mode}' requested but not supported by function '{fn_name}'. Skipping this mode for this function.")
+        else:
+            modes_to_run = ["full" if "full" in supported_modes_for_fn else "fwd"]
+        if not modes_to_run:
+            warning(f"No valid modes to run for function '{fn_name}' based on request and function support. Skipping this function.")
+            continue
         
-        # Create a function config for each backend and dtype combination
+        # create a function config for each backend and dtype combination
         for backend in supported_backends:
             for dtype in supported_dtypes:
-                for mode in supported_modes:
+                for mode in modes_to_run:
                     func_config = FunctionConfig(fn_name, mode, dtype, backend)
                     function_configs.append(func_config)
                     
@@ -1122,7 +1135,7 @@ def main():
                 # print explanation
                 print(f"Comparison Results (triton vs ck):")
                 print(f"Ratio values: values > 1 mean triton is faster (by that factor), values < 1 mean ck is faster")
-            else:
+            elif False:
                 # For other comparisons, use the standard approach
                 ratio_col = f"{func1}_to_{func2}_ratio"
                 
