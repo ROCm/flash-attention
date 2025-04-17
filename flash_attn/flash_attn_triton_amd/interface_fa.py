@@ -8,12 +8,10 @@ from .bwd_prefill_onekernel import attention_prefill_backward_triton_split_oneKe
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
-from .utils import DEBUG, MetaData, get_shapes_from_layout, is_fp8
+from .utils import DEBUG, USE_REF, MetaData, get_shapes_from_layout, is_fp8
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 from typing import Literal, Optional, Union
-
-USE_REF = os.environ.get('FLASH_ATTENTION_TRITON_AMD_REF', '0').lower() in ('1', 'true', 'yes')
 
 def fwd(q: torch.Tensor,
         k: torch.Tensor,
@@ -89,7 +87,7 @@ def fwd(q: torch.Tensor,
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
-        softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
+        out_ref, softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
                                                 q,
                                                 k,
                                                 v,
@@ -104,6 +102,7 @@ def fwd(q: torch.Tensor,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.use_exp2)
+        out = out_ref
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:

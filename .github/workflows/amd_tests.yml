@@ -52,7 +52,7 @@ jobs:
 
       - name: AMD Internal Tests
         run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 pytest flash_attn/flash_attn_triton_amd/test.py::test_fp8
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 pytest flash_attn/flash_attn_triton_amd/test.py
 
       - name: Flash Attention Tests
         run: |
