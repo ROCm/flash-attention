@@ -48,7 +48,6 @@ class MetaData():
     philox_seed: Optional[int] = None
     philox_offset : Optional[int]= None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
     # NOTE: scale sm_scale by log_2(e) and use 2^x in the loop as we do not have native e^x support in HW.
-    use_exp2: bool = False
     rotary_sin: Optional[torch.Tensor] = None
     rotary_cos: Optional[torch.Tensor] = None
     rotary_interleaved: bool = False

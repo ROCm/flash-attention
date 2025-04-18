@@ -13,6 +13,9 @@ from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 from typing import Literal, Optional, Union
 
+
+USE_EXP2 = True
+
 def fwd(q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -103,7 +106,7 @@ def fwd(q: torch.Tensor,
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.use_exp2)
+                                                USE_EXP2)
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -129,7 +132,7 @@ def fwd(q: torch.Tensor,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.return_scores,
-                                                metadata.use_exp2,
+                                                USE_EXP2,
                                                 descale_q,
                                                 descale_k,
                                                 descale_v,
@@ -244,7 +247,7 @@ def bwd(
             dropout_p,
             philox_seed,
             philox_offset,
-            False,
+            USE_EXP2,
         )
         delta = delta_ref
     else:
@@ -272,7 +275,7 @@ def bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                False,
+                USE_EXP2,
                 descale_q,
                 descale_k,
                 descale_v,
@@ -333,7 +336,7 @@ def bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                False
+                USE_EXP2
             )
             delta = delta_triton
         else:
@@ -452,7 +455,7 @@ def varlen_fwd(
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.use_exp2)
+                                                USE_EXP2)
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -478,7 +481,7 @@ def varlen_fwd(
                                                             metadata.philox_seed,
                                                             metadata.philox_offset,
                                                             metadata.return_scores,
-                                                            metadata.use_exp2,
+                                                            USE_EXP2,
                                                             descale_q,
                                                             descale_k,
                                                             descale_v,
@@ -785,7 +788,7 @@ def fwd_kvcache(
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.return_scores,
-                                                metadata.use_exp2,
+                                                USE_EXP2,
                                                 None,
                                                 None,
                                                 None,

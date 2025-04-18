@@ -1107,6 +1107,7 @@ def _bwd_dkdvdq_inner(
     stride_q_m, stride_q_k,
     stride_do_m, stride_do_k,
     stride_dropout_m, stride_dropout_n,
+    stride_dq_m, stride_dq_k,
     stride_deltam,
     dropout_p, philox_seed, batch_philox_offset, dropout_offset,
     seqlen_q, seqlen_k,
@@ -1132,7 +1133,7 @@ def _bwd_dkdvdq_inner(
     mask_n = offs_n < seqlen_k
     
     qT_ptrs_start = Q + offs_m[None, :] * stride_q_m + offs_k[:, None] * stride_q_k #[BLOCK_D_MODEL_POW2, BLOCK_M]
-    dq_ptrs_start = DQ + offs_m[:, None] * stride_q_m + offs_k[None,:] * stride_q_k #[BLOCK_M, BLOCK_D_MODEL_POW2]
+    dq_ptrs_start = DQ + offs_m[:, None] * stride_dq_m + offs_k[None,:] * stride_dq_k #[BLOCK_M, BLOCK_D_MODEL_POW2]
     
     do_ptrs_start = DO + offs_m[:, None] * stride_do_m + offs_k[None,: ] * stride_do_k
     curr_m = start_m
@@ -1170,7 +1171,7 @@ def _bwd_dkdvdq_inner(
 
         curr_m = start_m + blk_idx * step_m
         qT_ptrs = qT_ptrs_start + blk_idx * step_m * stride_q_m
-        dq_ptrs = dq_ptrs_start + blk_idx * step_m * stride_q_m
+        dq_ptrs = dq_ptrs_start + blk_idx * step_m * stride_dq_m
         do_ptrs = do_ptrs_start + blk_idx * step_m * stride_do_m
 
         offs_m = curr_m + tl.arange(0, BLOCK_M)
@@ -1278,6 +1279,7 @@ def _bwd_kernel_dkdvdq_causal(
     stride_q_b, stride_q_h, stride_q_m, stride_q_k,
     stride_k_b, stride_k_h, stride_k_n, stride_k_k,
     stride_v_b, stride_v_h, stride_v_n, stride_v_k,
+    stride_dq_b, stride_dq_h, stride_dq_m, stride_dq_k,
     stride_dk_b, stride_dk_h, stride_dk_n, stride_dk_k,
     stride_delta_b, stride_delta_h, stride_delta_m,
     stride_do_b, stride_do_h, stride_do_m, stride_do_k,
@@ -1387,9 +1389,10 @@ def _bwd_kernel_dkdvdq_causal(
 
         # offset input and output tensor by batch and Q/K heads
         adj_q = batch_idx * stride_q_b + head_q_idx * stride_q_h + q_start * stride_q_m
+        adj_dq = batch_idx * stride_dq_b + head_q_idx * stride_dq_h + q_start * stride_dq_m
         
         q_ptr_adj = q_ptr + adj_q
-        dq_ptr_adj = dq_ptr + adj_q
+        dq_ptr_adj = dq_ptr + adj_dq
         
         adj_do = batch_idx * stride_do_b + head_q_idx * stride_do_h + q_start * stride_do_m
         do_ptr_adj = do_ptr + adj_do
@@ -1433,6 +1436,7 @@ def _bwd_kernel_dkdvdq_causal(
             stride_q_m, stride_q_k,  # strides for q
             stride_do_m, stride_do_k,  # strides for o
             stride_dropout_m, stride_dropout_n,  # strides for dropout
+            stride_dq_m, stride_dq_k,
             stride_delta_m,
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
             seqlen_q, seqlen_k,  # max sequence length for q and k
@@ -1456,6 +1460,7 @@ def _bwd_kernel_dkdvdq_causal(
             stride_q_m, stride_q_k,  # strides for q
             stride_do_m, stride_do_k,  # strides for o
             stride_dropout_m, stride_dropout_n,  # strides for dropout
+            stride_dq_m, stride_dq_k,
             stride_delta_m,
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
             seqlen_q, seqlen_k,  # max sequence length for q and k
@@ -1864,6 +1869,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     stride_qb, stride_qh, stride_qm, stride_qk,
     stride_kb, stride_kh, stride_kn, stride_kk,
     stride_vb, stride_vh, stride_vn, stride_vk,
+    stride_dq_b, stride_dq_h, stride_dq_m, stride_dq_k,
     stride_dkb, stride_dkh, stride_dkn, stride_dkk,
     stride_deltab, stride_deltah, stride_deltam,
     stride_dob, stride_doh, stride_dom, stride_dok,
@@ -1939,9 +1945,10 @@ def _bwd_kernel_dkdvdq_noncausal(
 
     for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
         adj_q = (bid * stride_qb + hqid * stride_qh + q_start * stride_qm)
+        adj_dq = bid * stride_dq_b + hqid * stride_dq_h + q_start * stride_dq_m
         
         Q_ptr = Q + adj_q
-        DQ_ptr = DQ  + adj_q
+        DQ_ptr = DQ  + adj_dq
         
         adj_do = (bid * stride_dob + hqid * stride_doh + q_start * stride_dom)
         DO_ptr = DO + adj_do
@@ -1975,6 +1982,7 @@ def _bwd_kernel_dkdvdq_noncausal(
             stride_qm, stride_qk,
             stride_dom, stride_dok,
             stride_dropoutm, stride_dropoutn,
+            stride_dq_m, stride_dq_k,
             stride_deltam,
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,
             seqlen_q, seqlen_k,
@@ -2367,12 +2375,9 @@ def _flash_attn_backward(
         dropout_mask = None
         dropout_strides = (0, 0, 0, 0)
 
-    grid_dkdv = ((max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, num_k_heads)
-    grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, num_k_heads)
-    
     if fused: # fuses dk, dv, dq computations into one kernel by computing the dq using atomic adds between workgroups
         
-        BLOCK_N = 128
+        BLOCK_N = 128 if BLOCK_D_MODEL_POW2 < 160 else 64 # larger head sizes lead to oom
         config = {
             "BLOCK_M": 32,
             "BLOCK_N": BLOCK_N,
@@ -2384,7 +2389,6 @@ def _flash_attn_backward(
         
         num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
         grid_dkdvdq = (batch * num_k_heads * num_k_pids,) 
-
         if causal:
             _bwd_kernel_dkdvdq_causal[grid_dkdvdq](
                 q, k, v, sm_scale, do, dk, dv, dq,
@@ -2392,6 +2396,7 @@ def _flash_attn_backward(
                 *q_strides,
                 *k_strides,
                 *v_strides,
+                *dq_strides,
                 *dk_strides,
                 *delta_strides,
                 *do_strides,
@@ -2421,6 +2426,7 @@ def _flash_attn_backward(
                 *q_strides,
                 *k_strides,
                 *v_strides,
+                *dq_strides,
                 *dk_strides,
                 *delta_strides,
                 *do_strides,
@@ -2445,137 +2451,8 @@ def _flash_attn_backward(
             )
         
         return delta
-    
-    # split kernels solution: one kernel computes dk, dv and the other computes dq
-
-    if causal:
-        _bwd_kernel_dkdv_causal[grid_dkdv](
-            q, k, v, sm_scale, do, dk, dv,
-            softmax_lse, delta,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            *dk_strides,
-            *delta_strides,
-            *do_strides,
-            *dropout_strides,
-            *descale_strides,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_mask,dropout_p, philox_seed, philox_offset,
-            descale_q, descale_k, descale_v, descale_do,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M1,
-            BLOCK_N=BLOCK_N1,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-            BLOCK_D_MODEL=head_sz,
-            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
-        )
-        _bwd_kernel_dq_causal[grid_dq](
-            q, k, v, sm_scale, do, dq,
-            softmax_lse, delta,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            *dq_strides,
-            *delta_strides,
-            *do_strides,
-            *dropout_strides,
-            *descale_strides,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
-            dropout_mask,dropout_p, philox_seed, philox_offset,
-            descale_q, descale_k, descale_v, descale_do,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M2,
-            BLOCK_N=BLOCK_N2,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-            BLOCK_D_MODEL=head_sz,
-            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
-        )
     else:
-        _bwd_kernel_dkdv_noncausal[grid_dkdv](
-            q, k, v, sm_scale, do, dk, dv,
-            softmax_lse, delta,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            *dk_strides,
-            *delta_strides,
-            *do_strides,
-            *dropout_strides,
-            *descale_strides,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_mask,dropout_p, philox_seed, philox_offset,
-            descale_q, descale_k, descale_v, descale_do,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M1,
-            BLOCK_N=BLOCK_N1,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-            BLOCK_D_MODEL=head_sz,
-            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
-        )
-
-        _bwd_kernel_dq_noncausal[grid_dq](
-            q, k, v, sm_scale, do, dq,
-            softmax_lse, delta,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            *dq_strides,
-            *delta_strides,
-            *do_strides,
-            *dropout_strides,
-            *descale_strides,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_mask,dropout_p, philox_seed, philox_offset,
-            descale_q, descale_k, descale_v, descale_do,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M2,
-            BLOCK_N=BLOCK_N2,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
-            BLOCK_D_MODEL=head_sz,
-            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
-        )
-
-    return delta
+        raise ValueError("Only fused mode supported")
 
 
 class FlashAttnFunc(torch.autograd.Function):

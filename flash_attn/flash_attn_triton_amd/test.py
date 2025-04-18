@@ -96,7 +96,6 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
             print("MHA")
 
     # update metadata
-    metadata.use_exp2 = use_exp2
     if causal:
         metadata.need_causal(True)
 
@@ -129,7 +128,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
                                                 metadata.philox_seed, 
                                                 metadata.philox_offset, 
                                                 metadata.return_scores, 
-                                                metadata.use_exp2,
+                                                use_exp2,
                                                 None,
                                                 None,
                                                 None,
