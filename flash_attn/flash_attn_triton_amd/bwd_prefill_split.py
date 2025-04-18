@@ -3,7 +3,7 @@ import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
 from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shapes_from_layout, \
-    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8
+    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8, compute_alibi_block
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -82,19 +82,21 @@ def _bwd_dkdv_inner(
     Q, k, v, DO, M, D, sm_scale,  # input tensor
     stride_qm, stride_qk,
     stride_dom, stride_dok,
-    stride_dropoutm, stride_dropoutn,  #
+    stride_dropoutm, stride_dropoutn,
     stride_deltam,
     BLOCK_M: tl.constexpr,  # 16
     BLOCK_N: tl.constexpr,  # 128
     HEAD_DIM: tl.constexpr,  #
     ACTUAL_HEAD_DIM: tl.constexpr,  #
-    dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
+    dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+    alibi_slope,
     seqlen_q, seqlen_k,  # max sequence length for q and k
     # Filled in by the wrapper.
     start_n, start_m, num_steps,  # iteration numbers
     descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
     MASK: tl.constexpr,  # causal masking, only apply to tiles on mask diagonal
     ENABLE_DROPOUT: tl.constexpr,  # activate dropout
+    USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,  # activate exp2
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
@@ -157,6 +159,15 @@ def _bwd_dkdv_inner(
             qkT = (tl.dot(k, qT) * descale_q * descale_k)
         else:
             qkT = tl.dot(k, qT)
+
+        if USE_ALIBI:
+            # compute the global position of each token within the sequence
+            global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            global_n_positions = start_n + tl.arange(0, BLOCK_N)
+            alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
+                                              global_n_positions)
+            qkT += alibi_block
+
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
                 print(f"qT: {qT.shape}\n", qT)
@@ -388,11 +399,13 @@ def _bwd_kernel_dkdv_causal(
             MASK_BLOCK_M, BLOCK_N,  # block dim
             HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
+            alibi_slope,
             seqlen_q, seqlen_k,  # max sequence length for q and k
             start_n, start_m, num_steps,  # iteration numbers
             descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user 
             MASK=True,  # causal masking
             ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
+            USE_ALIBI=USE_ALIBI, 
             USE_EXP2=USE_EXP2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
@@ -416,11 +429,13 @@ def _bwd_kernel_dkdv_causal(
             BLOCK_M, BLOCK_N,  # block dim
             HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
+            alibi_slope,
             seqlen_q, seqlen_k,  # max sequence length for q and k
             start_n, start_m, num_steps,  # iteration numbers
             descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
             MASK=False,  # causal masking
             ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
+            USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
@@ -450,12 +465,14 @@ def _bwd_dq_inner(
     BLOCK_N2: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,  #
-    dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
+    dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+    alibi_slope,
     # Filled in by the wrapper.
     start_m, start_n, end_n, num_steps,  #
     descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
     MASK: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
@@ -519,6 +536,15 @@ def _bwd_dq_inner(
             qk = (tl.dot(q, kT) * descale_q * descale_k)
         else:
             qk = tl.dot(q, kT)
+
+        if USE_ALIBI:
+            # Compute the global position of each token within the sequence
+            global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            global_n_positions = start_n + tl.arange(0, BLOCK_N)
+            alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
+                                              global_n_positions)
+            qk += alibi_block
+
         if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk * sm_scale)  # noqa: E701
         if USE_EXP2:
             p = tl.math.exp2(qk * sm_scale * RCP_LN2 - m * RCP_LN2)
@@ -706,10 +732,12 @@ def _bwd_kernel_dq_causal(
             BLOCK_M, MASK_BLOCK_N,
             HEAD_DIM, ACTUAL_HEAD_DIM,
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+            alibi_slope,
             start_m, start_n, end_n, num_steps,
             descale_q, descale_k, descale_v, descale_do,
             MASK=True,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
+            USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
@@ -730,10 +758,12 @@ def _bwd_kernel_dq_causal(
             BLOCK_M, BLOCK_N,
             HEAD_DIM, ACTUAL_HEAD_DIM,
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+            alibi_slope,
             start_m, start_n, end_n, num_steps,
             descale_q, descale_k, descale_v, descale_do,
             MASK=False,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
+            USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
@@ -868,11 +898,13 @@ def _bwd_kernel_dkdv_noncausal(
             BLOCK_M, BLOCK_N,  # block dim
             HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
+            alibi_slope,
             seqlen_q, seqlen_k,  # max sequence length for q and k
             start_n, start_m, num_steps,  # iteration numbers
             descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
             MASK=False,  # causal masking
             ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
+            USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
@@ -1012,10 +1044,12 @@ def _bwd_kernel_dq_noncausal(
             BLOCK_M, BLOCK_N,
             HEAD_DIM, ACTUAL_HEAD_DIM,
             dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+            alibi_slope,
             start_m, start_n, end_n, num_steps,
             descale_q, descale_k, descale_v, descale_do,
             MASK=False,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
+            USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
