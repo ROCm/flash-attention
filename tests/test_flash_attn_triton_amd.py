@@ -16,7 +16,7 @@ from flash_attn import (
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_rdna
+from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, generate_bshd_tensor, is_rdna
 
 MAX_HEADDIM_SM8x = 192
 
@@ -924,7 +924,11 @@ def test_flash_attn_output(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    DEBUG_INPUT = True
+    if DEBUG_INPUT:
+        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+    else:
+        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
         # Ensure the values of qk are at least within softcap range.
         q = q * softcap
@@ -933,12 +937,17 @@ def test_flash_attn_output(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
         )
     else:
-        k = torch.randn(
-            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
-        )
-        v = torch.randn(
-            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
-        )
+        if DEBUG_INPUT:
+            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+        else:
+            k = torch.randn(
+                batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
+            )
+            v = torch.randn(
+                batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
+            )
+   
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
@@ -1133,9 +1142,9 @@ def test_flash_attn_output(
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
-        assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
-        assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
+        assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
+        assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
 
 
 @pytest.mark.parametrize("kvpacked", [False])

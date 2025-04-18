@@ -161,11 +161,8 @@ def _bwd_dkdv_inner(
             qkT = tl.dot(k, qT)
 
         if USE_ALIBI:
-            # compute the global position of each token within the sequence
-            global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            global_n_positions = start_n + tl.arange(0, BLOCK_N)
-            alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
-                                              global_n_positions)
+            # compute alibi block
+            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, curr_m + tl.arange(0, BLOCK_M), start_n + tl.arange(0, BLOCK_N), transpose=True)
             qkT += alibi_block
 
         if DEBUG_TRITON_DETAIL:
@@ -538,11 +535,8 @@ def _bwd_dq_inner(
             qk = tl.dot(q, kT)
 
         if USE_ALIBI:
-            # Compute the global position of each token within the sequence
-            global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            global_n_positions = start_n + tl.arange(0, BLOCK_N)
-            alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
-                                              global_n_positions)
+            # compute alibi block
+            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n)
             qk += alibi_block
 
         if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk * sm_scale)  # noqa: E701
