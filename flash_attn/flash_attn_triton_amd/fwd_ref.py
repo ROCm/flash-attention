@@ -1,10 +1,11 @@
 import torch
 import math
+from typing import Literal, Optional
 from .utils import DEBUG
 
 DEBUG_CORE = False
 
-def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2):
+def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
     if DEBUG_CORE:
         print()
         print("attention_forward_core_ref_impl")
@@ -32,6 +33,26 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
     attention_scaled_scores = sm_scale * attention_scores
     if DEBUG_CORE:
         print("attention_scaled_scores:", attention_scaled_scores, attention_scaled_scores.shape)
+
+    # Apply ALiBi if slopes are provided
+    if alibi_slopes is not None:
+        L_q, L_k = q.shape[1], k.shape[1]
+        row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
+        col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
+        # Compute position differences
+        position_diff = torch.abs(row_idx - col_idx)
+        # Apply ALiBi slopes (broadcasting to match the batch dimensions)
+        if alibi_slopes.dim() == 0:  # scalar
+            alibi_bias = position_diff * alibi_slopes
+        else:  # tensor with shape matching batch dimensions
+            # Reshape for broadcasting
+            alibi_slopes_reshaped = alibi_slopes.view(*alibi_slopes.shape, 1, 1)
+            alibi_bias = position_diff * alibi_slopes_reshaped
+        # Add ALiBi bias to attention scores
+        attention_scaled_scores = attention_scaled_scores - alibi_bias
+        if DEBUG_CORE:
+            print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
+
 
     # Apply causal mask if necessary
     if causal:
@@ -140,7 +161,7 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
 
     return o, softmax_lse, sd_mask
 
-def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout, dropout_p, philox_seed, philox_offset, use_exp2):
+def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
     """Compute reference output and softmax_lse using PyTorch's built-in function"""
 
     # Ensure the layout is 'bhsd'
@@ -176,7 +197,7 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
 
     # Call the core attention function
     o, softmax_lse, sd_mask = attention_forward_core_ref_impl(
-        q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2
+        q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
     )
 
     if group_size != 1:
@@ -214,6 +235,7 @@ def attention_varlen_forward_pytorch_ref_impl(
     dropout_p, 
     philox_seed, 
     philox_offset,
+    alibi_slopes,
     use_exp2
 ):
     # Ensure the layout is 'thd'
@@ -278,7 +300,7 @@ def attention_varlen_forward_pytorch_ref_impl(
             v_i = v_i.reshape(nheads_k, seqlen_k, head_dim)
 
         # Call the core attention function for this sequence
-        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2)
+        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2)
 
         # Reshape outputs back to original dimensions
         if group_size != 1:
@@ -308,22 +330,23 @@ def attention_varlen_forward_pytorch_ref_impl(
 
 
 def attention_forward_pytorch_ref_impl(
-    q,
-    k,
-    v,
-    out,
-    sm_scale,
-    causal,
-    layout,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    dropout_p,
-    philox_seed,
-    philox_offset,
-    use_exp2
-    ):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    sm_scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+    causal: bool,
+    layout: Literal["bshd", "bhsd", "thd"],
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    philox_seed: Optional[int],
+    philox_offset: Optional[int],
+    use_exp2: bool
+):
     if DEBUG:
         print()
         print("attention_forward_pytorch_ref_impl")
@@ -332,6 +355,7 @@ def attention_forward_pytorch_ref_impl(
         print("v:", v, v.shape)
         print("out:", out, out.shape)
         print("sm_scale:", sm_scale)
+        print("alibi_slopes:", alibi_slopes, alibi_slopes.shape if alibi_slopes is not None else None)
         print("causal:", causal)
         print("layout:", layout)
         print("cu_seqlens_q:", cu_seqlens_q)
@@ -359,10 +383,12 @@ def attention_forward_pytorch_ref_impl(
             dropout_p,
             philox_seed,
             philox_offset,
+            alibi_slopes,
             use_exp2,
         )
     else:
-        o_ref, softmax_lse_ref, sd_mask_ref = attention_vanilla_forward_pytorch_ref_impl(q.clone(),
+        o_ref, softmax_lse_ref, sd_mask_ref = attention_vanilla_forward_pytorch_ref_impl(
+                                                       q.clone(),
                                                        k.clone(),
                                                        v.clone(),
                                                        sm_scale,
@@ -371,6 +397,7 @@ def attention_forward_pytorch_ref_impl(
                                                        dropout_p,
                                                        philox_seed,
                                                        philox_offset,
+                                                       alibi_slopes,
                                                        use_exp2)
 
     # copy back to ouput tensor

@@ -30,28 +30,29 @@ DROPOUT_DUMP = False
 # Metadata
 # -------------------------------
 class MetaData():
-    cu_seqlens_q = None
-    cu_seqlens_k = None
-    max_seqlens_q = 0
-    max_seqlens_k = 0
-    bias = None
-    alibi_slopes = None
+    cu_seqlens_q: Optional[torch.Tensor] = None
+    cu_seqlens_k: Optional[torch.Tensor] = None
+    max_seqlens_q: int = 0
+    max_seqlens_k: int = 0
+    bias: Optional[torch.Tensor] = None
+    alibi_slopes: Optional[torch.Tensor] = None
     causal: bool = False
     num_contexts = 0
     varlen: bool = False
     layout: Optional[Literal["bshd", "bhsd", "thd"]] = None
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None
     cache_batch_idx = None
-    packing = None
-    return_scores= False
+    packing: Optional[bool] = None
+    return_scores: bool = False
     dropout_p: float = 0.0
-    philox_seed, philox_offset = None, None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
+    philox_seed: Optional[int] = None
+    philox_offset : Optional[int]= None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
     # NOTE: scale sm_scale by log_2(e) and use 2^x in the loop as we do not have native e^x support in HW.
-    use_exp2 = False
-    rotary_sin = None
-    rotary_cos = None
-    rotary_interleaved = False
-    rotary_conjunction = False
+    use_exp2: bool = False
+    rotary_sin: Optional[torch.Tensor] = None
+    rotary_cos: Optional[torch.Tensor] = None
+    rotary_interleaved: bool = False
+    rotary_conjunction: bool = False
     
 
     def __repr__(self) -> str:
