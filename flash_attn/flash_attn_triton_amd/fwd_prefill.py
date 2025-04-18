@@ -612,6 +612,7 @@ def attention_prefill_forward_triton_impl(
 
     # check flags
     is_varlen = layout == "thd"
+    use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     is_inference = False if cache_seqlens is None else True
     if is_inference:
         assert layout == "bshd", f"{layout} layout is not supported with inference. Use bshd layout"
@@ -667,20 +668,15 @@ def attention_prefill_forward_triton_impl(
     else:
         bias_strides = (0, 0, 0, 0)
 
-    if alibi_slopes is not None:
-        alibi_strides = (alibi_slopes.stride(0), alibi_slopes.stride(1))
-    else:
-        alibi_strides = (0, 0)
-
     attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
                     sm_scale, softmax_lse, o, *q_strides, *k_strides, *v_strides, *o_strides,
-                    *bias_strides, *alibi_strides, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
+                    *bias_strides, stride_az, stride_ah, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
                     dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 
                     HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size, MAX_SEQLENS_Q=max_seqlens_q,
                     MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=is_varlen, IS_INFERENCE=is_inference,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
-                    USE_ALIBI=False if alibi_slopes is None else True, ENABLE_DROPOUT=dropout_p
+                    USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p
                     > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT)
 
     return softmax_lse, sd_mask if return_softmax else None 
