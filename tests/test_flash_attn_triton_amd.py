@@ -1133,6 +1133,8 @@ def test_flash_attn_output(
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
+    print("out:", out)
+    print("out_ref:", out_ref)
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     if dropout_p > 0.0:
@@ -1142,8 +1144,14 @@ def test_flash_attn_output(
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+        print("dv:", dv)
+        print("dv_ref:", dv_ref)
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
+        print("dk:", dk)
+        print("dk_ref:", dk_ref)
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
+        print("dq:", dq)
+        print("dq_ref:", dq_ref)
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
 
 

@@ -397,6 +397,9 @@ def attention_backward_pytorch_ref_impl(
     v,
     o,
     softmax_lse,
+    dq,
+    dk,
+    dv,
     sm_scale,
     causal,
     layout,
@@ -433,7 +436,7 @@ def attention_backward_pytorch_ref_impl(
 
 
     if layout == "thd":
-        dq, dk, dv, delta = attention_varlen_backward_pytorch_ref_impl(
+        dq_ref, dk_ref, dv_ref, delta = attention_varlen_backward_pytorch_ref_impl(
             do,
             q,
             k,
@@ -453,7 +456,7 @@ def attention_backward_pytorch_ref_impl(
             use_exp2,
         )
     else:
-        dq, dk, dv, delta = attention_vanilla_backward_pytorch_ref_impl(
+        dq_ref, dk_ref, dv_ref, delta = attention_vanilla_backward_pytorch_ref_impl(
             do,
             q,
             k,
@@ -470,6 +473,11 @@ def attention_backward_pytorch_ref_impl(
         )
         
 
+    # copy into output tensor
+    dv.copy_(dv_ref.to(dv.dtype))
+    dk.copy_(dk_ref.to(dk.dtype))
+    dq.copy_(dq_ref.to(dq.dtype))
+
     if DEBUG:
         print()
         print("attention_backward_pytorch_ref_impl outputs")
@@ -477,5 +485,4 @@ def attention_backward_pytorch_ref_impl(
         print("dv:", dv, dv.shape)
         print("dk:", dk, dk.shape)
         print("dq:", dq, dq.shape)
-
-    return dq, dk, dv, delta
+    return delta

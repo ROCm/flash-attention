@@ -87,10 +87,11 @@ def fwd(q: torch.Tensor,
     if USE_REF:
         if DEBUG:
             print("Using reference implementation")
-        out_ref, softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
+        softmax_lse_ref, sd_mask_ref = attention_forward_pytorch_ref_impl(
                                                 q,
                                                 k,
                                                 v,
+                                                out,
                                                 metadata.sm_scale,
                                                 metadata.causal,
                                                 metadata.layout,
@@ -102,7 +103,6 @@ def fwd(q: torch.Tensor,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
                                                 metadata.use_exp2)
-        out = out_ref
         softmax_lse=softmax_lse_ref
         sd_mask=sd_mask_ref
     else:
@@ -229,6 +229,9 @@ def bwd(
             v,
             out,
             softmax_lse,
+            dq,
+            dk,
+            dv,
             softmax_scale,
             causal,
             "bshd",
@@ -435,6 +438,7 @@ def varlen_fwd(
                                                 q,
                                                 k,
                                                 v,
+                                                out,
                                                 metadata.sm_scale,
                                                 metadata.causal,
                                                 metadata.layout,
@@ -573,6 +577,9 @@ def varlen_bwd(
             v,
             out,
             softmax_lse,
+            dq,
+            dk,
+            dv,
             softmax_scale,
             causal,
             "thd",

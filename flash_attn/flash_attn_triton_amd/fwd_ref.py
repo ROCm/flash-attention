@@ -311,6 +311,7 @@ def attention_forward_pytorch_ref_impl(
     q,
     k,
     v,
+    out,
     sm_scale,
     causal,
     layout,
@@ -329,6 +330,7 @@ def attention_forward_pytorch_ref_impl(
         print("q:", q, q.shape)
         print("k:", k, k.shape)
         print("v:", v, v.shape)
+        print("out:", out, out.shape)
         print("sm_scale:", sm_scale)
         print("causal:", causal)
         print("layout:", layout)
@@ -371,11 +373,13 @@ def attention_forward_pytorch_ref_impl(
                                                        philox_offset,
                                                        use_exp2)
 
+    # copy back to ouput tensor
+    out.copy_(o_ref.to(out.dtype))
+    
     if DEBUG:
         print()
         print("attention_forward_pytorch_ref_impl outputs")
-        print("o:", o_ref, o_ref.shape)
+        print("out:", out, out.shape)
         print("softmax_lse:", softmax_lse_ref, softmax_lse_ref.shape)
         print("sd_mask:", sd_mask_ref, sd_mask_ref.shape if sd_mask_ref is not None else None)
-
-    return o_ref, softmax_lse_ref, sd_mask_ref
+    return softmax_lse_ref, sd_mask_ref
