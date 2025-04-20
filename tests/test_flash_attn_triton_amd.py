@@ -886,6 +886,7 @@ def test_flash_attn_varlen_qkvpacked(
     "seqlen_q,seqlen_k",
     [
         (2, 2),
+        # (2, 4),
         # (113, 203),
         # (128, 217),
         # (113, 211),
@@ -905,6 +906,7 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
+    DEBUG_INPUT = True
     if USE_TRITON_ROCM:
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:
@@ -919,12 +921,15 @@ def test_flash_attn_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 1 # 4
-    nheads = 1 # 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
+    if DEBUG_INPUT:
+        batch_size = 2
+        nheads = 2
+    else:
+        batch_size = 4
+        nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    DEBUG_INPUT = False
     if DEBUG_INPUT:
         q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
     else:
@@ -951,6 +956,8 @@ def test_flash_attn_output(
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
+        print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
+        print("attn_bias:", attn_bias, attn_bias.shape)
     else:
         alibi_slopes, attn_bias = None, None
 

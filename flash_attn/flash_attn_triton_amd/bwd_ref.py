@@ -1,7 +1,7 @@
 import torch
 import math
 from typing import Literal, Optional
-from .utils import DEBUG
+from .utils import DEBUG, compute_alibi_tensor_ref
 
 DEBUG_CORE = False
 
@@ -43,19 +43,17 @@ def attention_backward_core_ref_impl(
     if DEBUG_CORE:
         print("attention_scaled_scores:", attention_scaled_scores, attention_scaled_scores.shape)
 
-    # apply alibi if slopes are provided
     if alibi_slopes is not None:
         L_q, L_k = q.shape[1], k.shape[1]
-        row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
-        col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
-        position_diff = torch.abs(row_idx - col_idx)
-        # scalar vs batched slopes
-        if alibi_slopes.dim() == 0:
-            alibi_bias = position_diff * alibi_slopes
-        else:
-            # reshape to [..., 1, 1] for broadcast
-            alibi_bias = position_diff * alibi_slopes.view(*alibi_slopes.shape, 1, 1)
-        attention_scaled_scores = attention_scaled_scores - alibi_bias
+        if DEBUG_CORE:
+            print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
+        alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
+        alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
+        if DEBUG_CORE:
+            print("alibi_bias:", alibi_bias, alibi_bias.shape)
+        attention_scaled_scores = attention_scaled_scores + alibi_bias
+        if DEBUG_CORE:
+            print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
 
     # Apply causal mask if necessary
     if causal:

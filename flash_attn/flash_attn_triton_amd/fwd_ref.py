@@ -1,9 +1,9 @@
 import torch
 import math
 from typing import Literal, Optional
-from .utils import DEBUG
+from .utils import DEBUG, compute_alibi_tensor_ref
 
-DEBUG_CORE = False
+DEBUG_CORE = True
 
 def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
     if DEBUG_CORE:
@@ -37,19 +37,15 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
     # Apply ALiBi if slopes are provided
     if alibi_slopes is not None:
         L_q, L_k = q.shape[1], k.shape[1]
-        row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
-        col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
-        # Compute position differences
-        position_diff = torch.abs(row_idx - col_idx)
-        # Apply ALiBi slopes (broadcasting to match the batch dimensions)
-        if alibi_slopes.dim() == 0:  # scalar
-            alibi_bias = position_diff * alibi_slopes
-        else:  # tensor with shape matching batch dimensions
-            # Reshape for broadcasting
-            alibi_slopes_reshaped = alibi_slopes.view(*alibi_slopes.shape, 1, 1)
-            alibi_bias = position_diff * alibi_slopes_reshaped
-        # Add ALiBi bias to attention scores
-        attention_scaled_scores = attention_scaled_scores - alibi_bias
+        if DEBUG_CORE:
+            print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
+        alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
+        if DEBUG_CORE:
+            print("alibi_bias:", alibi_bias, alibi_bias.shape)
+        alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
+        if DEBUG_CORE:
+            print("alibi_bias_flat:", alibi_bias, alibi_bias.shape)
+        attention_scaled_scores = attention_scaled_scores + alibi_bias
         if DEBUG_CORE:
             print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
 
