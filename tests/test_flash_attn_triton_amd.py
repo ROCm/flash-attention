@@ -924,7 +924,7 @@ def test_flash_attn_output(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    DEBUG_INPUT = True
+    DEBUG_INPUT = False
     if DEBUG_INPUT:
         q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
     else:

@@ -1,11 +1,12 @@
 import torch
 import math
+from typing import Literal, Optional
 from .utils import DEBUG
 
 DEBUG_CORE = False
 
 def attention_backward_core_ref_impl(
-    do, q, k, v, o, softmax_lse, sm_scale, causal, dropout_p, philox_seed, philox_offset, use_exp2
+    do, q, k, v, o, softmax_lse, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
 ):
     if DEBUG_CORE:
         print()
@@ -41,6 +42,20 @@ def attention_backward_core_ref_impl(
     attention_scaled_scores = sm_scale * attention_scores
     if DEBUG_CORE:
         print("attention_scaled_scores:", attention_scaled_scores, attention_scaled_scores.shape)
+
+    # apply alibi if slopes are provided
+    if alibi_slopes is not None:
+        L_q, L_k = q.shape[1], k.shape[1]
+        row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
+        col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
+        position_diff = torch.abs(row_idx - col_idx)
+        # scalar vs batched slopes
+        if alibi_slopes.dim() == 0:
+            alibi_bias = position_diff * alibi_slopes
+        else:
+            # reshape to [..., 1, 1] for broadcast
+            alibi_bias = position_diff * alibi_slopes.view(*alibi_slopes.shape, 1, 1)
+        attention_scaled_scores = attention_scaled_scores - alibi_bias
 
     # Apply causal mask if necessary
     if causal:
@@ -97,14 +112,6 @@ def attention_backward_core_ref_impl(
         if DEBUG_CORE:
             print("dp_dropout:", dp_dropout, dp_dropout.shape)
             print("dp:", dp, dp.shape)
-
-        # calculate ds
-        if True:
-            delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
-        else:
-            delta = torch.sum(p * dp, axis=-1).unsqueeze(-1)
-        dscores_scaled = p * (dp - delta)
-        ds = dscores_scaled * sm_scale
     else:
         # compute dv
         dv = torch.matmul(p.transpose(-2, -1), do)
@@ -116,10 +123,13 @@ def attention_backward_core_ref_impl(
         if DEBUG_CORE:
             print("dp:", dp, dp.shape)
 
-        # calculate ds
+    # calculate ds
+    if False:
         delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
-        dscores_scaled = p * (dp - delta)
-        ds = dscores_scaled * sm_scale
+    else:
+        delta = torch.sum(p * dp, axis=-1).unsqueeze(-1)
+    dscores_scaled = p * (dp - delta)
+    ds = dscores_scaled * sm_scale
     if DEBUG_CORE:
         print("delta:", delta, delta.shape)
         print("dscores_scaled:", dscores_scaled, dscores_scaled.shape)
@@ -165,6 +175,7 @@ def attention_varlen_backward_pytorch_ref_impl(
     dropout_p, 
     philox_seed, 
     philox_offset,
+    alibi_slopes,
     use_exp2,
 ):
     # Ensure the layout is 'thd'
@@ -242,6 +253,7 @@ def attention_varlen_backward_pytorch_ref_impl(
             dropout_p, 
             philox_seed, 
             philox_offset,
+            alibi_slopes,
             use_exp2
         )
 
@@ -285,9 +297,10 @@ def attention_vanilla_backward_pytorch_ref_impl(
     sm_scale,
     causal,
     layout,
-    dropout_p, 
-    philox_seed, 
+    dropout_p,
+    philox_seed,
     philox_offset,
+    alibi_slopes,
     use_exp2,
 ):
     if layout == "bshd":
@@ -352,6 +365,7 @@ def attention_vanilla_backward_pytorch_ref_impl(
         dropout_p, 
         philox_seed, 
         philox_offset,
+        alibi_slopes,
         use_exp2
     )
 
@@ -391,26 +405,27 @@ def attention_vanilla_backward_pytorch_ref_impl(
     return dq, dk, dv, delta
 
 def attention_backward_pytorch_ref_impl(
-    do,
-    q,
-    k,
-    v,
-    o,
-    softmax_lse,
-    dq,
-    dk,
-    dv,
-    sm_scale,
-    causal,
-    layout,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    dropout_p, 
-    philox_seed, 
-    philox_offset,
-    use_exp2
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    sm_scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+    causal: bool,
+    layout: Literal["bshd", "bhsd", "thd"],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
+    dropout_p: float, 
+    philox_seed: Optional[int], 
+    philox_offset: Optional[int],
+    use_exp2: bool
 ):
 
     if DEBUG:
@@ -451,8 +466,9 @@ def attention_backward_pytorch_ref_impl(
             max_seqlen_q,
             max_seqlen_k,
             dropout_p, 
-            philox_seed, 
+            philox_seed,
             philox_offset,
+            alibi_slopes,
             use_exp2,
         )
     else:
@@ -469,6 +485,7 @@ def attention_backward_pytorch_ref_impl(
             dropout_p, 
             philox_seed, 
             philox_offset,
+            alibi_slopes,
             use_exp2,
         )
         
