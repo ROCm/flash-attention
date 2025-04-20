@@ -237,6 +237,7 @@ def attention_varlen_backward_pytorch_ref_impl(
         do_i = do_i.permute(1, 0, 2)
         o_i = o_i.permute(1, 0, 2)
         softmax_lse_i = softmax_lse_i.transpose(0, 1)
+        alibi_slopes_i = alibi_slopes[i]
 
         # Call the core backward function for this sequence
         dq_i, dk_i, dv_i, delta_i = attention_backward_core_ref_impl(
@@ -251,7 +252,7 @@ def attention_varlen_backward_pytorch_ref_impl(
             dropout_p, 
             philox_seed, 
             philox_offset,
-            alibi_slopes,
+            alibi_slopes_i,
             use_exp2
         )
 
