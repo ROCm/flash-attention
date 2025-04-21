@@ -162,12 +162,7 @@ def _bwd_dkdv_inner(
         qkT_scaled =  qkT * sm_scale
 
         if USE_ALIBI:
-            # relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
-            # relative_pos_block = offs_m[None, :] + seqlen_k - seqlen_q - offs_n[:, None]
-            # relative_pos_block = offs_m[None, :] + seqlen_q - seqlen_k - offs_n[:, None]
             relative_pos_block = offs_n[:, None] + seqlen_q - seqlen_k - offs_m[None, :]
-            # relative_pos_block = offs_n[:, None] + seqlen_k - seqlen_q - offs_m[None, :]
-            
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qkT_scaled += alibi_block
 
