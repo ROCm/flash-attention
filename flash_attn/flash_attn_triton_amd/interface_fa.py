@@ -143,7 +143,7 @@ def fwd(q: torch.Tensor,
         if is_fp8(out):
             print("descale_o:", descale_o, descale_o.shape if descale_o is not None else None)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("exp_scores:", sd_mask, sd_mask.shape if sd_mask is not None else None )
+        print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None )
 
     return out, softmax_lse, sd_mask, rng_state
 

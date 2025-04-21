@@ -345,27 +345,7 @@ def attention_forward_pytorch_ref_impl(
     philox_offset: Optional[int],
     use_exp2: bool
 ):
-    if DEBUG:
-        print()
-        print("attention_forward_pytorch_ref_impl")
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("out:", out, out.shape)
-        print("sm_scale:", sm_scale)
-        print("alibi_slopes:", alibi_slopes, alibi_slopes.shape if alibi_slopes is not None else None)
-        print("causal:", causal)
-        print("layout:", layout)
-        print("cu_seqlens_q:", cu_seqlens_q)
-        print("cu_seqlens_k:", cu_seqlens_k)
-        print("max_seqlen_q:", max_seqlen_q)
-        print("max_seqlen_k:", max_seqlen_k)
-        print("dropout_p:", dropout_p)
-        print("philox_seed:", philox_seed)
-        print("philox_offset:", philox_offset)
-        print("use_exp2:", use_exp2)
-
-     # compute reference
+    # compute reference
     if layout == "thd":
         o_ref, softmax_lse_ref, sd_mask_ref = attention_varlen_forward_pytorch_ref_impl(
             q.clone(), 
@@ -401,10 +381,4 @@ def attention_forward_pytorch_ref_impl(
     # copy back to ouput tensor
     out.copy_(o_ref.to(out.dtype))
     
-    if DEBUG:
-        print()
-        print("attention_forward_pytorch_ref_impl outputs")
-        print("out:", out, out.shape)
-        print("softmax_lse:", softmax_lse_ref, softmax_lse_ref.shape)
-        print("sd_mask:", sd_mask_ref, sd_mask_ref.shape if sd_mask_ref is not None else None)
     return softmax_lse_ref, sd_mask_ref

@@ -1179,7 +1179,7 @@ def attention_prefill_backward_triton_split_impl(
     )
     
     if DEBUG:
-        print("delta:", delta)
+        print("delta:", delta, delta.shape)
 
     # dropout mask tensor for debugging. We dump the dropout mask created in
     #   the kernel for testing

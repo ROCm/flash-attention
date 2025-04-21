@@ -126,10 +126,11 @@ def attention_backward_core_ref_impl(
         delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
     else:
         delta = torch.sum(p * dp, axis=-1).unsqueeze(-1)
+    if DEBUG:
+        print("delta:", delta, delta.shape)
     dscores_scaled = p * (dp - delta)
     ds = dscores_scaled * sm_scale
     if DEBUG_CORE:
-        print("delta:", delta, delta.shape)
         print("dscores_scaled:", dscores_scaled, dscores_scaled.shape)
         print("ds:", ds, ds.shape)
 
@@ -426,29 +427,6 @@ def attention_backward_pytorch_ref_impl(
     philox_offset: Optional[int],
     use_exp2: bool
 ):
-
-    if DEBUG:
-        print()
-        print("attention_backward_pytorch_ref_impl")
-        print("do:", do, do.shape)
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("o:", o, o.shape)
-        print("softmax_lse:", softmax_lse)
-        print("sm_scale:", sm_scale)
-        print("causal:", causal)
-        print("layout:", layout)
-        print("cu_seqlens_q:", cu_seqlens_q)
-        print("cu_seqlens_k:", cu_seqlens_k)
-        print("max_seqlen_q:", max_seqlen_q)
-        print("max_seqlen_k:", max_seqlen_k)
-        print("dropout_p:", dropout_p)
-        print("philox_seed:", philox_seed)
-        print("philox_offset:", philox_offset)
-        print("use_exp2:", use_exp2)
-
-
     if layout == "thd":
         dq_ref, dk_ref, dv_ref, delta = attention_varlen_backward_pytorch_ref_impl(
             do,
@@ -494,11 +472,4 @@ def attention_backward_pytorch_ref_impl(
     dk.copy_(dk_ref.to(dk.dtype))
     dq.copy_(dq_ref.to(dq.dtype))
 
-    if DEBUG:
-        print()
-        print("attention_backward_pytorch_ref_impl outputs")
-        print("delta:", delta, delta.shape)
-        print("dv:", dv, dv.shape)
-        print("dk:", dk, dk.shape)
-        print("dq:", dq, dq.shape)
     return delta
