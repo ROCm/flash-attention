@@ -159,6 +159,7 @@ def _bwd_dkdv_inner(
             qkT = (tl.dot(k, qT) * descale_q * descale_k)
         else:
             qkT = tl.dot(k, qT)
+        qkT_scaled =  qkT * sm_scale
 
         if USE_ALIBI:
             # relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
@@ -168,18 +169,18 @@ def _bwd_dkdv_inner(
             # relative_pos_block = offs_n[:, None] + seqlen_k - seqlen_q - offs_m[None, :]
             
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
-            qkT += alibi_block
+            qkT_scaled += alibi_block
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
                 print(f"qT: {qT.shape}\n", qT)
                 print(f"k: {k.shape}\n", k)
-                print(f"qkT scaled: {qkT.shape}\n", qkT * sm_scale)
+                print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
         # TODO: remove the scaling of m later when we removed re-scaling in fwd
         if USE_EXP2:
-            pT = tl.math.exp2(qkT * sm_scale * RCP_LN2 - m[None, :] * RCP_LN2)
+            pT = tl.math.exp2(qkT_scaled * RCP_LN2 - m[None, :] * RCP_LN2)
         else:
-            pT = tl.math.exp(qkT * sm_scale - m[None, :])
+            pT = tl.math.exp(qkT_scaled - m[None, :])
 
         # Autoregressive masking.
         if MASK:
@@ -538,17 +539,18 @@ def _bwd_dq_inner(
             qk = (tl.dot(q, kT) * descale_q * descale_k)
         else:
             qk = tl.dot(q, kT)
+        qk_scaled = qk * sm_scale
 
         if USE_ALIBI:
             relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
-            qk += alibi_block
+            qk_scaled += alibi_block
 
-        if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk * sm_scale)  # noqa: E701
+        if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk_scaled)  # noqa: E701
         if USE_EXP2:
-            p = tl.math.exp2(qk * sm_scale * RCP_LN2 - m * RCP_LN2)
+            p = tl.math.exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)
         else:
-            p = tl.math.exp(qk * sm_scale - m)
+            p = tl.math.exp(qk_scaled - m)
 
         # Autoregressive masking.
         if MASK:
