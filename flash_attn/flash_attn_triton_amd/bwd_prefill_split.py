@@ -162,7 +162,7 @@ def _bwd_dkdv_inner(
 
         if USE_ALIBI:
             # compute alibi block
-            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, curr_m + tl.arange(0, BLOCK_M), start_n + tl.arange(0, BLOCK_N), transpose=True)
+            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=True)
             qkT += alibi_block
 
         if DEBUG_TRITON_DETAIL:

@@ -49,7 +49,7 @@ def attention_backward_core_ref_impl(
             print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
         alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
         alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
-        if DEBUG_CORE:
+        if True:
             print("alibi_bias:", alibi_bias, alibi_bias.shape)
         attention_scaled_scores = attention_scaled_scores + alibi_bias
         if DEBUG_CORE:
@@ -122,7 +122,7 @@ def attention_backward_core_ref_impl(
             print("dp:", dp, dp.shape)
 
     # calculate ds
-    if False:
+    if True:
         delta = torch.sum(o * do, axis=-1).unsqueeze(-1)
     else:
         delta = torch.sum(p * dp, axis=-1).unsqueeze(-1)
@@ -238,7 +238,10 @@ def attention_varlen_backward_pytorch_ref_impl(
         do_i = do_i.permute(1, 0, 2)
         o_i = o_i.permute(1, 0, 2)
         softmax_lse_i = softmax_lse_i.transpose(0, 1)
-        alibi_slopes_i = alibi_slopes[i]
+        if alibi_slopes is not None:
+            alibi_slopes_i = alibi_slopes[i]
+        else:
+            alibi_slopes_i = None
 
         # Call the core backward function for this sequence
         dq_i, dk_i, dv_i, delta_i = attention_backward_core_ref_impl(

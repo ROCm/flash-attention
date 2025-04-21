@@ -295,7 +295,10 @@ def attention_varlen_forward_pytorch_ref_impl(
             k_i = k_i.reshape(nheads_k, seqlen_k, head_dim)
             v_i = v_i.reshape(nheads_k, seqlen_k, head_dim)
 
-        alibi_slopes_i = alibi_slopes[i]
+        if alibi_slopes is not None:
+            alibi_slopes_i = alibi_slopes[i]
+        else:
+            alibi_slopes_i = None
 
         # Call the core attention function for this sequence
         o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes_i, use_exp2)
