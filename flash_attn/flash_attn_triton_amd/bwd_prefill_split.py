@@ -3,7 +3,7 @@ import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
 from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, get_shapes_from_layout, \
-    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8, compute_alibi_block
+    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_fp8
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -161,8 +161,13 @@ def _bwd_dkdv_inner(
             qkT = tl.dot(k, qT)
 
         if USE_ALIBI:
-            # compute alibi block
-            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=True)
+            # relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
+            # relative_pos_block = offs_m[None, :] + seqlen_k - seqlen_q - offs_n[:, None]
+            # relative_pos_block = offs_m[None, :] + seqlen_q - seqlen_k - offs_n[:, None]
+            relative_pos_block = offs_n[:, None] + seqlen_q - seqlen_k - offs_m[None, :]
+            # relative_pos_block = offs_n[:, None] + seqlen_k - seqlen_q - offs_m[None, :]
+            
+            alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qkT += alibi_block
 
         if DEBUG_TRITON_DETAIL:
@@ -535,8 +540,8 @@ def _bwd_dq_inner(
             qk = tl.dot(q, kT)
 
         if USE_ALIBI:
-            # compute alibi block
-            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n)
+            relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
+            alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qk += alibi_block
 
         if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk * sm_scale)  # noqa: E701
