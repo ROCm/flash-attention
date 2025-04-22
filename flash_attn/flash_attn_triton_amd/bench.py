@@ -1124,6 +1124,52 @@ def check_environment_variables():
         if key in os.environ:
             raise ValueError(f"Running with {key} environment variable is not recommended for the benching script. Use --help to see how to use the benching script.")
 
+def compute_flops(batch, hq, hk, sq, sk, d_head, causal):
+    # 2 FLOPs per multiply‑add
+    if causal:
+        valid_pairs = ((sk * (sk + 1)) // 2 if sq > sk else
+                       sq * sk - (sq * (sq - 1)) // 2)
+    else:
+        valid_pairs = sq * sk
+    return 2 * batch * hq * valid_pairs * d_head  
+
+# see ref, https://github.com/ROCm/aiter/blob/jukorhon/mha-bwd/op_benchmarks/triton/bench_mha.py
+def _flops_single_row(row: pd.Series, mode: str) -> float:
+    b, hq, d_head = int(row["BATCH"]), int(row["HQ"]), int(row["D_HEAD"])
+    sq, sk        = int(row["N_CTX_Q"]), int(row["N_CTX_K"])
+    causal        = bool(row["CAUSAL"])
+
+    # -------- number of (query, key) products per head ----------------
+    if not causal:
+        valid_pairs = sq * sk
+    else:                      # triangular mask
+        if sq > sk:
+            valid_pairs = sk * (sk + 1) // 2 + (sq - sk) * sk
+        else:                  # sq <= sk
+            valid_pairs = sq * (sq + 1) // 2
+
+    # one matmul FLOPs (mul + add) = 2 · m · n · k
+    flops_per_matmul = 2.0 * b * hq * valid_pairs * d_head
+    total_flops      = 2.0 * flops_per_matmul    # 2 matmuls in forward
+
+    if mode == "fwd":
+        pass
+    elif mode == "bwd":
+        total_flops *= 2.5                       # 2·bwd + 0.5·recompute
+    elif mode == "full":
+        total_flops *= 3.5                       # fwd + bwd
+    else:
+        raise ValueError(f"unknown mode {mode}")
+
+    return total_flops
+
+def add_tflops_columns(df: pd.DataFrame, func_cfg: FunctionConfig) -> pd.DataFrame:
+    ms_col = func_cfg.column_name()
+    tf_col = ms_col.replace("_ms", "_tflops")
+    flops = df.apply(_flops_single_row, axis=1, mode=func_cfg.mode)
+    df[tf_col] = flops / df[ms_col] * 1e-9
+    return df
+
 def main():
     """
     Main function to run benchmarks.
@@ -1137,27 +1183,30 @@ def main():
     # process args to get function configs and input configs
     function_configs, all_input_configs = process_args()
     
-    # Check if we have multiple function configurations
-    has_multiple_func_configs = len(function_configs) > 1
-    combined_df = None
-
     # run benchmarks for each function configuration
+    combined_ms_df  = None
+    combined_tf_df  = None
+    input_cols = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "CAUSAL", "DROPOUT"]
     for func_config in function_configs:
         # run benchmark with the input configs for this function config
         input_configs = all_input_configs[func_config]
         df = run_benchmark(func_config, input_configs)
+        df = add_tflops_columns(df, func_config)
         
-        # Define the columns that represent input configurations
-        input_config_cols = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD", "CAUSAL", "DROPOUT"]
-        
-        # merge into one final dataframe
-        if combined_df is None:
-            combined_df = df
-        else:
-            # Ensure we're joining on input configuration columns
-            combined_df = combined_df.merge(df, on=input_config_cols, how="outer")
-    
+        # add to combined table
+        ms_cols = [c for c in df.columns if c.endswith('_ms')]
+        tf_cols = [c for c in df.columns if c.endswith('_tflops')]
 
+        ms_df = df[input_cols + ms_cols]
+        tf_df = df[input_cols + tf_cols]
+
+        if combined_ms_df is None:
+            combined_ms_df = ms_df
+            combined_tf_df = tf_df
+        else:
+            combined_ms_df = combined_ms_df.merge(ms_df, on=input_cols, how="outer")
+            combined_tf_df = combined_tf_df.merge(tf_df, on=input_cols, how="outer")
+    
     # print new line to seperate the combined data information from the benchmark specific information
     print()
 
@@ -1166,6 +1215,7 @@ def main():
     print(f"Total time for all benchmarks: {total_elapsed_time:.2f} seconds")
 
     # save combined data and make comparisons if we have multiple function configs
+    has_multiple_func_configs = False # len(function_configs) > 1
     if has_multiple_func_configs:
         if len(function_configs) == 2:
             func1 = function_configs[0]
@@ -1199,25 +1249,21 @@ def main():
                 # print explanation
                 print(f"Comparison Results (triton vs ck):")
                 print(f"Ratio values: values > 1 mean triton is faster (by that factor), values < 1 mean ck is faster")
-            elif False:
-                # For other comparisons, use the standard approach
-                ratio_col = f"{func1}_to_{func2}_ratio"
-                
-                # Calculate the ratio
-                combined_df[ratio_col] = combined_df[col2] / combined_df[col1]
-                
-                # print explanation
-                print(f"Comparison Results ({func1} vs {func2}):")
-                print(f"Ratio values: values > 1 mean {func1} is faster than {func2} (by that factor), values < 1 mean slower")
-       
-        print(f"Combined data:")
-        print(combined_df)
 
-        # save csv & markdown
-        combined_filename = f"benchmark_combined"
-        combined_df.to_csv(f"{combined_filename}.csv", index=False)
-        with open(f"{combined_filename}.md", 'w') as f:
-            f.write(combined_df.to_markdown(index=False, floatfmt=".2f"))
+    print("\nCombined wall‑time (ms) table:")
+    print(combined_ms_df)
+
+    print("\nCombined throughput (TFLOPs) table:")
+    print(combined_tf_df)
+
+    combined_ms_df.to_csv("benchmark_ms.csv",     index=False)
+    combined_tf_df.to_csv("benchmark_tflops.csv", index=False)
+
+    with open("benchmark_ms.md", 'w') as f:
+        f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
+
+    with open("benchmark_tflops.md", 'w') as f:
+        f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
 
 if __name__ == "__main__":
     main()
