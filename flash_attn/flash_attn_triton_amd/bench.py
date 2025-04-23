@@ -1016,9 +1016,9 @@ def get_input_config_set(config_type):
         # batch, hq, hk, sq, sk, d_head, causal, dropout
         input_configs = [
             # LLaMA 3 8B
-            (1, 32, 8, 8192, 8192, 128, True, 0.0),
+            (4, 32, 8, 8192, 8192, 128, True, 0.0),
             # LLaMA 3 70B
-            (1, 64, 8, 8192, 8192, 128, True, 0.0),
+            (4, 64, 8, 8192, 8192, 128, True, 0.0),
         ]
     else:
         raise ValueError(f"Unknown input config: {config_type}")

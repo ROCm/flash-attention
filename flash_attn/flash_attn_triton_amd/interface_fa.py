@@ -15,7 +15,7 @@ from typing import Literal, Optional, Union
 
 
 USE_EXP2 = True
-BWD_MODE = os.environ.get('BWD_MODE', 'fused').lower()
+BWD_MODE = os.environ.get('BWD_MODE', 'jingning').lower()
 
 def fwd(q: torch.Tensor,
         k: torch.Tensor,
