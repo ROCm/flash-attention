@@ -150,7 +150,7 @@ def fwd(q: torch.Tensor,
 
     return out, softmax_lse, sd_mask, rng_state
 
-BWD_MODE = os.environ.get('BWD_MODE', 'split').lower()
+BWD_MODE = os.environ.get('BWD_MODE', 'fused').lower()
 def bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
