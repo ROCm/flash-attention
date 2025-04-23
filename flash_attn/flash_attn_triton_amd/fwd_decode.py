@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 import triton.language as tl
@@ -575,19 +576,29 @@ def attention_decode_forward_triton_impl(
         cache_seqlens: Optional[Union[(int, torch.Tensor)]], 
         cache_batch_idx: Optional[torch.Tensor],
 ):
+    BLOCK_M = int(os.environ.get("AMD_TRITON_FWD_DECODE_BLOCK_M", 16))
+    BLOCK_N = int(os.environ.get("AMD_TRITON_FWD_DECODE_BLOCK_N", 64))
+    num_stages = int(os.environ.get("AMD_TRITON_FWD_DECODE_NUM_STAGES", 1))
+    num_warps_fwd = int(os.environ.get("AMD_TRITON_FWD_DECODE_NUM_WARPS_FWD", 1))
+    num_warps_reduce = int(os.environ.get("AMD_TRITON_FWD_DECODE_NUM_WARPS_REDUCE", 4))
+    SPLIT_K = os.environ.get("AMD_TRITON_FWD_DECODE_SPLIT_K", None)
+    SPLIT_K = int(SPLIT_K) if SPLIT_K is not None else SPLIT_K
+    NUM_QUANT_GROUPS = int(os.environ.get("AMD_TRITON_FWD_DECODE_NUM_QUANT_GROUPS", 1))
+
     # triton configs
-    BLOCK_M = 16
-    BLOCK_N = 64
-    num_stages = 1
-    num_warps_fwd = 1
-    num_warps_reduce = 4
+    # BLOCK_M = 16
+    # BLOCK_N = 64
+    # num_stages = 1
+    # num_warps_fwd = 1
+    # num_warps_reduce = 4
         
     # kernel_configs
     is_new_kv = True if k_new is not None and v_new is not None else False
     use_alibi = False if alibi_slopes is None else True
     use_cache_seqlens = cache_seqlens is not None
-    SPLIT_K = None
-    NUM_QUANT_GROUPS = 1
+    # SPLIT_K = None
+    # NUM_QUANT_GROUPS = 1
+    use_cache_batch_idx = cache_batch_idx is not None
 
     # get shapes and strides
     (batch_size, seqlen_q, nheads_q, dim_q), (stride_qz, stride_qh, stride_qm, stride_qd) = get_shape_and_strides_from_layout(q, layout)
@@ -739,7 +750,7 @@ def attention_decode_forward_triton_impl(
         ACTUAL_BLOCK_DMODEL=dim_kc,
         BOUNDS_CHECKS_N=(split_size % BLOCK_N) > 0 or use_cache_seqlens,
         USE_CACHE_SEQLENs=use_cache_seqlens,
-        USE_CACHE_BATCH_IDX=cache_batch_idx is not None,
+        USE_CACHE_BATCH_IDX=use_cache_batch_idx,
         NEW_KV=is_new_kv,
         IS_GQA=is_gqa,
         IS_CAUSAL=causal,
