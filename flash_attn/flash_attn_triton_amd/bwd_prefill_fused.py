@@ -2384,14 +2384,14 @@ def _flash_attn_backward(
     
     if fused: # fuses dk, dv, dq computations into one kernel by computing the dq using atomic adds between workgroups
         
-        BLOCK_N = 128
+        BLOCK_N = 128 if BLOCK_D_MODEL_POW2 < 160 else 64 # larger head sizes lead to oom
         config = {
             "BLOCK_M": 32,
             "BLOCK_N": BLOCK_N,
             "num_warps": 4,
             "num_stages": 1,
             "waves_per_eu": 1,
-            "BLK_SLICE_FACTOR": 1,
+            "BLK_SLICE_FACTOR": 2,
         }
         
         num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
