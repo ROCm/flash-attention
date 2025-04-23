@@ -1136,6 +1136,7 @@ def main():
 
     # process args to get function configs and input configs
     function_configs, all_input_configs = process_args()
+    function_configs = function_configs[:1]
     
     # Check if we have multiple function configurations
     has_multiple_func_configs = len(function_configs) > 1
