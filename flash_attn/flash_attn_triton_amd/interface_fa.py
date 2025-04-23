@@ -15,6 +15,7 @@ from typing import Literal, Optional, Union
 
 
 USE_EXP2 = True
+BWD_MODE = os.environ.get('BWD_MODE', 'fused').lower()
 
 def fwd(q: torch.Tensor,
         k: torch.Tensor,
@@ -150,7 +151,6 @@ def fwd(q: torch.Tensor,
 
     return out, softmax_lse, sd_mask, rng_state
 
-BWD_MODE = os.environ.get('BWD_MODE', 'fused').lower()
 def bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -597,44 +597,100 @@ def varlen_bwd(
             dropout_p,
             philox_seed,
             philox_offset,
-            False,
+            USE_EXP2,
         )
         delta = delta_ref
     else:
         if DEBUG:
             print("Using Triton implementation") 
-        delta_triton = attention_prefill_backward_triton_split_impl(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            softmax_scale,
-            alibi_slopes,
-            causal,
-            "thd",
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            False,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_o,
-            descale_do,
-            descale_dq,
-            descale_dk,
-            descale_dv,
-        )
-        delta = delta_triton
+        if BWD_MODE == "split":
+            delta_triton = attention_prefill_backward_triton_split_impl(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                softmax_scale,
+                alibi_slopes,
+                causal,
+                "thd",
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                USE_EXP2,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                descale_do,
+                descale_dq,
+                descale_dk,
+                descale_dv,
+            )
+            delta = delta_triton
+        elif BWD_MODE == "fused":
+            delta_triton = attention_prefill_backward_triton_fused_impl(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                softmax_scale,
+                alibi_slopes,
+                causal,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                True,
+            )
+            delta = delta_triton
+        elif BWD_MODE == "jingning":
+            delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                softmax_scale,
+                alibi_slopes,
+                causal,
+                "thd",
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                USE_EXP2
+            )
+            delta = delta_triton
+        else:
+            raise ValueError(f"Unknown bwd mode {BWD_MODE}")
 
     if DEBUG:
         print("varlen_bwd outputs")
