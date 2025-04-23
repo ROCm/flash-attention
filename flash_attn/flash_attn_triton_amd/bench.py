@@ -873,7 +873,7 @@ def load_flash_attn_module(backend: Literal["triton", "ck"], env_configs: Dict =
         os.environ["FLASH_ATTENTION_TRITON_AMD_ENABLE"] = "TRUE"
         os.environ["FLASH_ATTENTION_TRITON_AMD_DEBUG"] = "0"
         os.environ["FLASH_ATTENTION_TRITON_AMD_AUTOTUNE"] = "0"
-        os.environ["TRITON_PRINT_AUTOTUNING "] = "0"
+        os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
     elif backend == "ck":
         os.environ["FLASH_ATTENTION_TRITON_AMD_ENABLE"] = "FALSE"
     else:
