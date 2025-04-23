@@ -1025,6 +1025,21 @@ def get_input_config_set(config_type):
     
     return input_configs
 
+def filter_backends(requested_backends, supported_backends, fn_name):
+    if requested_backends:
+        selected = []
+        for be in requested_backends:
+            if be in supported_backends:
+                selected.append(be)
+            else:
+                warning(
+                    f"backend '{be}' requested but not supported by "
+                    f"function '{fn_name}'. skipping this back-end."
+                )
+        return selected
+    else:
+        return supported_backends
+
 
 def process_args():
     """
@@ -1052,6 +1067,14 @@ def process_args():
         default=None,
         help=f"Benchmarking mode(s) to run. If omitted, runs all supported modes for each function.",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        nargs='*',
+        choices=["triton", "ck"],
+        default=None,
+        help="Back-end(s) to run (triton, ck). Omit to run every back-end that is both available and supported by the function.",
+    )
     # config
     parser.add_argument("-b", type=int, default=None, help="Batch size")
     parser.add_argument("-hq", type=int, default=None, help="Q Number of heads")
@@ -1067,7 +1090,8 @@ def process_args():
 
     # parse function args
     benchmark_fns = args.benchmark_fn
-    requested_modes = args.mode 
+    requested_modes = args.mode
+    requested_backends = args.backend
 
     # fenerate function configurations and input configurations separately
     all_function_configs = []
@@ -1101,9 +1125,17 @@ def process_args():
         if not modes_to_run:
             warning(f"No valid modes to run for function '{fn_name}' based on request and function support. Skipping this function.")
             continue
+
+        # filter by backend
+        backends_to_run = filter_backends(requested_backends,
+                                  supported_backends,
+                                  fn_name)
+        if not backends_to_run:
+            warning(f"no valid back-ends left for '{fn_name}'. skipping.")
+            continue
         
         # create a function config for each backend and dtype combination
-        for backend in supported_backends:
+        for backend in backends_to_run:
             for dtype in supported_dtypes:
                 for mode in modes_to_run:
                     for env_config in supported_env_configs[backend]:
@@ -1244,26 +1276,25 @@ def main():
                     ratio_col = f"ck_to_triton_ratio"
                     
                 # Calculate ratio: ck_time / triton_time (values > 1 mean triton is faster)
-                combined_df[ratio_col] = combined_df[ck_col] / combined_df[triton_col]
+                combined_ms_df[ratio_col] = combined_ms_df[ck_col] / combined_ms_df[triton_col]
                 
                 # print explanation
                 print(f"Comparison Results (triton vs ck):")
                 print(f"Ratio values: values > 1 mean triton is faster (by that factor), values < 1 mean ck is faster")
 
-    print("\nCombined wall‑time (ms) table:")
-    print(combined_ms_df)
+    if combined_ms_df is not None:
+        print("\nCombined wall‑time (ms) table:")
+        print(combined_ms_df)
+        combined_ms_df.to_csv("benchmark_ms.csv", index=False)
+        with open("benchmark_ms.md", 'w') as f:
+            f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
 
-    print("\nCombined throughput (TFLOPs) table:")
-    print(combined_tf_df)
-
-    combined_ms_df.to_csv("benchmark_ms.csv",     index=False)
-    combined_tf_df.to_csv("benchmark_tflops.csv", index=False)
-
-    with open("benchmark_ms.md", 'w') as f:
-        f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
-
-    with open("benchmark_tflops.md", 'w') as f:
-        f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
+    if combined_tf_df is not None:
+        print("\nCombined throughput (TFLOPs) table:")
+        print(combined_tf_df)
+        combined_tf_df.to_csv("benchmark_tflops.csv", index=False)
+        with open("benchmark_tflops.md", 'w') as f:
+            f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
 
 if __name__ == "__main__":
     main()
