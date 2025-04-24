@@ -250,16 +250,12 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
              MAX_SEQLENS_K: tl.constexpr, IS_VARLEN: tl.constexpr, IS_INFERENCE: tl.constexpr,  IS_CAUSAL: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
              ENABLE_DROPOUT: tl.constexpr, RETURN_SCORES: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr, 
-             IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr):
+             IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr, USE_XCD: tl.constexpr):
     # set params
     ACCUMULATOR_TYPE = tl.float32
 
     # compute offsets
-    if False:
-        start_m = tl.program_id(0)
-        off_h_q = tl.program_id(1)
-        off_z = tl.program_id(2)
-    else:
+    if USE_XCD:
         NUM_XCDS: tl.constexpr = 8
         start_m = tl.program_id(2)
         off_h_q = tl.program_id(1)
@@ -272,6 +268,10 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         xcd_group = off_h_q % NUM_XCDS
         pid_in_xcd = off_h_q // NUM_XCDS
         off_h_q = xcd_group * pids_per_xcd + pid_in_xcd
+    else:
+        start_m = tl.program_id(0)
+        off_h_q = tl.program_id(1)
+        off_z = tl.program_id(2)
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -613,11 +613,11 @@ def attention_prefill_forward_triton_impl(
     # kernel is padded - there is no padding in memory for any dims.
     padded_d_model = max(padded_d_model, 16)
 
-    if False:
-        grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
-    else:
+    USE_XCD = True
+    if USE_XCD:
         grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
-    
+    else:
+        grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
 
     # sd_mask is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
@@ -662,6 +662,6 @@ def attention_prefill_forward_triton_impl(
                     MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=is_varlen, IS_INFERENCE=is_inference,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
                     USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p
-                    > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT)
+                    > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, USE_XCD=USE_XCD)
 
     return softmax_lse, sd_mask if return_softmax else None 
