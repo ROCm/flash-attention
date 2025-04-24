@@ -256,18 +256,18 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
 
     # compute offsets
     if USE_XCD:
-        NUM_XCDS: tl.constexpr = 8
-        start_m = tl.program_id(2)
-        off_h_q = tl.program_id(1)
+        #NUM_XCDS: tl.constexpr = 8
         off_z = tl.program_id(0)
+        off_h_q = tl.program_id(1)
+        start_m = tl.program_id(2)
 
-        start_m = (tl.cdiv(MAX_SEQLENS_Q, BLOCK_M) - 1) - start_m
+        #start_m = (tl.cdiv(MAX_SEQLENS_Q, BLOCK_M) - 1) - start_m
 
         # Remap heads to the same XCD
-        pids_per_xcd = HQ // NUM_XCDS
-        xcd_group = off_h_q % NUM_XCDS
-        pid_in_xcd = off_h_q // NUM_XCDS
-        off_h_q = xcd_group * pids_per_xcd + pid_in_xcd
+        #pids_per_xcd = HQ // NUM_XCDS
+        #xcd_group = off_h_q % NUM_XCDS
+        #pid_in_xcd = off_h_q // NUM_XCDS
+        #off_h_q = xcd_group * pids_per_xcd + pid_in_xcd
     else:
         start_m = tl.program_id(0)
         off_h_q = tl.program_id(1)
@@ -323,7 +323,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
             o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
             acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=Out.type.element_ty)
-            o_ptrs_mask = offs_m[:, None] < seqlen_q
+            o_ptrs_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
             # We still need to write 0s to the result
             tl.store(o_ptrs, acc, mask=o_ptrs_mask)
             # The tensor allocated for L is based on MAX_SEQLENS_Q as that is
