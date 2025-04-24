@@ -215,7 +215,7 @@ def get_autotune_configs():
     else:
         return [
             triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 128, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1, "PRE_LOAD_V": False},
                 num_stages=1,
                 num_warps=4,
             ),
@@ -251,24 +251,27 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
              BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
              ENABLE_DROPOUT: tl.constexpr, RETURN_SCORES: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr, 
              IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr, FP8_OUTPUT: tl.constexpr):
-
-    NUM_XCDS: tl.constexpr = 8
-
     # set params
     ACCUMULATOR_TYPE = tl.float32
 
     # compute offsets
-    start_m = tl.program_id(2)
-    off_h_q = tl.program_id(1)
-    off_z = tl.program_id(0)
+    if False:
+        start_m = tl.program_id(0)
+        off_h_q = tl.program_id(1)
+        off_z = tl.program_id(2)
+    else:
+        NUM_XCDS: tl.constexpr = 8
+        start_m = tl.program_id(2)
+        off_h_q = tl.program_id(1)
+        off_z = tl.program_id(0)
 
-    start_m = (tl.cdiv(MAX_SEQLENS_Q, BLOCK_M) - 1) - start_m
+        start_m = (tl.cdiv(MAX_SEQLENS_Q, BLOCK_M) - 1) - start_m
 
-    # Remap heads to the same XCD
-    pids_per_xcd = HQ // NUM_XCDS
-    xcd_group = off_h_q % NUM_XCDS
-    pid_in_xcd = off_h_q // NUM_XCDS
-    off_h_q = xcd_group * pids_per_xcd + pid_in_xcd
+        # Remap heads to the same XCD
+        pids_per_xcd = HQ // NUM_XCDS
+        xcd_group = off_h_q % NUM_XCDS
+        pid_in_xcd = off_h_q // NUM_XCDS
+        off_h_q = xcd_group * pids_per_xcd + pid_in_xcd
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -610,7 +613,11 @@ def attention_prefill_forward_triton_impl(
     # kernel is padded - there is no padding in memory for any dims.
     padded_d_model = max(padded_d_model, 16)
 
-    grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
+    if False:
+        grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
+    else:
+        grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
+    
 
     # sd_mask is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
