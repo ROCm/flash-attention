@@ -565,7 +565,7 @@ def get_dropout_fraction(
     return dropped.sum() / valid.sum()
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [False])
@@ -714,7 +714,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [True])
@@ -864,7 +864,7 @@ def test_flash_attn_varlen_qkvpacked(
 
 @pytest.mark.parametrize("kvpacked", [False])
 # @pytest.mark.parametrize("kvpacked", [False])
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
@@ -1139,7 +1139,7 @@ def test_flash_attn_output(
 
 @pytest.mark.parametrize("kvpacked", [False])
 # @pytest.mark.parametrize('kvpacked', [False])
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize('mha_type', ["mqa"])
@@ -1459,7 +1459,7 @@ def test_flash_attn_varlen_output(
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [True])
@@ -1572,7 +1572,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item() + 1e-5
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [True])
@@ -1741,7 +1741,7 @@ def test_flash_attn_varlen_causal(
         assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item() + 1e-5
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [True])
@@ -2310,7 +2310,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     ).abs().max().item() + 1e-3
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [False])
@@ -2400,7 +2400,7 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     assert not v.grad.isnan().any()
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [True])
@@ -2459,7 +2459,7 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
         assert torch.equal(dq, dq0)
 
 
-@pytest.mark.parametrize("dtype", ([torch.float16]))
+@pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [True])
