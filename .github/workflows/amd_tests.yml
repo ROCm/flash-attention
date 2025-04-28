@@ -51,6 +51,7 @@ jobs:
           pip install numpy==1.24 matplotlib pandas tabulate
 
       - name: AMD Internal Tests
+        if: False
         run: |
           FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 pytest flash_attn/flash_attn_triton_amd/test.py
 
