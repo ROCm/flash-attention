@@ -108,7 +108,7 @@ def get_autotune_configs():
 def _bwd_preprocess(
     O, DO,  # noqa: E741
     Delta,
-    stride_ob, stride_oh, stride_om, stride_ok,
+    stride_ob, stride_oh, stride_om, stride_od,
     stride_deltab, stride_deltah, stride_deltam,
     stride_descale_do_z,
     cu_seqlens_q, max_seqlen_q,
@@ -135,7 +135,7 @@ def _bwd_preprocess(
 
     # Compute offsets
     offs_m = pid_m * PRE_BLOCK + tl.arange(0, PRE_BLOCK)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_d = tl.arange(0, HEAD_DIM)
     # Offset O/DO by batch, head and q_start
     O += bid * stride_ob + hid * stride_oh + q_start * stride_om  # noqa: E741
     DO += bid * stride_ob + hid * stride_oh + q_start * stride_om
@@ -144,9 +144,9 @@ def _bwd_preprocess(
     mask_md = mask_m[:, None]
     PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
     if PADDED_HEAD:
-        mask_md &= offs_k[None, :] < ACTUAL_HEAD_DIM
+        mask_md &= offs_d[None, :] < ACTUAL_HEAD_DIM
     # compute pointers
-    offs_do = offs_m[:, None] * stride_om + offs_k[None, :] * stride_ok
+    offs_do = offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     out_ptrs = O + offs_do
     do_ptrs = DO + offs_do
     # load
@@ -434,13 +434,14 @@ def _bwd_dq_inner(
 def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
     Q, K, V, sm_scale, DO, DQ, DK, DV,
     M, Delta,
-    stride_qb, stride_qh, stride_qm, stride_qk,
-    stride_kb, stride_kh, stride_kn, stride_kk,
-    stride_vb, stride_vh, stride_vn, stride_vk,
-    stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-    stride_dkb, stride_dkh, stride_dkn, stride_dkk,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
     stride_deltab, stride_deltah, stride_deltam,
-    stride_dob, stride_doh, stride_dom, stride_dok,
+    stride_dob, stride_doh, stride_dom, stride_dod,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
@@ -481,7 +482,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON: print(f"delta_qk = {delta_qk}")  # noqa: E701
     PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_d = tl.arange(0, HEAD_DIM)
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     # align the delta_qk
@@ -511,15 +512,17 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
         # Mask for loading K and V
         mask_kv = offs_n[:, None] < seqlen_k
         if PADDED_HEAD:
-            mask_k = offs_k < ACTUAL_HEAD_DIM
+            mask_k = offs_d < ACTUAL_HEAD_DIM
             mask_kv &= mask_k[None, :]
-        offs_kv = offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
+        offs_k = offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        offs_v = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
 
         # K/V tensors not changed for the group
-        adj_kv = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = tl.load(K + adj_kv + offs_kv, mask=mask_kv, other=0.0)
-        v = tl.load(V + adj_kv + offs_kv, mask=mask_kv, other=0.0)
+        k = tl.load(K + adj_k + offs_k, mask=mask_kv, other=0.0)
+        v = tl.load(V + adj_v + offs_v, mask=mask_kv, other=0.0)
         # If MQA / GQA, set the K and V head offsets appropriately.
         # hqid = hkid
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
@@ -570,8 +573,8 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             dk, dv = _bwd_dkdv_inner(
                 dk, dv,  # output tensors
                 Q_ptr, k, v, DO_ptr, M_ptr, Delta_ptr, sm_scale, # input tensors
-                stride_qm, stride_qk,  # strides for q
-                stride_dom, stride_dok,  # strides for o
+                stride_qm, stride_qd,  # strides for q
+                stride_dom, stride_dod,  # strides for o
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
                 stride_deltam,
                 MASK_BLOCK_M1, BLOCK_N1,  # block dim
@@ -598,8 +601,8 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             dk, dv = _bwd_dkdv_inner(
                 dk, dv,  # output tensors
                 Q_ptr, k, v, DO_ptr, M_ptr, Delta_ptr, sm_scale, # input tensors
-                stride_qm, stride_qk,  # strides for q
-                stride_dom, stride_dok,  # strides for o
+                stride_qm, stride_qd,  # strides for q
+                stride_dom, stride_dod,  # strides for o
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
                 stride_deltam,
                 BLOCK_M1, BLOCK_N1,  # block dim
@@ -617,12 +620,15 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
         # end of GQA/MQA of dkdv
-        # Write back dV and dK.
-        adj_dkdv = bid * stride_dkb + hkid * stride_kh + k_start * stride_dkn
-        offs_dkdv = offs_n[:, None] * stride_dkn + offs_k[None, :] * stride_dkk
-        tl.store(DV + adj_dkdv + offs_dkdv, dv, mask=mask_kv)
+        # Write back dV
+        adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
+        offs_dv = offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd
+        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
+        # write back dk
+        adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
         dk *= sm_scale
-        tl.store(DK + adj_dkdv + offs_dkdv, dk, mask=mask_kv)
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
 
     # This part does dq
     start_m = pid * BLOCK_M2
@@ -637,13 +643,15 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
         # Mask for loading K and V
         mask_q = offs_m[:, None] < seqlen_q
         if PADDED_HEAD:
-            mask_k = offs_k < ACTUAL_HEAD_DIM
+            mask_k = offs_d < ACTUAL_HEAD_DIM
             mask_q &= mask_k[None, :]
-        offs_q = offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
-        offs_do = offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok
-        adj_kv = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
-        K +=  adj_kv
-        V +=  adj_kv
+        offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
+        # NOTE: don't assume that the strides for k and v are the same!
+        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn
+        K +=  adj_k
+        V +=  adj_v
         # If MQA / GQA, set the K and V head offsets appropriately.
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
             # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
@@ -684,7 +692,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             dq = _bwd_dq_inner(
                 dq,
                 q, K, V, do, m, Delta_ptr, sm_scale, #
-                stride_qm, stride_qk, stride_kn, stride_kk, stride_vn, stride_vk,
+                stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
                 stride_dropoutm, stride_dropoutn,  #
                 stride_deltam,
                 seqlen_q, seqlen_k,  #
@@ -708,7 +716,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             dq = _bwd_dq_inner(
                 dq,  #
                 q, K, V, do, m, Delta_ptr, sm_scale, #
-                stride_qm, stride_qk, stride_kn, stride_kk, stride_vn, stride_vk, #
+                stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd, #
                 stride_dropoutm, stride_dropoutn,  #
                 stride_deltam,
                 seqlen_q, seqlen_k,  #
@@ -727,7 +735,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
-            offs_dq = offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk
+            offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
             # end of GQA/MQA of dq
@@ -741,13 +749,14 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
 def bwd_kernel_noncausal(
     Q, K, V, sm_scale, DO, DQ, DK, DV,
     M, Delta,
-    stride_qb, stride_qh, stride_qm, stride_qk,
-    stride_kb, stride_kh, stride_kn, stride_kk,
-    stride_vb, stride_vh, stride_vn, stride_vk,
-    stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-    stride_dkb, stride_dkh, stride_dkn, stride_dkk,
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
     stride_deltab, stride_deltah, stride_deltam,
-    stride_dob, stride_doh, stride_dom, stride_dok,
+    stride_dob, stride_doh, stride_dom, stride_dod,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
     HQ, HK,
     cu_seqlens_q, cu_seqlens_k,
@@ -786,7 +795,7 @@ def bwd_kernel_noncausal(
         seqlen_k = k_end - k_start
 
     PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_d = tl.arange(0, HEAD_DIM)
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     start_n = pid * BLOCK_N1
@@ -798,15 +807,18 @@ def bwd_kernel_noncausal(
         # Mask for loading K and V
         mask_kv = offs_n[:, None] < seqlen_k
         if PADDED_HEAD:
-            mask_k = offs_k < ACTUAL_HEAD_DIM
+            mask_k = offs_d < ACTUAL_HEAD_DIM
             mask_kv &= mask_k[None, :]
-        offs_kv = offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk
+        # NOTE: don't assume that the strides for k and v are the same!
+        offs_k = offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        offs_v = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
 
         # K/V tensors not changed for the group
-        adj_kv = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = tl.load(K + adj_kv + offs_kv, mask=mask_kv, other=0.0)
-        v = tl.load(V + adj_kv + offs_kv, mask=mask_kv, other=0.0)
+        k = tl.load(K + adj_k + offs_k, mask=mask_kv, other=0.0)
+        v = tl.load(V + adj_v + offs_v, mask=mask_kv, other=0.0)
         # If MQA / GQA, set the K and V head offsets appropriately.
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
             # offset input and output tensor by batch and Q/K heads
@@ -834,8 +846,8 @@ def bwd_kernel_noncausal(
             dk, dv = _bwd_dkdv_inner(
                 dk, dv,  # output tensors
                 Q_ptr, k, v, DO_ptr, M_ptr, Delta_ptr, sm_scale, # input tensors
-                stride_qm, stride_qk,  # strides for q
-                stride_dom, stride_dok,  # strides for o
+                stride_qm, stride_qd,  # strides for q
+                stride_dom, stride_dod,  # strides for o
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
                 stride_deltam,
                 BLOCK_M1, BLOCK_N1,  # block dim
@@ -853,12 +865,15 @@ def bwd_kernel_noncausal(
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
 
-        # Write back dV and dK.
-        adj_dkdv = bid * stride_dkb + hkid * stride_kh + k_start * stride_dkn
-        offs_dkdv = offs_n[:, None] * stride_dkn + offs_k[None, :] * stride_dkk
-        tl.store(DV + adj_dkdv + offs_dkdv, dv, mask=mask_kv)
+        # Write back dV
+        adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
+        offs_dv = offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd
+        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
+        # write back dk
+        adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
         dk *= sm_scale
-        tl.store(DK + adj_dkdv + offs_dkdv, dk, mask=mask_kv)
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
 
     # THIS PART DOES DQ
     start_m = pid * BLOCK_M2
@@ -867,13 +882,14 @@ def bwd_kernel_noncausal(
         # Mask for loading K and V
         mask_q = offs_m[:, None] < seqlen_q
         if PADDED_HEAD:
-            mask_k = offs_k < ACTUAL_HEAD_DIM
+            mask_k = offs_d < ACTUAL_HEAD_DIM
             mask_q &= mask_k[None, :]
-        offs_q = offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
-        offs_do = offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok
-        adj_kv = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
-        K +=  adj_kv
-        V +=  adj_kv
+        offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
+        adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn
+        K +=  adj_k
+        V +=  adj_v
         # If MQA / GQA, set the K and V head offsets appropriately.
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
             # offset input and output tensor by batch and Q/K heads
@@ -909,7 +925,7 @@ def bwd_kernel_noncausal(
             dq = _bwd_dq_inner(
                 dq,  #
                 q, K, V, do, m, Delta_ptr, sm_scale, #
-                stride_qm, stride_qk, stride_kn, stride_kk, stride_vn, stride_vk, #
+                stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd, #
                 stride_dropoutm, stride_dropoutn,  #
                 stride_deltam,
                 seqlen_q, seqlen_k,  #
@@ -928,10 +944,16 @@ def bwd_kernel_noncausal(
             )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
-            offs_dq = offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk
+            offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
+def is_contiguous(x, name):
+    if x.is_contiguous():
+        return x
+    else:
+        print(f"{name} is not contiguous")
+        return x.contiguous() 
 
 def attention_prefill_backward_triton_split_oneKernel_impl(
     do: torch.Tensor,
@@ -960,6 +982,16 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     DEBUG_TRITON: bool = False
     DEBUG_TRITON_DETAIL: bool = False
 
+    # do = is_contiguous(do, "do")
+    # q = is_contiguous(q, "q")
+    # k = is_contiguous(k, "k")
+    # v = is_contiguous(v, "v")
+    # o = is_contiguous(o, "o")
+    # softmax_lse = is_contiguous(softmax_lse, "softmax_lse")
+    # dq = is_contiguous(dq, "dq")
+    # dk = is_contiguous(dk, "dk")
+    # dv = is_contiguous(dv, "dv")
+
     # get strides and shape
     batch, nheads_q, nheads_k, head_size, max_seqlen_q_final, max_seqlen_k_final = \
         get_shapes_from_layout(
@@ -969,15 +1001,16 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
         )
     q_strides, k_strides, v_strides, o_strides = \
         get_strides_from_layout(q, k, v, o, layout)
-    stride_qb, stride_qh, stride_qm, stride_qk =  q_strides
-    stride_kb, stride_kh, stride_kn, stride_kk = k_strides
-    stride_vb, stride_vh, stride_vn, stride_vk = v_strides
-    stride_ob, stride_oh, stride_om, stride_ok = o_strides
-    dq_strides, dk_strides, _, do_strides = \
+    stride_qb, stride_qh, stride_qm, stride_qd =  q_strides
+    stride_kb, stride_kh, stride_kn, stride_kd = k_strides
+    stride_vb, stride_vh, stride_vn, stride_vd = v_strides
+    stride_ob, stride_oh, stride_om, stride_od = o_strides
+    dq_strides, dk_strides, dv_strides, do_strides = \
         get_strides_from_layout(dq, dk, dv, do, layout)
-    stride_dqb, stride_dqh, stride_dqm, stride_dqk =  dq_strides
-    stride_dkb, stride_dkh, stride_dkn, stride_dkk = dk_strides
-    stride_dob, stride_doh, stride_dom, stride_dok = do_strides
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd =  dq_strides
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk_strides
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv_strides
+    stride_dob, stride_doh, stride_dom, stride_dod = do_strides
     IS_VARLEN = layout == "thd"
     use_dropout = (dropout_p > 0.0)
 
@@ -998,7 +1031,7 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     _bwd_preprocess[pre_grid](
         o, do,
         delta,
-        stride_ob, stride_oh, stride_om, stride_ok,
+        stride_ob, stride_oh, stride_om, stride_od,
         stride_deltab, stride_deltah, stride_deltam,
         0,
         cu_seqlens_q, max_seqlen_q_final,
@@ -1043,13 +1076,14 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
         bwd_kernel_causal[grid](
             q, k, v, sm_scale, do, dq, dk, dv,
             softmax_lse, delta,
-            stride_qb, stride_qh, stride_qm, stride_qk,
-            stride_kb, stride_kh, stride_kn, stride_kk,
-            stride_vb, stride_vh, stride_vn, stride_vk,
-            stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-            stride_dkb, stride_dkh, stride_dkn, stride_dkk,
+            stride_qb, stride_qh, stride_qm, stride_qd,
+            stride_kb, stride_kh, stride_kn, stride_kd,
+            stride_vb, stride_vh, stride_vn, stride_vd,
+            stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+            stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+            stride_dvb, stride_dvh, stride_dvn, stride_dvd,
             stride_deltab, stride_deltah, stride_deltam,
-            stride_dob, stride_doh, stride_dom, stride_dok,
+            stride_dob, stride_doh, stride_dom, stride_dod,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
@@ -1067,13 +1101,14 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
         bwd_kernel_noncausal[grid](
             q, k, v, sm_scale, do, dq, dk, dv,
             softmax_lse, delta,
-            stride_qb, stride_qh, stride_qm, stride_qk,
-            stride_kb, stride_kh, stride_kn, stride_kk,
-            stride_vb, stride_vh, stride_vn, stride_vk,
-            stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-            stride_dkb, stride_dkh, stride_dkn, stride_dkk,
+            stride_qb, stride_qh, stride_qm, stride_qd,
+            stride_kb, stride_kh, stride_kn, stride_kd,
+            stride_vb, stride_vh, stride_vn, stride_vd,
+            stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+            stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+            stride_dvb, stride_dvh, stride_dvn, stride_dvd,
             stride_deltab, stride_deltah, stride_deltam,
-            stride_dob, stride_doh, stride_dom, stride_dok,
+            stride_dob, stride_doh, stride_dom, stride_dod,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
