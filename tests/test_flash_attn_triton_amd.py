@@ -919,13 +919,21 @@ def test_flash_attn_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 2
-    nheads = 16 if softcap == 0.0 else 4  # softcap reference impl takes more memory
+    SBHD_STRIDE=True
+    if SBHD_STRIDE:
+        batch_size = 2
+        nheads = 16 if softcap == 0.0 else 4  # softcap reference impl takes more memory
+    else:
+        batch_size = 4
+        nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    q = torch.randn(seqlen_q, batch_size, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    q = torch.transpose(q, 0, 1)
+    if SBHD_STRIDE:
+        q = torch.randn(seqlen_q, batch_size, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        q = torch.transpose(q, 0, 1)
+    else:
+        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
         # Ensure the values of qk are at least within softcap range.
         q = q * softcap
@@ -934,13 +942,22 @@ def test_flash_attn_output(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
         )
     else:
-        kv = torch.randn(
-            seqlen_k, batch_size, nheads_k, 2, d, device=device, dtype=dtype, requires_grad=True
-        )
-        k = kv[:,:,:,0,:]
-        v = kv[:,:,:,1,:]
-        k = torch.transpose(k, 0, 1)
-        v = torch.transpose(v, 0, 1)
+        if SBHD_STRIDE:
+            kv = torch.randn(
+                seqlen_k, batch_size, nheads_k, 2, d, device=device, dtype=dtype, requires_grad=True
+            )
+            k = kv[:,:,:,0,:]
+            v = kv[:,:,:,1,:]
+            k = torch.transpose(k, 0, 1)
+            v = torch.transpose(v, 0, 1)
+        else:
+            k = torch.randn(
+            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
+            )
+            v = torch.randn(
+                batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
+            )
+
         print()
         print("q.size(): ", q.size(), ", q.stride(): ", q.stride())
         print("k.size(): ", k.size(), ", k.stride(): ", k.stride())
