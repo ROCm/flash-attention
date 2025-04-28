@@ -514,14 +514,14 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
         if PADDED_HEAD:
             mask_k = offs_d < ACTUAL_HEAD_DIM
             mask_kv &= mask_k[None, :]
-        offs_kv = offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        offs_k = offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
         offs_v = offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
 
         # K/V tensors not changed for the group
         adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
         adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = tl.load(K + adj_k + offs_d, mask=mask_kv, other=0.0)
+        k = tl.load(K + adj_k + offs_k, mask=mask_kv, other=0.0)
         v = tl.load(V + adj_v + offs_v, mask=mask_kv, other=0.0)
         # If MQA / GQA, set the K and V head offsets appropriately.
         # hqid = hkid
@@ -626,9 +626,9 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
         tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
         # write back dk
         adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
-        offs_dv = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
         dk *= sm_scale
-        tl.store(DK + adj_dk + offs_dv, dk, mask=mask_kv)
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
 
     # This part does dq
     start_m = pid * BLOCK_M2
@@ -871,9 +871,9 @@ def bwd_kernel_noncausal(
         tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
         # write back dk
         adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
-        offs_dv = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
         dk *= sm_scale
-        tl.store(DK + adj_dk + offs_dv, dk, mask=mask_kv)
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
 
     # THIS PART DOES DQ
     start_m = pid * BLOCK_M2
@@ -1001,16 +1001,16 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
         )
     q_strides, k_strides, v_strides, o_strides = \
         get_strides_from_layout(q, k, v, o, layout)
-    stride_qb, stride_qh, stride_qm, stride_qk =  q_strides
-    stride_kb, stride_kh, stride_kn, stride_kk = k_strides
-    stride_vb, stride_vh, stride_vn, stride_vk = v_strides
-    stride_ob, stride_oh, stride_om, stride_ok = o_strides
+    stride_qb, stride_qh, stride_qm, stride_qd =  q_strides
+    stride_kb, stride_kh, stride_kn, stride_kd = k_strides
+    stride_vb, stride_vh, stride_vn, stride_vd = v_strides
+    stride_ob, stride_oh, stride_om, stride_od = o_strides
     dq_strides, dk_strides, dv_strides, do_strides = \
         get_strides_from_layout(dq, dk, dv, do, layout)
-    stride_dqb, stride_dqh, stride_dqm, stride_dqk =  dq_strides
-    stride_dkb, stride_dkh, stride_dkn, stride_dkk = dk_strides
-    stride_dvb, stride_dvh, stride_dvn, stride_dvk = dv_strides
-    stride_dob, stride_doh, stride_dom, stride_dok = do_strides
+    stride_dqb, stride_dqh, stride_dqm, stride_dqd =  dq_strides
+    stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk_strides
+    stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv_strides
+    stride_dob, stride_doh, stride_dom, stride_dod = do_strides
     IS_VARLEN = layout == "thd"
     use_dropout = (dropout_p > 0.0)
 
@@ -1031,7 +1031,7 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     _bwd_preprocess[pre_grid](
         o, do,
         delta,
-        stride_ob, stride_oh, stride_om, stride_ok,
+        stride_ob, stride_oh, stride_om, stride_od,
         stride_deltab, stride_deltah, stride_deltam,
         0,
         cu_seqlens_q, max_seqlen_q_final,
@@ -1076,14 +1076,14 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
         bwd_kernel_causal[grid](
             q, k, v, sm_scale, do, dq, dk, dv,
             softmax_lse, delta,
-            stride_qb, stride_qh, stride_qm, stride_qk,
-            stride_kb, stride_kh, stride_kn, stride_kk,
-            stride_vb, stride_vh, stride_vn, stride_vk,
-            stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-            stride_dkb, stride_dkh, stride_dkn, stride_dkk,
-            stride_dvb, stride_dvh, stride_dvn, stride_dvk,
+            stride_qb, stride_qh, stride_qm, stride_qd,
+            stride_kb, stride_kh, stride_kn, stride_kd,
+            stride_vb, stride_vh, stride_vn, stride_vd,
+            stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+            stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+            stride_dvb, stride_dvh, stride_dvn, stride_dvd,
             stride_deltab, stride_deltah, stride_deltam,
-            stride_dob, stride_doh, stride_dom, stride_dok,
+            stride_dob, stride_doh, stride_dom, stride_dod,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
@@ -1101,14 +1101,14 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
         bwd_kernel_noncausal[grid](
             q, k, v, sm_scale, do, dq, dk, dv,
             softmax_lse, delta,
-            stride_qb, stride_qh, stride_qm, stride_qk,
-            stride_kb, stride_kh, stride_kn, stride_kk,
-            stride_vb, stride_vh, stride_vn, stride_vk,
-            stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-            stride_dkb, stride_dkh, stride_dkn, stride_dkk,
-            stride_dvb, stride_dvh, stride_dvn, stride_dvk,
+            stride_qb, stride_qh, stride_qm, stride_qd,
+            stride_kb, stride_kh, stride_kn, stride_kd,
+            stride_vb, stride_vh, stride_vn, stride_vd,
+            stride_dqb, stride_dqh, stride_dqm, stride_dqd,
+            stride_dkb, stride_dkh, stride_dkn, stride_dkd,
+            stride_dvb, stride_dvh, stride_dvn, stride_dvd,
             stride_deltab, stride_deltah, stride_deltam,
-            stride_dob, stride_doh, stride_dom, stride_dok,
+            stride_dob, stride_doh, stride_dom, stride_dod,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
