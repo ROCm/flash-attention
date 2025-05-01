@@ -48,7 +48,7 @@ jobs:
 
       - name: Install dependencies for bench and misc
         run: |
-          pip install numpy==1.24 matplotlib pandas tabulate
+          pip install matplotlib pandas tabulate
 
       - name: AMD Internal Tests
         if: False
