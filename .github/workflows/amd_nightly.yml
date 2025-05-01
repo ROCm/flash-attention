@@ -38,7 +38,7 @@ jobs:
 
       - name: Install Triton
         run: |
-          pip install triton==3.2.0
+          pip install triton==3.3.0
       
       - name: Show Triton version
         run: |
@@ -50,7 +50,7 @@ jobs:
 
       - name: Install dependencies for bench and misc
         run: |
-          pip install numpy==1.24 matplotlib pandas tabulate
+          pip install matplotlib pandas tabulate
 
       - name: AMD Internal Tests
         run: |
@@ -90,7 +90,7 @@ jobs:
 
         - name: Install Triton
           run: |
-            pip install triton==3.2.0
+            pip install triton==3.3.0
         
         - name: Show Triton version
           run: |

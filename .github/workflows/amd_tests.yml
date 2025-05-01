@@ -36,7 +36,7 @@ jobs:
 
       - name: Install Triton
         run: |
-          pip install triton==3.2.0
+          pip install triton==3.3.0
       
       - name: Show Triton version
         run: |
