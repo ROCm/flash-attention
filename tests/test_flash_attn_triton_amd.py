@@ -16,7 +16,7 @@ from flash_attn import (
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_rdna
+from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, is_rdna
 
 MAX_HEADDIM_SM8x = 192
 
@@ -26,7 +26,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
 is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
 is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
 
-skip_bfloat16 = True # True if is_sm75 else False
+skip_bfloat16 = True if is_sm75 or is_hip() else False
 
 
 def attn_bias_from_alibi_slopes(
@@ -571,7 +571,7 @@ def get_dropout_fraction(
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [False])
@@ -720,7 +720,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 # @pytest.mark.parametrize('dtype', [torch.float16])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [True])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [True])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [True])
@@ -872,7 +872,7 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [True])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [False])
@@ -1147,7 +1147,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('mha_type', ["mqa"])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [True])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [True])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [True])
@@ -1747,7 +1747,7 @@ def test_flash_attn_varlen_causal(
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [True])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [True])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [False])
@@ -1881,7 +1881,7 @@ def test_flash_attn_splitkv(
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False, True])
 # @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [False])

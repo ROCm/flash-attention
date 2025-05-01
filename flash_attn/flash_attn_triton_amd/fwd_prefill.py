@@ -80,15 +80,6 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             qk += tl.dot(q, k)
         qk_scaled =  qk * SM_SCALE
 
-        if IS_CAUSAL:
-            causal_boundary = start_n + offs_n_causal
-            causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
-            qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
-        if bias_ptrs is not None:
-            bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
-            bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
-            qk_scaled += bias
-
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -96,6 +87,17 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
                                               global_n_positions)
             qk_scaled += alibi_block
+
+        if IS_CAUSAL:
+            causal_boundary = start_n + offs_n_causal
+            causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
+            qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+        
+        if bias_ptrs is not None:
+            bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
+            bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
+            qk_scaled += bias
+
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
@@ -217,6 +219,12 @@ def get_autotune_configs():
         if arch == "gfx950":
             default_config = triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 128, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                num_stages=1,
+                num_warps=4,
+            )
+        elif arch == "gfx942":
+            default_config = triton.Config(
+                {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
                 num_stages=1,
                 num_warps=4,
             )
