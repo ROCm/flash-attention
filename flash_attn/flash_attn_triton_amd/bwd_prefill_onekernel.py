@@ -318,130 +318,130 @@ def _bwd_dkdv_inner(
         do_ptrs += step_m * stride_dom
     return dk, dv
 
-# the main inner-loop logic for computing dQ
-@triton.jit
-def _bwd_dq_inner(
-    dq,  # output
-    q, K, V, do, m, Delta, sm_scale, # input
-    # shared by Q/K/V.
-    stride_qm, stride_qk, stride_kn,  stride_kk, stride_vn, stride_vk,
-    stride_dropoutm, stride_dropoutn,  # stride for dropout
-    stride_deltam,
-    seqlen_q, seqlen_k,  #
-    BLOCK_M2: tl.constexpr,  #
-    BLOCK_N2: tl.constexpr,  #
-    HEAD_DIM: tl.constexpr,
-    ACTUAL_HEAD_DIM: tl.constexpr,  #
-    dropout_p, philox_seed, batch_philox_offset, dropout_offset,
-    alibi_slope,
-    # Filled in by the wrapper.
-    start_m, start_n, end_n, num_steps,  #
-    descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
-    MASK: tl.constexpr,
-    ENABLE_DROPOUT: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
-    USE_EXP2: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    DEBUG_TRITON: tl.constexpr,
-    DEBUG_TRITON_DETAIL: tl.constexpr,
-):
-    # if HEAD_DIM is padded
-    PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
-    delta_qk = seqlen_q - seqlen_k
-    offs_m = start_m + tl.arange(0, BLOCK_M2)
-    offs_n = start_n + tl.arange(0, BLOCK_N2)
-    offs_k = tl.arange(0, HEAD_DIM)
+# # the main inner-loop logic for computing dQ
+# @triton.jit
+# def _bwd_dq_inner(
+#     dq,  # output
+#     q, K, V, do, m, Delta, sm_scale, # input
+#     # shared by Q/K/V.
+#     stride_qm, stride_qk, stride_kn,  stride_kk, stride_vn, stride_vk,
+#     stride_dropoutm, stride_dropoutn,  # stride for dropout
+#     stride_deltam,
+#     seqlen_q, seqlen_k,  #
+#     BLOCK_M2: tl.constexpr,  #
+#     BLOCK_N2: tl.constexpr,  #
+#     HEAD_DIM: tl.constexpr,
+#     ACTUAL_HEAD_DIM: tl.constexpr,  #
+#     dropout_p, philox_seed, batch_philox_offset, dropout_offset,
+#     alibi_slope,
+#     # Filled in by the wrapper.
+#     start_m, start_n, end_n, num_steps,  #
+#     descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
+#     MASK: tl.constexpr,
+#     ENABLE_DROPOUT: tl.constexpr,
+#     USE_ALIBI: tl.constexpr,
+#     USE_EXP2: tl.constexpr,
+#     IS_FP8: tl.constexpr,
+#     FP8_MAX: tl.constexpr,
+#     DEBUG_TRITON: tl.constexpr,
+#     DEBUG_TRITON_DETAIL: tl.constexpr,
+# ):
+#     # if HEAD_DIM is padded
+#     PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
+#     delta_qk = seqlen_q - seqlen_k
+#     offs_m = start_m + tl.arange(0, BLOCK_M2)
+#     offs_n = start_n + tl.arange(0, BLOCK_N2)
+#     offs_k = tl.arange(0, HEAD_DIM)
 
-    # mask to make sure not OOB of seqlen_q
-    mask_m = offs_m < seqlen_q
+#     # mask to make sure not OOB of seqlen_q
+#     mask_m = offs_m < seqlen_q
 
-    kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
-    vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k[:, None] * stride_vk
-    # D (= delta) is pre-divided by ds_scale.
-    Di = tl.load(Delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
-    # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
-    tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
-    curr_n = start_n
-    step_n = BLOCK_N2
-    curr_philox_offset = batch_philox_offset
-    curr_dropout_offset = dropout_offset
-    RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
-    for blk_idx in range(num_steps):
-        if DEBUG_TRITON: print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
-        offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        # end_n is needed because the end of causal True might not be perfectly
-        # aligned with the end of the block
-        mask_n = offs_n < end_n
-        if DEBUG_TRITON_DETAIL: print(f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}")  # noqa: E701
-        if DEBUG_TRITON_DETAIL: print(f"mask_n: {mask_n.shape}\n{mask_n}")  # noqa: E701
-        mask_kT = mask_n[None, :]
-        mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
-        if PADDED_HEAD:
-            mask_kT &= offs_k[:, None] < ACTUAL_HEAD_DIM
+#     kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
+#     vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k[:, None] * stride_vk
+#     # D (= delta) is pre-divided by ds_scale.
+#     Di = tl.load(Delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
+#     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
+#     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
+#     curr_n = start_n
+#     step_n = BLOCK_N2
+#     curr_philox_offset = batch_philox_offset
+#     curr_dropout_offset = dropout_offset
+#     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
+#     for blk_idx in range(num_steps):
+#         if DEBUG_TRITON: print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
+#         offs_n = curr_n + tl.arange(0, BLOCK_N2)
+#         # end_n is needed because the end of causal True might not be perfectly
+#         # aligned with the end of the block
+#         mask_n = offs_n < end_n
+#         if DEBUG_TRITON_DETAIL: print(f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}")  # noqa: E701
+#         if DEBUG_TRITON_DETAIL: print(f"mask_n: {mask_n.shape}\n{mask_n}")  # noqa: E701
+#         mask_kT = mask_n[None, :]
+#         mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
+#         if PADDED_HEAD:
+#             mask_kT &= offs_k[:, None] < ACTUAL_HEAD_DIM
 
-        kT = tl.load(kT_ptrs, mask=mask_kT, other=0.0)
-        vT = tl.load(vT_ptrs, mask=mask_kT, other=0.0)
+#         kT = tl.load(kT_ptrs, mask=mask_kT, other=0.0)
+#         vT = tl.load(vT_ptrs, mask=mask_kT, other=0.0)
 
-        if ENABLE_DROPOUT:
-            # NOTE: dropout is transposed because it is used to mask pT
-            philox_offs = curr_philox_offset + \
-                          offs_m[:, None] * stride_dropoutm + \
-                          offs_n[None, :] * stride_dropoutn
-            if tl_DROPOUT_USE_PYTORCH:
-                dropout_offs = offs_m[:, None] * stride_dropoutm + \
-                               offs_n[None, :] * stride_dropoutn
-                dropout_mask = tl.load(
-                    curr_dropout_offset + dropout_offs,
-                    mask=mask_mn)
-            else:
-                rand_vals = tl.rand(philox_seed, philox_offs)
-                dropout_mask = rand_vals > dropout_p
-            dropout_scale = 1 / (1 - dropout_p)
+#         if ENABLE_DROPOUT:
+#             # NOTE: dropout is transposed because it is used to mask pT
+#             philox_offs = curr_philox_offset + \
+#                           offs_m[:, None] * stride_dropoutm + \
+#                           offs_n[None, :] * stride_dropoutn
+#             if tl_DROPOUT_USE_PYTORCH:
+#                 dropout_offs = offs_m[:, None] * stride_dropoutm + \
+#                                offs_n[None, :] * stride_dropoutn
+#                 dropout_mask = tl.load(
+#                     curr_dropout_offset + dropout_offs,
+#                     mask=mask_mn)
+#             else:
+#                 rand_vals = tl.rand(philox_seed, philox_offs)
+#                 dropout_mask = rand_vals > dropout_p
+#             dropout_scale = 1 / (1 - dropout_p)
 
-        if IS_FP8:
-            qk = (tl.dot(q, kT) * descale_q * descale_k)
-        else:
-            qk = tl.dot(q, kT)
-        qk_scaled = qk * sm_scale
+#         if IS_FP8:
+#             qk = (tl.dot(q, kT) * descale_q * descale_k)
+#         else:
+#             qk = tl.dot(q, kT)
+#         qk_scaled = qk * sm_scale
 
-        if USE_ALIBI:
-            relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
-            alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
-            qk_scaled += alibi_block
+#         if USE_ALIBI:
+#             relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
+#             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
+#             qk_scaled += alibi_block
 
-        if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk_scaled)  # noqa: E701
-        if USE_EXP2:
-            p = tl.math.exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)
-        else:
-            p = tl.math.exp(qk_scaled - m)
+#         if DEBUG_TRITON_DETAIL: print(f"qk scaled: {qk.shape}\n", qk_scaled)  # noqa: E701
+#         if USE_EXP2:
+#             p = tl.math.exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)
+#         else:
+#             p = tl.math.exp(qk_scaled - m)
 
-        # Autoregressive masking.
-        if MASK:
-            causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
-            mask = causal_mask & mask_mn
-            p = tl.where(mask, p, 0.0)
-        # Compute dP and dS.
-        if IS_FP8:
-            dp = (tl.dot(do, vT) * descale_do * descale_v)
-        else:
-            dp = tl.dot(do, vT)
-        if ENABLE_DROPOUT:
-            dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
-        delta_i = Di[:, None]
-        ds = p * (dp -delta_i)
-        # Compute dQ.
-        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
-        if IS_FP8:
-            scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
-            dq += (tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT)) * descale_ds * descale_k)
-        else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
-        # Increment pointers.
-        curr_n += step_n
-        kT_ptrs += step_n * stride_kn
-        vT_ptrs += step_n * stride_vn
-    return dq
+#         # Autoregressive masking.
+#         if MASK:
+#             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
+#             mask = causal_mask & mask_mn
+#             p = tl.where(mask, p, 0.0)
+#         # Compute dP and dS.
+#         if IS_FP8:
+#             dp = (tl.dot(do, vT) * descale_do * descale_v)
+#         else:
+#             dp = tl.dot(do, vT)
+#         if ENABLE_DROPOUT:
+#             dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+#         delta_i = Di[:, None]
+#         ds = p * (dp -delta_i)
+#         # Compute dQ.
+#         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
+#         if IS_FP8:
+#             scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
+#             dq += (tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT)) * descale_ds * descale_k)
+#         else:
+#             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+#         # Increment pointers.
+#         curr_n += step_n
+#         kT_ptrs += step_n * stride_kn
+#         vT_ptrs += step_n * stride_vn
+#     return dq
 
 @triton.autotune(
     configs=causal_autotune_configs,
