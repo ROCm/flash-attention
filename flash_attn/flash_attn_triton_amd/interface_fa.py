@@ -70,12 +70,19 @@ def fwd(q: torch.Tensor,
     if return_softmax:
         metadata.return_scores = True
 
-    batch, nheads_q, nheads_k, head_size, _, _ = get_shapes_from_layout(q, k, metadata.layout)
+    # get shape
+    batch, _ , nheads_q, _= q.shape
 
     if causal:
         metadata.need_causal(True)
 
     if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError(f"Alibi can be (nheads,) or (batch_size, nheads). Given tensor with shape {alibi_slopes.shape}")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     if dropout_p > 0.0:
@@ -215,11 +222,22 @@ def bwd(
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
     dv = torch.zeros_like(v) if dv is None else dv.zero_()
 
+    # get shape
+    batch, _ , nheads_q, _= q.shape
+
     if dropout_p > 0.0:
         assert rng_state is not None
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
+
+    if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
     if USE_REF:
@@ -417,13 +435,20 @@ def varlen_fwd(
     metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)  # set layout to "thd" and other metdata
     assert metadata.layout is not None
 
-    # get shapes
-    batch, nheads_q, nheads_k, head_size , seqlen_q, seqlen_k = get_shapes_from_layout(q, k, metadata.layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+    # get shape
+    batch = len(cu_seqlens_q) - 1
+    _, nheads_q, _= q.shape
 
     if causal:
         metadata.need_causal(True)
 
     if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     if dropout_p > 0.0:
@@ -566,11 +591,23 @@ def varlen_bwd(
     dk = torch.zeros_like(k) if dk is None else dk.zero_()
     dv = torch.zeros_like(v) if dv is None else dv.zero_()
 
+    # get shape
+    batch = len(cu_seqlens_q) - 1
+    _, nheads_q, _= q.shape
+
     if dropout_p > 0.0:
         assert rng_state is not None
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
+
+    if alibi_slopes is not None:
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
 
     # call implementation
     if USE_REF:
@@ -762,11 +799,19 @@ def fwd_kvcache(
     k_new = k
     v_new = v
 
+    # get shape
+    batch, _ , nheads_q, _= q.shape
+
     if causal:
         metadata.need_causal(True)
 
     if alibi_slopes is not None:
-        batch, _ , nheads_q, _= q.shape
+        if alibi_slopes.dim() == 2:
+            pass
+        elif alibi_slopes.dim() == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
+        else:
+            raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     # rotary boolean
