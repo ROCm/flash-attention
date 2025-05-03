@@ -1145,7 +1145,7 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
 
     # get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (head_size - 1).bit_length()
-    padded_d_model = max(padded_d_model, 16)
+    padded_d_model = max(padded_d_model, 32)
     HEAD_DIM = padded_d_model
     ACTUAL_HEAD_DIM = head_size
 
