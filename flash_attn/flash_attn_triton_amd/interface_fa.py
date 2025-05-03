@@ -354,7 +354,15 @@ def bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                USE_EXP2
+                USE_EXP2,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                descale_do,
+                descale_dq,
+                descale_dk,
+                descale_dv,
             )
             delta = delta_triton
         else:
@@ -723,7 +731,15 @@ def varlen_bwd(
                 dropout_p,
                 philox_seed,
                 philox_offset,
-                USE_EXP2
+                USE_EXP2,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_o,
+                descale_do,
+                descale_dq,
+                descale_dk,
+                descale_dv,
             )
             delta = delta_triton
         else:
