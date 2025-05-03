@@ -316,6 +316,7 @@ def _bwd_dkdv_inner(
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
         do_ptrs += step_m * stride_dom
+    return dk, dv
 
 # the main inner-loop logic for computing dQ
 @triton.jit
@@ -440,6 +441,7 @@ def _bwd_dq_inner(
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
         vT_ptrs += step_n * stride_vn
+    return dq
 
 @triton.autotune(
     configs=causal_autotune_configs,
@@ -606,7 +608,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             # if start_m is negative, the current N-tile has no block on the
             #   diagonal of causal mask, so everything have no causal mask
             if DEBUG_TRITON: print(f"Masked: start_n: {start_n}; start_m: {start_m}, num_steps: {num_steps}")  # noqa: E701
-            _bwd_dkdv_inner(
+            dk, dv = _bwd_dkdv_inner(
                 dk, dv,  # output tensors
                 Q_ptr, k, v, DO_ptr, M_ptr, Delta_ptr, sm_scale, # input tensors
                 stride_qm, stride_qd,  # strides for q
@@ -636,7 +638,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             if DEBUG_TRITON: print(f"start_m after Masked step: {start_m}; num_steps: {num_steps}")  # noqa: E701
             if DEBUG_TRITON: print(f"unMasked: start_n: {start_n}, start_m: {start_m}, end_m: {end_m}, num_steps: {num_steps}")  # noqa: E701
             if DEBUG_TRITON: print("unMasked")  # noqa: E701
-            _bwd_dkdv_inner(
+            dk, dv = _bwd_dkdv_inner(
                 dk, dv,  # output tensors
                 Q_ptr, k, v, DO_ptr, M_ptr, Delta_ptr, sm_scale, # input tensors
                 stride_qm, stride_qd,  # strides for q
@@ -741,9 +743,8 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             else:
                 descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
-
             dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-            _bwd_dq_inner(
+            dq = _bwd_dq_inner(
                 dq,
                 q, K, V, do, m, Delta_ptr, sm_scale,
                 stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
@@ -769,7 +770,7 @@ def bwd_kernel_causal( # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhead
             num_steps = tl.cdiv(end_n, BLOCK_N2)
             start_n = max(end_n - num_steps * BLOCK_N2, 0)
             if DEBUG_TRITON: print(f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}")  # noqa: E701
-            _bwd_dq_inner(
+            dq = _bwd_dq_inner(
                 dq,
                 q, K, V, do, m, Delta_ptr, sm_scale,
                 stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
@@ -920,7 +921,7 @@ def bwd_kernel_noncausal(
             # because there is no causal, we always start from the beginning
             start_m = 0
             num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
-            _bwd_dkdv_inner(
+            dk, dv = _bwd_dkdv_inner(
                 dk, dv,  # output tensors
                 Q_ptr, k, v, DO_ptr, M_ptr, Delta_ptr, sm_scale, # input tensors
                 stride_qm, stride_qd,  # strides for q
@@ -1013,7 +1014,7 @@ def bwd_kernel_noncausal(
             num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
 
             dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-            _bwd_dq_inner(
+            dq = _bwd_dq_inner(
                 dq,
                 q, K, V, do, m, Delta_ptr, sm_scale,
                 stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
