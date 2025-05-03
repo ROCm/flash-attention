@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 720 # self hosted runners can run jobs for longer than the default of 360 minutes
     container:
       image: rocm/pytorch:latest
-      options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video --user root
+      options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --shm-size 16G --group-add video --user root
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
 
       - name: Install Triton
         run: |
-          pip install triton==3.2.0
+          pip install triton==3.3.0
       
       - name: Show Triton version
         run: |
@@ -48,7 +48,7 @@ jobs:
 
       - name: Install dependencies for bench and misc
         run: |
-          pip install numpy==1.24 matplotlib pandas tabulate
+          pip install matplotlib pandas tabulate
 
       - name: AMD Internal Tests
         run: |
@@ -56,7 +56,7 @@ jobs:
 
       - name: Flash Attention Tests
         run: |
-          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 pytest tests/test_flash_attn_triton_amd.py
+          FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 pytest -n 8 tests/test_flash_attn_triton_amd.py
 
       - name: AMD Bench
         run: |
