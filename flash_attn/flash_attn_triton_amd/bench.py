@@ -1011,10 +1011,18 @@ def get_env_value_combinations(current_backend: Optional[Literal["triton", "ck"]
     
     return env_configs
 
-def get_input_config_set(config_type):
+def get_input_config_set(config_type = "custom"):
     if config_type == "llama":
         # batch, hq, hk, sq, sk, d_head, causal, dropout
         input_configs = [
+            # LLaMA 3 8B
+            (4, 32, 8, 8192, 8192, 128, True, 0.0),
+            # LLaMA 3 70B
+            (4, 64, 8, 8192, 8192, 128, True, 0.0),
+        ]
+    elif config_type == "custom":
+        input_configs = [
+            (4, 8, 1, 8192, 8192, 128, True, 0.0),
             # LLaMA 3 8B
             (4, 32, 8, 8192, 8192, 128, True, 0.0),
             # LLaMA 3 70B
@@ -1116,7 +1124,7 @@ def process_args():
             input_configs = [(batch, hq, hk, sq, sk, d_head, causal, dropout)]
         else:
             if True:
-                input_configs = get_input_config_set("llama")
+                input_configs = get_input_config_set()
             else:
                 input_configs = generate_benchmark_configs(is_varlen, packing)
 
