@@ -69,7 +69,7 @@ def get_autotune_configs():
             triton.Config({"PRE_BLOCK": PRE_BLOCK, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
         ]
         preprocess_autotune_keys = [
-            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
+            "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
             "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
         ]
         causal_autotune_configs = [
