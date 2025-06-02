@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 720 # self hosted runners can run jobs for longer than the default of 360 minutes
     container:
       image: rocm/pytorch:latest
-      options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --shm-size 16G --group-add video --user root
+      options: --device=/dev/kfd $GHA_RENDER_DEVICES --security-opt seccomp=unconfined --shm-size 16G --group-add video --user root
     steps:
       - name: Checkout
         uses: actions/checkout@v4
