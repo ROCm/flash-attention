@@ -44,6 +44,7 @@ gpucore.*
 *.txt
 *.pth
 *.md
+*.crt
 training/logs
 training/data
 # ck modules
