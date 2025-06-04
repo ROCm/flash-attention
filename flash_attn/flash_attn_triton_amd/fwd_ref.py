@@ -1,11 +1,11 @@
 import torch
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 from .utils import DEBUG, compute_alibi_tensor_ref
 
 DEBUG_CORE = False
 
-def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
+def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
     if DEBUG_CORE:
         print()
         print("attention_forward_core_ref_impl")
@@ -14,6 +14,7 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
         print("v:", v, v.shape)
         print("sm_scale:", sm_scale)
         print("causal:", causal)
+        print("window_size:", window_size)
         print("dropout_p:", dropout_p)
         print("philox_seed:", philox_seed)
         print("philox_offset:", philox_offset)
@@ -49,8 +50,31 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
         if DEBUG_CORE:
             print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
 
+    # Apply sliding window mask if necessary
+    if window_size is not None and window_size != (-1, -1):
+        window_size_left, window_size_right = window_size
+        L_q, L_k = q.shape[1], k.shape[1]
+        row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
+        col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
+        col_offset = L_q - L_k
+        
+        # Create sliding window mask
+        # For each query position i, it can attend to keys in range:
+        # [i + col_offset - window_size_left, i + col_offset + window_size_right]
+        window_mask = (col_idx >= (row_idx + col_offset - window_size_left)) & \
+                      (col_idx <= (row_idx + col_offset + window_size_right))
+        
+        if DEBUG_CORE:
+            print("window_mask:", window_mask)
+        
+        # Apply window mask
+        attention_scaled_scores = attention_scaled_scores.masked_fill(
+            torch.logical_not(window_mask.unsqueeze(0)), float('-inf')
+        )
+        if DEBUG_CORE:
+            print("attention_scaled_scores after window mask:", attention_scaled_scores, attention_scaled_scores.shape)
 
-    # Apply causal mask if necessary
+    # Apply causal mask if necessary (this should be applied after window mask)
     if causal:
         L_q, L_k = q.shape[1], k.shape[1]
         row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
@@ -70,13 +94,13 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
     max_scores = torch.max(attention_scaled_scores, dim=-1, keepdim=True)[0]
     if DEBUG_CORE:
         print("max_scores:", max_scores, max_scores.shape)
-    if causal:
+    if causal or (window_size is not None and window_size != (-1, -1)):
         # Replace -inf in max_scores with zeros to avoid NaN in subtraction
         max_scores = torch.where(
             torch.isinf(max_scores), torch.zeros_like(max_scores), max_scores
         )
         if DEBUG:
-            print("max_scores if causal:", max_scores, max_scores.shape)
+            print("max_scores if causal or windowed:", max_scores, max_scores.shape)
 
     # Shift scores
     attention_shifted_scaled_scores = attention_scaled_scores - max_scores
@@ -97,7 +121,7 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
     sum_exp_scores = torch.sum(exp_scores, dim=-1, keepdim=True)
     if DEBUG_CORE:
         print("sum_exp_scores:", sum_exp_scores, sum_exp_scores.shape)
-    if causal:
+    if causal or (window_size is not None and window_size != (-1, -1)):
         # if sum of exp scores is 0.0 it means scores where -inf, we cannot compute softmax and softmax_lse. Setting to 1 deals with -inf case cleanly 
         sum_exp_scores = torch.where(
         sum_exp_scores == 0,
@@ -157,7 +181,7 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox
 
     return o, softmax_lse, sd_mask
 
-def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
+def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, window_size, layout, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
     """Compute reference output and softmax_lse using PyTorch's built-in function"""
 
     # Ensure the layout is 'bhsd'
@@ -193,7 +217,7 @@ def attention_vanilla_forward_pytorch_ref_impl(q, k, v, sm_scale, causal, layout
 
     # Call the core attention function
     o, softmax_lse, sd_mask = attention_forward_core_ref_impl(
-        q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
+        q, k, v, sm_scale, causal, window_size, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2
     )
 
     if group_size != 1:
@@ -223,6 +247,7 @@ def attention_varlen_forward_pytorch_ref_impl(
     v,
     sm_scale,
     causal,
+    window_size,
     layout,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -301,7 +326,7 @@ def attention_varlen_forward_pytorch_ref_impl(
             alibi_slopes_i = None
 
         # Call the core attention function for this sequence
-        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes_i, use_exp2)
+        o_i, softmax_lse_i, sd_mask_i = attention_forward_core_ref_impl(q_i, k_i, v_i, sm_scale, causal, window_size, dropout_p, philox_seed, philox_offset, alibi_slopes_i, use_exp2)
 
         # Reshape outputs back to original dimensions
         if group_size != 1:
@@ -338,6 +363,7 @@ def attention_forward_pytorch_ref_impl(
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
+    window_size: Optional[Tuple[int, int]],
     layout: Literal["bshd", "bhsd", "thd"],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
@@ -356,6 +382,7 @@ def attention_forward_pytorch_ref_impl(
             v.clone(), 
             sm_scale, 
             causal,
+            window_size,
             layout,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -374,6 +401,7 @@ def attention_forward_pytorch_ref_impl(
                                                        v.clone(),
                                                        sm_scale,
                                                        causal,
+                                                       window_size,
                                                        layout,
                                                        dropout_p,
                                                        philox_seed,
