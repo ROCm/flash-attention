@@ -3,7 +3,7 @@ import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
 from .utils import DEBUG, AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shapes_from_layout, compute_fp8_scaling_factors, \
-    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_cdna, is_fp8, is_rdna
+    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_cdna, is_fp8, is_rdna, round_multiple
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -1150,11 +1150,15 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     ACTUAL_HEAD_DIM = head_size
 
     # init delta
-    delta = torch.empty_like(softmax_lse)
     if IS_VARLEN:
+        delta = torch.empty_like(softmax_lse)
         stride_deltab = 0
         stride_deltam, stride_deltah = delta.stride()
     else:
+        # torch.compile's fake kernel expects sequence dimension rounded to 128
+        seqlen_rounded = round_multiple(max_seqlen_q_final, 128)
+        delta = torch.zeros((batch, nheads_q, seqlen_rounded), 
+                           device=softmax_lse.device, dtype=torch.float32)
         stride_deltab, stride_deltah, stride_deltam = delta.stride()
     pre_grid = lambda META:  (triton.cdiv(max_seqlen_q_final, META['PRE_BLOCK']), batch, nheads_q)
     _bwd_preprocess[pre_grid](

@@ -153,6 +153,7 @@ def fwd(q: torch.Tensor,
             print("descale_o:", descale_o, descale_o.shape if descale_o is not None else None)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None )
+        print("rng_state:", rng_state)
 
     return out, softmax_lse, sd_mask, rng_state
 
