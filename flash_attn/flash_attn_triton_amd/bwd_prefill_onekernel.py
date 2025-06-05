@@ -1,3 +1,4 @@
+import os
 import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
@@ -1048,6 +1049,9 @@ def is_contiguous(x, name):
     else:
         print(f"{name} is not contiguous")
         return x.contiguous() 
+    
+
+ROUNDED_LSE = os.environ.get('ROUNDED_LSE', '0').lower() in ('1', 'true', 'yes')
 
 def attention_prefill_backward_triton_split_oneKernel_impl(
     do: torch.Tensor,
@@ -1150,16 +1154,25 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     ACTUAL_HEAD_DIM = head_size
 
     # init delta
-    if IS_VARLEN:
-        delta = torch.empty_like(softmax_lse)
-        stride_deltab = 0
-        stride_deltam, stride_deltah = delta.stride()
+    if ROUNDED_LSE:
+        if IS_VARLEN:
+            delta = torch.empty_like(softmax_lse)
+            stride_deltab = 0
+            stride_deltam, stride_deltah = delta.stride()
+        else:
+            # torch.compile's fake kernel expects sequence dimension rounded to 128
+            seqlen_rounded = round_multiple(max_seqlen_q_final, 128)
+            delta = torch.zeros((batch, nheads_q, seqlen_rounded), 
+                            device=softmax_lse.device, dtype=torch.float32)
+            stride_deltab, stride_deltah, stride_deltam = delta.stride()
     else:
-        # torch.compile's fake kernel expects sequence dimension rounded to 128
-        seqlen_rounded = round_multiple(max_seqlen_q_final, 128)
-        delta = torch.zeros((batch, nheads_q, seqlen_rounded), 
-                           device=softmax_lse.device, dtype=torch.float32)
-        stride_deltab, stride_deltah, stride_deltam = delta.stride()
+        delta = torch.empty_like(softmax_lse)
+        if IS_VARLEN:
+            stride_deltab = 0
+            stride_deltam, stride_deltah = delta.stride()
+        else:
+            stride_deltab, stride_deltah, stride_deltam = delta.stride()
+
     pre_grid = lambda META:  (triton.cdiv(max_seqlen_q_final, META['PRE_BLOCK']), batch, nheads_q)
     _bwd_preprocess[pre_grid](
         o, do,
