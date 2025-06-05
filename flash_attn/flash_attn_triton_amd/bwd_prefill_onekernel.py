@@ -110,7 +110,7 @@ def _bwd_preprocess(
     O, DO,  # noqa: E741
     Delta,
     stride_ob, stride_oh, stride_om, stride_od,
-    stride_deltab, stride_deltah, stride_deltam,
+    stride_delta_b, stride_delta_h, stride_delta_m,
     stride_descale_do_z,
     cu_seqlens_q, max_seqlen_q,
     Descale_do,
@@ -161,8 +161,8 @@ def _bwd_preprocess(
         delta = tl.sum(o.to(tl.float32) * (do.to(tl.float32) * descale_do), axis=1)
     else:
         delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
-    delta_offset = Delta + bid * stride_deltab + hid * stride_deltah + q_start * stride_deltam
-    tl.store(delta_offset + offs_m * stride_deltam, delta, mask=mask_m)
+    delta_offset = Delta + bid * stride_delta_b + hid * stride_delta_h + q_start * stride_delta_m
+    tl.store(delta_offset + offs_m * stride_delta_m, delta, mask=mask_m)
 
 
 # The main inner-loop logic for computing dK and dV.
@@ -173,7 +173,7 @@ def _bwd_dkdv_inner(
     stride_qm, stride_qk,
     stride_dom, stride_dok,
     stride_dropoutm, stride_dropoutn,
-    stride_deltam,
+    stride_lse_m, stride_delta_m,
     BLOCK_M: tl.constexpr,  # 16
     BLOCK_N: tl.constexpr,  # 128
     HEAD_DIM: tl.constexpr,  #
@@ -244,7 +244,7 @@ def _bwd_dkdv_inner(
                 dropout_mask = rand_vals > dropout_p
             dropout_scale = 1.0 / (1 - dropout_p)
         # Load m before computing qk to reduce pipeline stall.
-        m = tl.load(M + offs_m * stride_deltam, mask=mask_m, other=0.0)
+        m = tl.load(M + offs_m * stride_lse_m, mask=mask_m, other=0.0)
         if IS_FP8:
             qkT = (tl.dot(k, qT) * descale_q * descale_k)
         else:
@@ -298,7 +298,7 @@ def _bwd_dkdv_inner(
             if start_n == 256:
                 print(f"pT: {pT.shape}\n", pT)
         # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
+        Di = tl.load(D + offs_m * stride_delta_m, mask=mask_m)
         # Compute dP and dS.
         if IS_FP8:
             dpT = (tl.dot(v, tl.trans(do)) * descale_v * descale_do)
@@ -327,7 +327,8 @@ def _bwd_dq_inner(
     # shared by Q/K/V.
     stride_qm, stride_qk, stride_kn,  stride_kk, stride_vn, stride_vk,
     stride_dropoutm, stride_dropoutn,  # stride for dropout
-    stride_deltam,
+    stride_lse_m,
+    stride_delta_m,
     seqlen_q, seqlen_k,  #
     BLOCK_M2: tl.constexpr,  #
     BLOCK_N2: tl.constexpr,  #
@@ -360,7 +361,7 @@ def _bwd_dq_inner(
     kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
     vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k[:, None] * stride_vk
     # D (= delta) is pre-divided by ds_scale.
-    Di = tl.load(Delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
+    Di = tl.load(Delta + offs_m * stride_delta_m, mask=mask_m, other=0.0)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
@@ -459,7 +460,8 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
     stride_dqb, stride_dqh, stride_dqm, stride_dqd,
     stride_dkb, stride_dkh, stride_dkn, stride_dkd,
     stride_dvb, stride_dvh, stride_dvn, stride_dvd,
-    stride_deltab, stride_deltah, stride_deltam,
+    stride_lse_b, stride_lse_h, stride_lse_m,
+    stride_delta_b, stride_delta_h, stride_delta_m,
     stride_dob, stride_doh, stride_dom, stride_dod,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
     stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
@@ -569,10 +571,10 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
             Q_ptr = Q + adj_q
             adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
             DO_ptr = DO + adj_do
-            adj_delta = bid * stride_deltab + hqid * stride_deltah + \
-                q_start * stride_deltam
-            M_ptr = M + adj_delta
+            adj_delta = bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
             Delta_ptr = Delta + adj_delta
+            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m 
+            M_ptr = M + adj_m
 
             if USE_ALIBI:
                 alibi_offset = bid * stride_az + hqid * stride_ah
@@ -615,7 +617,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 stride_qm, stride_qd,  # strides for q
                 stride_dom, stride_dod,  # strides for o
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
-                stride_deltam,
+                stride_lse_m, stride_delta_m,
                 MASK_BLOCK_M1, BLOCK_N1,  # block dim
                 HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,
@@ -645,7 +647,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 stride_qm, stride_qd,  # strides for q
                 stride_dom, stride_dod,  # strides for o
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
-                stride_deltam,
+                stride_lse_m, stride_delta_m,
                 BLOCK_M1, BLOCK_N1,  # block dim
                 HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,
@@ -706,8 +708,10 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
             adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
             adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
             adj_delta = \
-                bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+                bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
             Delta_ptr = Delta + adj_delta
+            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m 
+            M_ptr = M + adj_m
 
             if USE_ALIBI:
                 alibi_offset = bid * stride_az + hqid * stride_ah
@@ -727,7 +731,7 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
-            m = tl.load(M + adj_delta + offs_m * stride_deltam,
+            m = tl.load(M + adj_m + offs_m * stride_lse_m,
                         mask=offs_m < seqlen_q)
             m = m[:, None]
 
@@ -750,7 +754,8 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 q, K, V, do, m, Delta_ptr, sm_scale,
                 stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
                 stride_dropoutm, stride_dropoutn,
-                stride_deltam,
+                stride_lse_m,
+                stride_delta_m,
                 seqlen_q, seqlen_k,
                 BLOCK_M2, MASK_BLOCK_N2,
                 HEAD_DIM, ACTUAL_HEAD_DIM,
@@ -776,7 +781,8 @@ def bwd_kernel_causal( # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), ba
                 q, K, V, do, m, Delta_ptr, sm_scale,
                 stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
                 stride_dropoutm, stride_dropoutn,
-                stride_deltam,
+                stride_lse_m,
+                stride_delta_m,
                 seqlen_q, seqlen_k,
                 BLOCK_M2, BLOCK_N2,
                 HEAD_DIM, ACTUAL_HEAD_DIM,
@@ -815,7 +821,8 @@ def bwd_kernel_noncausal(
     stride_dqb, stride_dqh, stride_dqm, stride_dqd,
     stride_dkb, stride_dkh, stride_dkn, stride_dkd,
     stride_dvb, stride_dvh, stride_dvn, stride_dvd,
-    stride_deltab, stride_deltah, stride_deltam,
+    stride_lse_b, stride_lse_h, stride_lse_m,
+    stride_delta_b, stride_delta_h, stride_delta_m,
     stride_dob, stride_doh, stride_dom, stride_dod,
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
     stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
@@ -891,9 +898,10 @@ def bwd_kernel_noncausal(
             Q_ptr = Q + adj_q
             adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
             DO_ptr = DO + adj_do
-            adj_delta = bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
-            M_ptr = M + adj_delta
+            adj_delta = bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
             Delta_ptr = Delta + adj_delta
+            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m 
+            M_ptr = M + adj_m
 
             if USE_ALIBI:
                 alibi_offset = bid * stride_az + hqid * stride_ah
@@ -928,7 +936,8 @@ def bwd_kernel_noncausal(
                 stride_qm, stride_qd,  # strides for q
                 stride_dom, stride_dod,  # strides for o
                 stride_dropoutm, stride_dropoutn,  # strides for dropout
-                stride_deltam,
+                stride_lse_m,
+                stride_delta_m,
                 BLOCK_M1, BLOCK_N1,  # block dim
                 HEAD_DIM, ACTUAL_HEAD_DIM,  # head dim
                 dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
@@ -975,8 +984,10 @@ def bwd_kernel_noncausal(
             adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
             adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
             adj_delta = \
-                bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+                bid * stride_delta_b + hqid * stride_delta_h + q_start * stride_delta_m
             Delta_ptr = Delta + adj_delta
+            adj_m = bid * stride_lse_b + hqid * stride_lse_h + q_start * stride_lse_m 
+            M_ptr = M + adj_m
 
             if USE_ALIBI:
                 alibi_offset = bid * stride_az + hqid * stride_ah
@@ -997,7 +1008,7 @@ def bwd_kernel_noncausal(
 
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
-            m = tl.load(M + adj_delta + offs_m * stride_deltam,
+            m = tl.load(M + adj_m + offs_m * stride_lse_m,
                         mask=offs_m < seqlen_q)
             m = m[:, None]
 
@@ -1020,7 +1031,8 @@ def bwd_kernel_noncausal(
                 q, K, V, do, m, Delta_ptr, sm_scale,
                 stride_qm, stride_qd, stride_kn, stride_kd, stride_vn, stride_vd,
                 stride_dropoutm, stride_dropoutn,
-                stride_deltam,
+                stride_lse_m,
+                stride_delta_m,
                 seqlen_q, seqlen_k,
                 BLOCK_M2, BLOCK_N2,
                 HEAD_DIM, ACTUAL_HEAD_DIM,
@@ -1124,7 +1136,9 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_o_z = stride_descale_do_z = None
 
 
-    # get strides and shape
+    # get params, strides and shape
+    IS_VARLEN = layout == "thd"
+    use_dropout = (dropout_p > 0.0)
     batch, nheads_q, nheads_k, head_size, max_seqlen_q_final, max_seqlen_k_final = \
         get_shapes_from_layout(
             q, k, layout,
@@ -1143,8 +1157,7 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk_strides
     stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv_strides
     stride_dob, stride_doh, stride_dom, stride_dod = do_strides
-    IS_VARLEN = layout == "thd"
-    use_dropout = (dropout_p > 0.0)
+    stride_lse_b, stride_lse_h, stride_lse_m = (0, softmax_lse.stride(0), softmax_lse.stride(1)) if IS_VARLEN else softmax_lse.stride()
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
 
     # get closest power of 2 over or equal to 32.
@@ -1157,28 +1170,24 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     if ROUNDED_LSE:
         if IS_VARLEN:
             delta = torch.empty_like(softmax_lse)
-            stride_deltab = 0
-            stride_deltam, stride_deltah = delta.stride()
+            stride_delta_b, stride_delta_m, stride_delta_h = (0, delta.stride(0), delta.stride(1))
         else:
-            # torch.compile's fake kernel expects sequence dimension rounded to 128
-            seqlen_rounded = round_multiple(max_seqlen_q_final, 128)
-            delta = torch.zeros((batch, nheads_q, seqlen_rounded), 
+            # the interface expects the sequence dimension to be rounded to 128
+            max_seqlen_q_rounded = round_multiple(max_seqlen_q_final, 128)
+            delta_padded = torch.zeros((batch, nheads_q, max_seqlen_q_rounded), 
                             device=softmax_lse.device, dtype=torch.float32)
-            stride_deltab, stride_deltah, stride_deltam = delta.stride()
+            delta = delta_padded[:, :, :max_seqlen_q_final]
+            stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
     else:
         delta = torch.empty_like(softmax_lse)
-        if IS_VARLEN:
-            stride_deltab = 0
-            stride_deltam, stride_deltah = delta.stride()
-        else:
-            stride_deltab, stride_deltah, stride_deltam = delta.stride()
+        stride_delta_b, stride_delta_h, stride_delta_m =  (0, delta.stride(0), delta.stride(1)) if IS_VARLEN else delta.stride()
 
     pre_grid = lambda META:  (triton.cdiv(max_seqlen_q_final, META['PRE_BLOCK']), batch, nheads_q)
     _bwd_preprocess[pre_grid](
         o, do,
         delta,
         stride_ob, stride_oh, stride_om, stride_od,
-        stride_deltab, stride_deltah, stride_deltam,
+        stride_delta_b, stride_delta_h, stride_delta_m,
         stride_descale_do_z,
         cu_seqlens_q, max_seqlen_q_final,
         descale_do,
@@ -1231,7 +1240,8 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
             stride_dqb, stride_dqh, stride_dqm, stride_dqd,
             stride_dkb, stride_dkh, stride_dkn, stride_dkd,
             stride_dvb, stride_dvh, stride_dvn, stride_dvd,
-            stride_deltab, stride_deltah, stride_deltam,
+            stride_lse_b, stride_lse_h, stride_lse_m,
+            stride_delta_b, stride_delta_h, stride_delta_m,
             stride_dob, stride_doh, stride_dom, stride_dod,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
             stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
@@ -1264,7 +1274,8 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
             stride_dqb, stride_dqh, stride_dqm, stride_dqd,
             stride_dkb, stride_dkh, stride_dkn, stride_dkd,
             stride_dvb, stride_dvh, stride_dvn, stride_dvd,
-            stride_deltab, stride_deltah, stride_deltam,
+            stride_lse_b, stride_lse_h, stride_lse_m,
+            stride_delta_b, stride_delta_h, stride_delta_m,
             stride_dob, stride_doh, stride_dom, stride_dod,
             stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
             stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
@@ -1288,4 +1299,7 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
 
-    return delta
+    if ROUNDED_LSE:
+        return delta_padded
+    else:
+        return delta
