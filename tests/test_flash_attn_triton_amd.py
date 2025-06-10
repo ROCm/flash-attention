@@ -887,7 +887,10 @@ def test_flash_attn_varlen_qkvpacked(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (8, 8),
+        # (8, 8),
+        # (64, 64),
+        (96, 96),
+        # (128, 128),
         # (113, 203),
         # (128, 217),
         # (113, 211),
@@ -907,7 +910,7 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    DEBUG = True
+    DEBUG = False
     if USE_TRITON_ROCM:
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:

@@ -90,7 +90,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
 
         if IS_CAUSAL or USE_SLIDING_WINDOW:
             # Calculate global positions
-            global_m_positions = start_m * BLOCK_M + OFFS_M
+            global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             global_n_positions = start_n + tl.arange(0, BLOCK_N)
             
             # Start with all positions allowed
@@ -99,15 +99,18 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             # Apply sliding window constraint
             if USE_SLIDING_WINDOW:
                 if WINDOW_SIZE_LEFT >= 0:  # -1 means no left limit
-                    mask = mask & (global_n_positions[None, :] >= (global_m_positions[:, None] - WINDOW_SIZE_LEFT))
+                    left_boundary = global_m_positions[:, None] - WINDOW_SIZE_LEFT
+                    mask = mask & (global_n_positions[None, :] >= left_boundary)
                 if WINDOW_SIZE_RIGHT >= 0:  # -1 means no right limit  
-                    mask = mask & (global_n_positions[None, :] <= (global_m_positions[:, None] + WINDOW_SIZE_RIGHT))
+                    right_boundary = global_m_positions[:, None] + WINDOW_SIZE_RIGHT
+                    mask = mask & (global_n_positions[None, :] <= right_boundary)
             
             # Apply causal constraint
             if IS_CAUSAL:
                 # Adjust for different sequence lengths
                 causal_offset = seqlen_q - seqlen_k
-                mask = mask & (global_m_positions[:, None] >= (global_n_positions[None, :] + causal_offset))
+                causal_boundary = global_n_positions[None, :] + causal_offset
+                mask = mask & (global_m_positions[:, None] >= causal_boundary)
             
             # Apply the mask
             qk_scaled = tl.where(mask, qk_scaled, float("-inf"))
@@ -338,25 +341,41 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         seqlen_q = MAX_SEQLENS_Q
         seqlen_k = MAX_SEQLENS_K
 
-    # Now we compute whether we need to exit early due to causal masking.
-    # This is because for seqlen_q > seqlen_k, M rows of the attn scores
-    # are completely masked, resulting in 0s written to the output, and
-    # inf written to LSE. We don't need to do any GEMMs in this case.
-    # This block of code determines what N is, and if this WG is operating
-    # on those M rows.
+    # Calculate total K blocks
     n_blocks = tl.cdiv(seqlen_k, BLOCK_N)
-    if (IS_CAUSAL):
-        # If seqlen_q == seqlen_k, the attn scores are a square matrix.
-        # If seqlen_q != seqlen_k, attn scores are rectangular which means
-        # the causal mask boundary is bottom right aligned, and ends at either
-        # the top edge (seqlen_q < seqlen_k) or left edge.
-        # This captures the decrease in n_blocks if we have a rectangular attn matrix
-        n_blocks_seqlen = tl.cdiv((start_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N)
-        # This is what adjusts the block_max for the current WG, only
-        # if IS_CAUSAL. Otherwise we want to always iterate through all n_blocks
-        n_blocks = min(n_blocks, n_blocks_seqlen)
-        # If we have no blocks after adjusting for seqlen deltas, this WG is part of
-        # the blocks that are all 0. We exit early.
+    # Calculate which K blocks this Q block needs to attend to
+    if USE_SLIDING_WINDOW or IS_CAUSAL:
+        # Get the range of Q positions for this block
+        q_start = start_m * BLOCK_M
+        q_end = min((start_m + 1) * BLOCK_M, seqlen_q)
+        
+        # Calculate K range based on window and causal constraints
+        if USE_SLIDING_WINDOW:
+            # For sliding window, calculate the range of K positions
+            if WINDOW_SIZE_LEFT >= 0:
+                k_start = max(0, q_start - WINDOW_SIZE_LEFT)
+            else:
+                k_start = 0
+                
+            if WINDOW_SIZE_RIGHT >= 0:
+                k_end = min(seqlen_k, q_end + WINDOW_SIZE_RIGHT)
+            else:
+                k_end = seqlen_k
+        else:
+            k_start = 0
+            k_end = seqlen_k
+        
+        # Apply causal constraint if needed
+        if IS_CAUSAL:
+            causal_k_end = q_end - (seqlen_q - seqlen_k)
+            k_end = min(k_end, causal_k_end)
+        
+        # Convert to block indices
+        block_start = k_start // BLOCK_N
+        block_end = tl.cdiv(k_end, BLOCK_N)
+        n_blocks = block_end - block_start
+        
+        # Early exit if no blocks to process
         if n_blocks <= 0:
             o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
             o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
@@ -378,6 +397,20 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             tl.store(l_ptrs, l, mask=l_ptrs_mask)
             # TODO: Should dropout and return encoded softmax be handled here too?
             return
+    else:
+        block_start = 0
+        block_end = n_blocks
+    
+    if block_start > 0:
+        k_ptrs += block_start * BLOCK_N * stride_kn
+        v_ptrs += block_start * BLOCK_N * stride_vk
+        if USE_BIAS:
+            bias_ptrs += block_start * BLOCK_N * stride_bn
+        if RETURN_SCORES:
+            sd_mask_ptrs += block_start * BLOCK_N * stride_sn
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += block_start * BLOCK_N * stride_sn
+            philox_ptrs += block_start * BLOCK_N * stride_sn
 
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
@@ -452,19 +485,25 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
-    if IS_CAUSAL:
-        # There are always at least BLOCK_M // BLOCK_N masked blocks.
-        # Additionally there might be one more due to dissimilar seqlens.
+    # For sliding window, we need to check each block individually
+    if USE_SLIDING_WINDOW:
+        # With sliding window, all blocks might be partially masked
+        # So we treat all blocks as masked and let _attn_fwd_inner handle the masking
+        masked_blocks = n_blocks
+        n_full_blocks = 0
+    elif IS_CAUSAL:
+        # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
+        # In this case we might exceed n_blocks so pick the min.
         masked_blocks = BLOCK_M // BLOCK_N + (not is_modulo_mn)
+        masked_blocks = min(masked_blocks, n_blocks)
+        n_full_blocks = n_blocks - masked_blocks
     else:
-        # Padding on Q does not need to be masked in the FA loop.
+        # No masking needed
         masked_blocks = padded_block_k
-    # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
-    # In this case we might exceed n_blocks so pick the min.
-    masked_blocks = min(masked_blocks, n_blocks)
-    n_full_blocks = n_blocks - masked_blocks
-    block_min = 0
-    block_max = n_blocks * BLOCK_N
+        masked_blocks = min(masked_blocks, n_blocks)
+        n_full_blocks = n_blocks - masked_blocks
+    block_min = block_start * BLOCK_N
+    block_max = block_end * BLOCK_N
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
     if n_full_blocks > 0:
@@ -485,11 +524,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
 
     tl.debug_barrier()
     # Remaining blocks, if any, are full / not masked.
-    if (masked_blocks > 0):
-        if IS_CAUSAL:
-            offs_n_causal = offs_n + (seqlen_q - seqlen_k)
-        else:
-            offs_n_causal = 0
+    if USE_SLIDING_WINDOW or (IS_CAUSAL and block_start > 0):
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vk
         if USE_BIAS:
