@@ -291,6 +291,14 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         start_m = tl.program_id(0)
         off_h_q = tl.program_id(1)
         off_z = tl.program_id(2)
+    # If MQA / GQA, set the K and V head offsets appropriately.
+    GROUP_SIZE: tl.constexpr = HQ // HK
+    if GROUP_SIZE != 1:
+        off_h_k = off_h_q // GROUP_SIZE
+    else:
+        off_h_k = off_h_q
+    # Determine if we need to mask the heads
+    PADDED_HEAD: tl.constexpr = (ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL)
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -319,65 +327,180 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         seqlen_q = MAX_SEQLENS_Q
         seqlen_k = MAX_SEQLENS_K
 
-    # Now we compute whether we need to exit early due to causal masking.
-    # This is because for seqlen_q > seqlen_k, M rows of the attn scores
-    # are completely masked, resulting in 0s written to the output, and
-    # inf written to LSE. We don't need to do any GEMMs in this case.
-    # This block of code determines what N is, and if this WG is operating
-    # on those M rows.
-    n_blocks = tl.cdiv(seqlen_k, BLOCK_N)
-    if (IS_CAUSAL):
-        # If seqlen_q == seqlen_k, the attn scores are a square matrix.
-        # If seqlen_q != seqlen_k, attn scores are rectangular which means
-        # the causal mask boundary is bottom right aligned, and ends at either
-        # the top edge (seqlen_q < seqlen_k) or left edge.
-        # This captures the decrease in n_blocks if we have a rectangular attn matrix
-        n_blocks_seqlen = tl.cdiv((start_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N)
-        # This is what adjusts the block_max for the current WG, only
-        # if IS_CAUSAL. Otherwise we want to always iterate through all n_blocks
-        n_blocks = min(n_blocks, n_blocks_seqlen)
-        # If we have no blocks after adjusting for seqlen deltas, this WG is part of
-        # the blocks that are all 0. We exit early.
-        if n_blocks <= 0:
-            o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
-            o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
-            acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=Out.type.element_ty)
-            o_ptrs_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-            # We still need to write 0s to the result
-            tl.store(o_ptrs, acc, mask=o_ptrs_mask)
-            # The tensor allocated for L is based on MAX_SEQLENS_Q as that is
-            # statically known.
-            l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
-            l_ptrs = l_offset + offs_m * stride_lse_m 
-
-            l = tl.full([BLOCK_M], value=0.0, dtype=ACCUMULATOR_TYPE)
-
-            # mask_m_offsets = start_m + tl.arange(0, BLOCK_M)
-            # lse_mask = mask_m_offsets < causal_start_idx
-            # softmax_lse = tl.where(lse_mask, 0.0, softmax_lse)
-            l_ptrs_mask = offs_m < MAX_SEQLENS_Q
-            tl.store(l_ptrs, l, mask=l_ptrs_mask)
-            # TODO: Should dropout and return encoded softmax be handled here too?
-            return
-
-    # If MQA / GQA, set the K and V head offsets appropriately.
-    GROUP_SIZE: tl.constexpr = HQ // HK
-    if GROUP_SIZE != 1:
-        off_h_k = off_h_q // GROUP_SIZE
+    # Load scale factors if IS_FP8.
+    if IS_FP8:
+        descale_q = tl.load(Descale_Q + off_z * stride_descale_q_z + off_h_q)
+        descale_k = tl.load(Descale_K + off_z * stride_descale_k_z + off_h_k)
+        descale_v = tl.load(Descale_V + off_z * stride_descale_v_z + off_h_k)
     else:
-        off_h_k = off_h_q
+        descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
+    
+    # ============================================================
+    #              K BLOCK CLASSIFICATION FOR THIS PROGRAM
+    # ============================================================
+    """
+    This section classifies ALL K blocks that this program might need to examine.
+    We determine:
+    1. How many K blocks exist in total
+    2. Which K blocks are visible to this M block (not skipped)
+    3. Of the visible blocks, which are full vs masked
+    """
+    
+    # Total K blocks in the key sequence
+    total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+    
+    # Classification results
+    n_visible_k_blocks = 0    # How many K blocks this program will process
+    n_full_blocks = 0         # How many are full blocks (no masking)
+    n_masked_blocks = 0       # How many are masked blocks (need masking)
+    n_skipped_blocks = 0      # How many are skipped blocks (above diagonal)
+    
+    # Program decision
+    program_early_exit = False  # Should this program exit without computation?
+    
+    # Causal-specific values
+    causal_offset = 0
+    
+    if IS_CAUSAL:
+        # ========== CAUSAL MODE: Classify K Blocks ==========
+        """
+        In causal attention, K blocks can be:
+        - FULL: All positions in the block are below the diagonal
+        - MASKED: The diagonal cuts through this block
+        - SKIPPED: All positions in the block are above the diagonal
+        """
+        
+        # Calculate causal boundary for this M block
+        causal_offset = seqlen_q - seqlen_k
+        m_block_start = start_m * BLOCK_M
+        m_block_end = min((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+        
+        # First, check if this program can see ANY K blocks
+        first_visible_k_pos = m_block_start - causal_offset
+        
+        if first_visible_k_pos < 0:
+            """
+            PROGRAM EARLY EXIT: All K blocks are SKIPPED blocks for this M block.
+            
+            Example: Program processing M block 0 with seqlen_q=32, seqlen_k=64
+            - This program handles queries 0-15
+            - Due to causal masking with offset -32, these queries can't see ANY keys
+            - ALL K blocks (0,1,2,3) are SKIPPED blocks
+            - Program should exit early
+            """
+            program_early_exit = True
+            n_visible_k_blocks = 0
+            n_skipped_blocks = total_k_blocks  # All blocks are skipped
+            
+        else:
+            """
+            NORMAL PROCESSING: This program can see some K blocks.
+            Now we classify each K block as FULL, MASKED, or SKIPPED.
+            """
+            
+            # Which K blocks are visible (not skipped)?
+            last_visible_k_pos = m_block_end - causal_offset
+            last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
+            
+            # Visible blocks: [0, last_visible_k_block]
+            n_visible_k_blocks = min(last_visible_k_block + 1, total_k_blocks)
+            n_skipped_blocks = total_k_blocks - n_visible_k_blocks
+            
+            """
+            Example: Program processing M block 1 (queries 16-31) with BLOCK_N=16
+            - Can see keys 0-31 (with appropriate offset)
+            - last_visible_k_block = 1 (K blocks 0 and 1)
+            - K blocks 2, 3, etc. are SKIPPED blocks
+            """
+            
+            # Of the visible blocks, which are FULL vs MASKED?
+            """
+            MASKED blocks are those where the causal diagonal cuts through.
+            These are always the LAST few visible blocks.
+            """
+            
+            # How many blocks does the diagonal cut through?
+            diagonal_blocks = BLOCK_M // BLOCK_N  # For square blocks = 1
+            
+            # Might need extra masked block for padding or misalignment
+            has_partial_last_k_block = (seqlen_k % BLOCK_N) != 0
+            has_misaligned_diagonal = (seqlen_q % BLOCK_M) != 0
+            needs_extra_masked_block = has_partial_last_k_block or has_misaligned_diagonal
+            
+            # Count masked blocks (capped by visible blocks)
+            n_masked_blocks = diagonal_blocks + (1 if needs_extra_masked_block else 0)
+            n_masked_blocks = min(n_masked_blocks, n_visible_k_blocks)
+            
+            # The rest are full blocks
+            n_full_blocks = n_visible_k_blocks - n_masked_blocks
+            
+            """
+            Example continued:
+            - n_visible_k_blocks = 2 (blocks 0, 1)
+            - n_masked_blocks = 1 (diagonal cuts through block 1)
+            - n_full_blocks = 1 (block 0 is fully below diagonal)
+            - n_skipped_blocks = total - visible = 2 (blocks 2, 3)
+            """
+    
+    else:
+        # ========== NON-CAUSAL MODE: Classify K Blocks ==========
+        """
+        Without causal masking, classification is simple:
+        - Most blocks are FULL blocks
+        - Only the last block might be MASKED (if padding needed)
+        - No blocks are SKIPPED
+        """
+        
+        program_early_exit = False  # Never early exit in non-causal
+        n_visible_k_blocks = total_k_blocks  # All blocks are visible
+        n_skipped_blocks = 0  # No causal skipping
+        
+        # Check if last K block needs padding
+        if (seqlen_k % BLOCK_N) != 0:
+            n_masked_blocks = 1  # Last block needs padding mask
+            n_full_blocks = total_k_blocks - 1
+        else:
+            n_masked_blocks = 0  # All blocks are aligned
+            n_full_blocks = total_k_blocks
+    
 
-    n_extra_tokens = 0
-    # print("n_extra_tokens:", n_extra_tokens)
-    # print("seqlen_k:", seqlen_k)
-    # print("BLOCK_N:", BLOCK_N)
-    # return
-    if seqlen_k < BLOCK_N:
-        n_extra_tokens = BLOCK_N - seqlen_k
-    elif seqlen_k % BLOCK_N:
-        n_extra_tokens = seqlen_k % BLOCK_N
-    PADDED_HEAD: tl.constexpr = (ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL)
-
+    # ============================================================
+    #          PROGRAM EARLY EXIT (All K Blocks Skipped)
+    # ============================================================
+    
+    if program_early_exit:
+        """
+        This program's M block can't attend to ANY K blocks.
+        All K blocks are SKIPPED blocks (above causal diagonal).
+        
+        No computation needed - just write zeros and exit.
+        """
+        
+        # Write zeros to output
+        o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
+        o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
+        o_ptrs_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+        acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=Out.type.element_ty)
+        tl.store(o_ptrs, acc, mask=o_ptrs_mask)
+        
+        # Write zeros to LSE
+        l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
+        l_ptrs = l_offset + offs_m * stride_lse_m
+        l_ptrs_mask = offs_m < MAX_SEQLENS_Q
+        l = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
+        tl.store(l_ptrs, l, mask=l_ptrs_mask)
+        
+        return  # ← PROGRAM EXITS EARLY HERE!
+    
+    # ============================================================
+    #         NORMAL PROCESSING (Some K Blocks Visible)
+    # ============================================================
+    """
+    This program has visible K blocks to process.
+    We'll use two calls to handle different block types efficiently.
+    """
+    
+    # Initialize for processing
     # Compute pointers for all the tensors used in this kernel.
     q_offset = Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
@@ -422,55 +545,58 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         q_ptrs_mask = q_ptrs_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
-    # Load scale factors if IS_FP8.
-    if IS_FP8:
-        descale_q = tl.load(Descale_Q + off_z * stride_descale_q_z + off_h_q)
-        descale_k = tl.load(Descale_K + off_z * stride_descale_k_z + off_h_k)
-        descale_v = tl.load(Descale_V + off_z * stride_descale_v_z + off_h_k)
-    else:
-        descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
-
-    # Here we compute how many full and masked blocks we have.
-    padded_block_k = n_extra_tokens != 0
-    is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
-    if IS_CAUSAL:
-        # There are always at least BLOCK_M // BLOCK_N masked blocks.
-        # Additionally there might be one more due to dissimilar seqlens.
-        masked_blocks = BLOCK_M // BLOCK_N + (not is_modulo_mn)
-    else:
-        # Padding on Q does not need to be masked in the FA loop.
-        masked_blocks = padded_block_k
-    # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
-    # In this case we might exceed n_blocks so pick the min.
-    masked_blocks = min(masked_blocks, n_blocks)
-    n_full_blocks = n_blocks - masked_blocks
-    block_min = 0
-    block_max = n_blocks * BLOCK_N
-    # Compute for full blocks. Here we set causal to false regardless of its actual
-    # value because there is no masking. Similarly we do not need padding.
+    # ========== CALL 1: Process FULL K Blocks (Fast Path) ==========
     if n_full_blocks > 0:
-        block_max = (n_blocks - masked_blocks) * BLOCK_N
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
-                                        start_m, seqlen_k, seqlen_q, dropout_p, philox_seed, philox_ptrs,
-                                        sd_mask_ptrs, dropout_mask_ptrs,
-                                        # _, _, offs_n_causal, masked_blocks, n_extra_tokens, _
-                                        block_min, block_max, 0, 0, 0, alibi_slope,
-                                        descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
-                                        # IS_CAUSAL, ....
-                                        False, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
-                                        # _, MASK_STEPS, ...
-                                        PRE_LOAD_V, False, ENABLE_DROPOUT, PADDED_HEAD,
-                                        ACTUAL_BLOCK_DMODEL, SM_SCALE, USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE)
-        block_min = block_max
-        block_max = n_blocks * BLOCK_N
-
-    tl.debug_barrier()
-    # Remaining blocks, if any, are full / not masked.
-    if (masked_blocks > 0):
-        if IS_CAUSAL:
-            offs_n_causal = offs_n + (seqlen_q - seqlen_k)
-        else:
-            offs_n_causal = 0
+        """
+        Process K blocks that are FULL blocks (no masking needed).
+        
+        These blocks are completely below the causal diagonal.
+        We can skip all masking logic for maximum performance.
+        
+        Loop will process K blocks: [0, n_full_blocks)
+        """
+        
+        # define the range for full blocks
+        block_min = 0                              # Start from first K block
+        block_max = n_full_blocks * BLOCK_N        # Process n_full_blocks K blocks
+        
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
+            start_m, seqlen_k, seqlen_q, dropout_p, philox_seed, philox_ptrs,
+            sd_mask_ptrs, dropout_mask_ptrs,
+            block_min,        # Start of range: 0
+            block_max,        # End of range: n_full_blocks * BLOCK_N
+            0,                # offs_n_causal: 0 (not needed for full blocks)
+            0,                # masked_blocks: 0 (we're only processing full blocks)
+            0,                # n_extra_tokens: 0 (no padding checks needed)
+            alibi_slope,
+            descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
+            False,            # IS_CAUSAL: False (disable causal masking)
+            BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
+            PRE_LOAD_V, 
+            False,            # MASK_STEPS: False (disable boundary checks)
+            ENABLE_DROPOUT, PADDED_HEAD,
+            ACTUAL_BLOCK_DMODEL, SM_SCALE, 
+            USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
+            RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
+        )
+    
+    # ========== CALL 2: Process MASKED K Blocks (Slow Path) ==========
+    if n_masked_blocks > 0:
+        """
+        Process K blocks that are MASKED blocks (need masking).
+        
+        These blocks either:
+        - Intersect with the causal diagonal (need causal masking)
+        - Are the last block with padding (need boundary checks)
+        
+        Loop will process K blocks: [n_full_blocks, n_visible_k_blocks)
+        
+        NOTE: SKIPPED K blocks are never reached because the loop stops
+        at n_visible_k_blocks, not total_k_blocks!
+        """
+        
+        # Advance pointers past the full blocks
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vk
         if USE_BIAS:
@@ -480,15 +606,48 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         if ENABLE_DROPOUT:
             dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
             philox_ptrs += n_full_blocks * BLOCK_N * stride_sn
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
-                                        start_m, seqlen_k, seqlen_q, dropout_p, philox_seed, philox_ptrs,
-                                        sd_mask_ptrs, dropout_mask_ptrs, block_min, block_max, offs_n_causal, masked_blocks,
-                                        n_extra_tokens, alibi_slope, descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
-                                        IS_CAUSAL, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
-                                        # _, MASK_STEPS, ...
-                                        PRE_LOAD_V, True, ENABLE_DROPOUT, PADDED_HEAD,
-                                        ACTUAL_BLOCK_DMODEL, SM_SCALE, USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE)
-    # epilogue
+        
+        # Calculate masking parameters
+        if IS_CAUSAL:
+            offs_n_causal = offs_n + causal_offset
+        else:
+            offs_n_causal = 0
+        
+        # Padding info for last block
+        n_extra_tokens = 0
+        if seqlen_k < BLOCK_N:
+            n_extra_tokens = BLOCK_N - seqlen_k
+        elif seqlen_k % BLOCK_N:
+            n_extra_tokens = seqlen_k % BLOCK_N
+        
+        # define the range for masked blocks
+        block_min = n_full_blocks * BLOCK_N           # Start after full blocks
+        block_max = n_visible_k_blocks * BLOCK_N      # End at last visible block
+        
+        acc, l_i, m_i = _attn_fwd_inner(
+            acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
+            start_m, seqlen_k, seqlen_q, dropout_p, philox_seed, philox_ptrs,
+            sd_mask_ptrs, dropout_mask_ptrs, 
+            block_min,        # Start of range: n_full_blocks * BLOCK_N
+            block_max,        # End of range: n_visible_k_blocks * BLOCK_N
+            offs_n_causal,    # Causal offset for masking
+            n_masked_blocks,  # Number of masked blocks being processed
+            n_extra_tokens,   # Padding tokens in last block
+            alibi_slope, 
+            descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
+            IS_CAUSAL,        # Use actual causal flag
+            BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
+            PRE_LOAD_V, 
+            True,             # MASK_STEPS: True (enable boundary checks)
+            ENABLE_DROPOUT, PADDED_HEAD,
+            ACTUAL_BLOCK_DMODEL, SM_SCALE, 
+            USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
+            RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
+        )
+
+    # ============================================================
+    #                        EPILOGUE
+    # ============================================================
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
