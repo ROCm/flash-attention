@@ -342,7 +342,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     This section classifies ALL K blocks that this program might need to examine.
     We determine:
     1. How many K blocks exist in total
-    2. Which K blocks are visible to this M block (not skipped)
+    2. Which K blocks are visible to this Q block (not skipped)
     3. Of the visible blocks, which are full vs masked
     """
     
@@ -370,7 +370,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         - SKIPPED: All positions in the block are above the diagonal
         """
         
-        # Calculate causal boundary for this M block
+        # Calculate causal boundary for this Q block
         causal_offset = seqlen_q - seqlen_k
         m_block_start = start_m * BLOCK_M
         m_block_end = min((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
@@ -380,13 +380,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         
         if first_visible_k_pos < 0:
             """
-            PROGRAM EARLY EXIT: All K blocks are SKIPPED blocks for this M block.
-            
-            Example: Program processing M block 0 with seqlen_q=32, seqlen_k=64
-            - This program handles queries 0-15
-            - Due to causal masking with offset -32, these queries can't see ANY keys
-            - ALL K blocks (0,1,2,3) are SKIPPED blocks
-            - Program should exit early
+            PROGRAM EARLY EXIT: All K blocks are SKIPPED blocks for this Q block.
             """
             program_early_exit = True
             n_visible_k_blocks = 0
@@ -405,13 +399,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             # Visible blocks: [0, last_visible_k_block]
             n_visible_k_blocks = min(last_visible_k_block + 1, total_k_blocks)
             n_skipped_blocks = total_k_blocks - n_visible_k_blocks
-            
-            """
-            Example: Program processing M block 1 (queries 16-31) with BLOCK_N=16
-            - Can see keys 0-31 (with appropriate offset)
-            - last_visible_k_block = 1 (K blocks 0 and 1)
-            - K blocks 2, 3, etc. are SKIPPED blocks
-            """
+
             
             # Of the visible blocks, which are FULL vs MASKED?
             """
@@ -433,14 +421,6 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             
             # The rest are full blocks
             n_full_blocks = n_visible_k_blocks - n_masked_blocks
-            
-            """
-            Example continued:
-            - n_visible_k_blocks = 2 (blocks 0, 1)
-            - n_masked_blocks = 1 (diagonal cuts through block 1)
-            - n_full_blocks = 1 (block 0 is fully below diagonal)
-            - n_skipped_blocks = total - visible = 2 (blocks 2, 3)
-            """
     
     else:
         # ========== NON-CAUSAL MODE: Classify K Blocks ==========
@@ -470,7 +450,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     
     if program_early_exit:
         """
-        This program's M block can't attend to ANY K blocks.
+        This program's Q block can't attend to ANY K blocks.
         All K blocks are SKIPPED blocks (above causal diagonal).
         
         No computation needed - just write zeros and exit.
@@ -689,7 +669,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         softmax_lse = tl.where(lse_mask, 0.0, softmax_lse)
 
     # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
-    # This is only true for the last M block. For others, overflow_size will be -ve
+    # This is only true for the last Q block. For others, overflow_size will be -ve
     overflow_size = end_m_idx - seqlen_q
     if overflow_size > 0:
         boundary = tl.full((BLOCK_M, ), BLOCK_M - overflow_size, dtype=tl.int32)
