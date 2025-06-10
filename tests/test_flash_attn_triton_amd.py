@@ -1143,7 +1143,7 @@ def test_flash_attn_output(
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
 
-    if DEBUG:
+    if True:
         print("out:", out)
         print("out_ref:", out_ref)
     # Check that FlashAttention's numerical error is at most twice the numerical error
