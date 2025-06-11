@@ -347,16 +347,6 @@ def attn_fwd_new(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     3. Of the visible blocks, which are full vs masked
     """
 
-    # calculate n_extra_tokens and is_modulo_mn as they're needed for classification
-    n_extra_tokens = 0
-    if seqlen_k < BLOCK_N:
-        n_extra_tokens = BLOCK_N - seqlen_k
-    elif seqlen_k % BLOCK_N:
-        n_extra_tokens = seqlen_k % BLOCK_N
-    
-    padded_block_k = n_extra_tokens != 0
-    is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
-    
     # Total K blocks in the key sequence
     total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
     
@@ -371,6 +361,12 @@ def attn_fwd_new(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     
     # Causal-specific values
     causal_offset = 0
+    if seqlen_k < BLOCK_N:
+        n_extra_tokens = BLOCK_N - seqlen_k
+    elif seqlen_k % BLOCK_N:
+        n_extra_tokens = seqlen_k % BLOCK_N
+    else:
+        n_extra_tokens = 0  
     
     if IS_CAUSAL:
         # ========== CAUSAL MODE: Classify K Blocks ==========
@@ -419,6 +415,9 @@ def attn_fwd_new(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             There are always at least BLOCK_M // BLOCK_N masked blocks.
             Additionally there might be one more due to dissimilar seqlens.
             """
+            # calculate is_modulo_mn
+            padded_block_k = n_extra_tokens != 0
+            is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
             
             # Count masked blocks
             n_masked_blocks = BLOCK_M // BLOCK_N + (1 if not is_modulo_mn else 0)
