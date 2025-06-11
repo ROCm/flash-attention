@@ -1,6 +1,6 @@
 import torch
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 from .utils import DEBUG, compute_alibi_tensor_ref
 
 DEBUG_CORE = False
@@ -376,8 +376,6 @@ def attention_varlen_forward_pytorch_ref_impl(
 
     return o, softmax_lse, sd_mask
 
-
-
 def attention_forward_pytorch_ref_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -439,3 +437,21 @@ def attention_forward_pytorch_ref_impl(
     out.copy_(o_ref.to(out.dtype))
     
     return softmax_lse_ref, sd_mask_ref
+
+def attention_decode_forward_ref_impl(
+        q: torch.Tensor, 
+        k_cache: torch.Tensor, 
+        v_cache: torch.Tensor,
+        k_new: Optional[torch.Tensor],
+        v_new: Optional[torch.Tensor],
+        out: torch.Tensor,
+        sm_scale: float, 
+        causal: bool,
+        window_size_left: int, 
+        window_size_right: int,
+        alibi_slopes: Optional[torch.Tensor], 
+        layout: Literal["bshd"], 
+        cache_seqlens: Optional[Union[(int, torch.Tensor)]], 
+        cache_batch_idx: Optional[torch.Tensor],
+):
+    pass

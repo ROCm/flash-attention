@@ -6,7 +6,7 @@ from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_prefill_fused import _flash_attn_backward as attention_prefill_backward_triton_fused_impl
 from .bwd_prefill_onekernel import attention_prefill_backward_triton_split_oneKernel_impl
 from .fwd_decode import attention_decode_forward_triton_impl
-from .fwd_ref import attention_forward_pytorch_ref_impl
+from .fwd_ref import attention_forward_pytorch_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData, get_shapes_from_layout, is_fp8
 from einops import rearrange, repeat
@@ -880,8 +880,29 @@ def fwd_kvcache(
         q, k_new = q_ro.to(q.dtype), k_ro.to(q.dtype)
 
     # launch kernel
-    DECODE_KERNEL= True # os.environ.get('DECODE_KERNEL', '0').lower() in ('1', 'true', 'yes')
-    if DECODE_KERNEL:
+    if USE_REF:
+        if DEBUG:
+            print("Using reference implementation")
+        softmax_lse_ref = attention_decode_forward_ref_impl(
+                q,
+                k_cache,
+                v_cache,
+                k_new,
+                v_new,
+                out,
+                metadata.sm_scale,
+                metadata.causal,
+                window_size_left, 
+                window_size_right,
+                metadata.alibi_slopes,
+                metadata.layout,
+                metadata.cache_seqlens,
+                metadata.cache_batch_idx,
+            )
+        softmax_lse=softmax_lse_ref
+    else:
+        if DEBUG:
+            print("Using Triton implementation") 
         softmax_lse_triton = attention_decode_forward_triton_impl(
             q,
             k_cache,
@@ -891,40 +912,14 @@ def fwd_kvcache(
             out,
             metadata.sm_scale,
             metadata.causal,
+            window_size_left, 
+            window_size_right,
             metadata.alibi_slopes,
             metadata.layout,
             metadata.cache_seqlens,
             metadata.cache_batch_idx,
         )
-    else:
-        softmax_lse_triton, sd_mask_triton = attention_prefill_forward_triton_impl(
-                                                q,
-                                                k_cache,
-                                                v_cache,
-                                                out,
-                                                metadata.sm_scale,
-                                                metadata.alibi_slopes,
-                                                metadata.causal,
-                                                window_size_left, 
-                                                window_size_right,
-                                                None,
-                                                metadata.layout,
-                                                metadata.cu_seqlens_q,
-                                                metadata.cu_seqlens_k,
-                                                metadata.max_seqlens_q,
-                                                metadata.max_seqlens_k,
-                                                metadata.cache_seqlens,
-                                                metadata.cache_batch_idx,
-                                                metadata.dropout_p,
-                                                metadata.philox_seed,
-                                                metadata.philox_offset,
-                                                metadata.return_scores,
-                                                USE_EXP2,
-                                                None,
-                                                None,
-                                                None,
-                                                None)
-    softmax_lse = softmax_lse_triton
+        softmax_lse = softmax_lse_triton
     
     if DEBUG:
         print("out:", out, out.shape)
