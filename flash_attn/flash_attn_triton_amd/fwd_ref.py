@@ -55,12 +55,18 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size_left,
     L_q, L_k = q.shape[1], k.shape[1]
     row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
     col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
+    
+    # Calculate offset for when seqlen_q != seqlen_k
+    # This offset aligns query positions to key positions
+    # When L_q < L_k, offset is positive, meaning query i maps to key position (i + offset)
+    # This is consistent with construct_local_mask in the tests which uses (sk - sq)
+    col_offset = L_k - L_q
 
     mask_applied = False
     if causal and (window_size_left, window_size_right) == (-1, -1):
-        # Pure causal: equivalent to (-1, 0)
-        col_offset = L_q - L_k
-        mask = row_idx >= (col_offset + col_idx)
+        # Pure causal: ensure query doesn't attend to future keys
+        # With offset, query i can attend to keys up to position (i + col_offset)
+        mask = row_idx >= (col_idx - col_offset)
         mask_applied = True
         if DEBUG_CORE:
             print("causal_mask:", mask)
@@ -72,25 +78,26 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size_left,
             window_size_right = -1  # No right limit
         
         if causal:
-            # Causal + sliding window: ensure we don't attend to futur
+            # Causal + sliding window: ensure we don't attend to future
             window_size_right = min(window_size_right, 0) if window_size_right != -1 else 0
         
         # Create sliding window mask
-        # Each query at position i attends to keys in [i - left, i + right]
+        # Each query at position i attends to keys in [i + offset - left, i + offset + right]
         if window_size_left == -1 and window_size_right == -1:
             # No window restriction
             mask = torch.ones((L_q, L_k), dtype=torch.bool, device=q.device)
         else:
             mask = torch.ones((L_q, L_k), dtype=torch.bool, device=q.device)
             if window_size_left != -1:
-                mask = mask & (col_idx >= (row_idx - window_size_left))
+                # Each query at position i attends to keys from position (i - left) accounting for offset
+                mask = mask & (col_idx >= (row_idx + col_offset - window_size_left))
             if window_size_right != -1:
-                mask = mask & (col_idx <= (row_idx + window_size_right))
+                # Each query at position i attends to keys up to position (i + right) accounting for offset
+                mask = mask & (col_idx <= (row_idx + col_offset + window_size_right))
         
         # Apply causal constraint
         if causal:
-            col_offset = L_q - L_k
-            causal_mask = row_idx >= (col_offset + col_idx)
+            causal_mask = row_idx >= (col_idx - col_offset)
             mask = mask & causal_mask
         
         mask_applied = True
