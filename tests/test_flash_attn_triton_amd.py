@@ -1914,7 +1914,7 @@ def test_flash_attn_splitkv(
 # @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
-@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])

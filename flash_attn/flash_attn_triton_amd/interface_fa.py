@@ -821,8 +821,11 @@ def fwd_kvcache(
     metadata.layout = "bshd"
     metadata.max_seqlens_q = q.shape[1]
     metadata.max_seqlens_k = k_cache.shape[1]
-    metadata.cache_seqlens = cache_seqlens
     metadata.cache_batch_idx = cache_batch_idx
+    if isinstance(cache_seqlens, int):
+        metadata.cache_seqlens = torch.tensor(cache_seqlens, device=q.device)
+    else:
+        metadata.cache_seqlens = cache_seqlens
 
     k_new = k
     v_new = v

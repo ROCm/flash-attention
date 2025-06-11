@@ -42,7 +42,7 @@ class MetaData():
     num_contexts = 0
     varlen: bool = False
     layout: Optional[Literal["bshd", "bhsd", "thd"]] = None
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None
+    cache_seqlens: Optional[torch.Tensor] = None
     cache_batch_idx = None
     packing: Optional[bool] = None
     return_scores: bool = False

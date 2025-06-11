@@ -574,7 +574,7 @@ def attention_decode_forward_triton_impl(
         window_size_right: int,
         alibi_slopes: Optional[torch.Tensor], 
         layout: Literal["bshd"], 
-        cache_seqlens: Optional[Union[(int, torch.Tensor)]], 
+        cache_seqlens: Optional[torch.Tensor], 
         cache_batch_idx: Optional[torch.Tensor],
 ):
     # triton configs
@@ -586,7 +586,7 @@ def attention_decode_forward_triton_impl(
         
     # kernel_configs
     is_new_kv = True if k_new is not None and v_new is not None else False
-    use_alibi = False if alibi_slopes is None else True
+    use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False,  alibi_slopes.stride() if alibi_slopes is not None else (None, None)
     use_cache_seqlens = cache_seqlens is not None
     SPLIT_K = None
     NUM_QUANT_GROUPS = 1
@@ -602,11 +602,6 @@ def attention_decode_forward_triton_impl(
         ( _, seqlen_kn, nheads_kn, dim_kn), (stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d) = (None, None, None, None), (None, None, None, None)
         (_, seqlen_vn, nheads_vn, dim_vn), (stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d) = (None, None, None, None), (None, None, None, None)
     (_, seqlen_o, nheads_o, dim_o), (stride_oz, stride_oh, stride_om, stride_od) = get_shape_and_strides_from_layout(out, layout)
-    if use_alibi:
-        stride_az, stride_ah = alibi_slopes.stride()
-    else:
-        stride_az, stride_ah = (None, None)
-
     assert dim_q == dim_kc == dim_vc, f"Dimensions must match: {dim_q}, {dim_kc}, {dim_vc}"
 
     # add extra information needed by the kernels

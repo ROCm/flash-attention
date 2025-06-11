@@ -451,7 +451,137 @@ def attention_decode_forward_ref_impl(
         window_size_right: int,
         alibi_slopes: Optional[torch.Tensor], 
         layout: Literal["bshd"], 
-        cache_seqlens: Optional[Union[(int, torch.Tensor)]], 
+        cache_seqlens: Optional[torch.Tensor], 
         cache_batch_idx: Optional[torch.Tensor],
 ):
-    pass
+    """Compute reference output for decode attention using PyTorch's built-in functions"""
+    
+    # get batch size before any layout conversion
+    batch_size = q.shape[0]
+    
+    # handle cache_batch_idx
+    if cache_batch_idx is not None:
+        # remap batch indices for cache access
+        batch_indices = cache_batch_idx
+    else:
+        batch_indices = torch.arange(batch_size, device=q.device)
+    
+    # copy new keys and values into cache if provided (before any layout conversion)
+    if k_new is not None and v_new is not None:
+        _, seq_len_new, _, _ = k_new.shape  # shape is [batch, seq_len, nheads, head_dim] for bshd layout
+        
+        for b in range(batch_size):
+            cache_idx = batch_indices[b].item() if torch.is_tensor(batch_indices) else batch_indices
+            
+            # determine where to place new k/v in cache
+            if cache_seqlens is not None:
+                if torch.is_tensor(cache_seqlens):
+                    start_pos = cache_seqlens[b].item()
+                else:
+                    start_pos = cache_seqlens
+            else:
+                # if no cache_seqlens, assume we're filling from the beginning
+                start_pos = 0
+            
+            end_pos = start_pos + seq_len_new
+            
+            # copy new keys and values into cache (both are in bshd layout)
+            k_cache[cache_idx, start_pos:end_pos, :, :] = k_new[b, :, :, :]
+            v_cache[cache_idx, start_pos:end_pos, :, :] = v_new[b, :, :, :]
+    
+    # ensure the layout is 'bhsd'
+    if layout == "bshd":
+        q = q.transpose(1, 2).contiguous()
+        k_cache = k_cache.transpose(1, 2).contiguous()
+        v_cache = v_cache.transpose(1, 2).contiguous()
+    elif layout != "bhsd":
+        raise ValueError(f"Unknown layout {layout}")
+    
+    # prepare tensors
+    batch_size_q, nheads_q, seq_len_q, head_dim = q.shape
+    batch_size_cache, nheads_k, max_cache_len, head_dim_k = k_cache.shape
+    _, nheads_v, _, head_dim_v = v_cache.shape
+    
+    # validate dimensions
+    assert head_dim == head_dim_k == head_dim_v, f"Head dimensions must match: {head_dim}, {head_dim_k}, {head_dim_v}"
+    
+    # handle MQA/GQA
+    group_size = nheads_q // nheads_k
+    if nheads_q % nheads_k != 0:
+        raise ValueError("nheads_q must be divisible by nheads_k")
+    
+    # handle cache_batch_idx
+    if cache_batch_idx is not None:
+        # remap batch indices for cache access
+        batch_indices = cache_batch_idx
+    else:
+        batch_indices = torch.arange(batch_size, device=q.device)
+    
+    # prepare outputs
+    o = torch.zeros_like(q)
+    softmax_lse = torch.zeros((batch_size, nheads_q, seq_len_q), dtype=torch.float32, device=q.device)
+    
+    # process each batch element
+    for b in range(batch_size):
+        cache_idx = batch_indices[b].item() if torch.is_tensor(batch_indices) else batch_indices
+        
+        # determine valid cache length for this batch element
+        if cache_seqlens is not None:
+            if torch.is_tensor(cache_seqlens):
+                cache_len = cache_seqlens[b].item()
+                if k_new is not None:
+                    # if we added new keys, include them in the length
+                    _, seq_len_new, _, _ = k_new.shape  # bshd layout
+                    cache_len += seq_len_new
+            else:
+                cache_len = cache_seqlens
+                if k_new is not None:
+                    _, seq_len_new, _, _ = k_new.shape  # bshd layout
+                    cache_len += seq_len_new
+        else:
+            cache_len = max_cache_len
+        
+        # extract relevant portions of k and v from cache
+        k_b = k_cache[cache_idx, :, :cache_len, :]  # [nheads_k, cache_len, head_dim]
+        v_b = v_cache[cache_idx, :, :cache_len, :]  # [nheads_v, cache_len, head_dim]
+        q_b = q[b:b+1, :, :, :]  # [1, nheads_q, 1, head_dim]
+        
+        # handle MQA/GQA by expanding k and v
+        if group_size != 1:
+            # expand k and v to match q's number of heads
+            k_b = k_b.unsqueeze(1).expand(-1, group_size, -1, -1)  # [nheads_k, group_size, cache_len, head_dim]
+            k_b = k_b.reshape(nheads_q, cache_len, head_dim)  # [nheads_q, cache_len, head_dim]
+            
+            v_b = v_b.unsqueeze(1).expand(-1, group_size, -1, -1)  # [nheads_v, group_size, cache_len, head_dim]
+            v_b = v_b.reshape(nheads_q, cache_len, head_dim)  # [nheads_q, cache_len, head_dim]
+        
+        # reshape for attention_forward_core_ref_impl
+        q_b = q_b.reshape(nheads_q, seq_len_q, head_dim)
+        
+        # handle alibi slopes for this batch
+        alibi_slopes_b = None
+        if alibi_slopes is not None:
+            if alibi_slopes.dim() == 2:
+                alibi_slopes_b = alibi_slopes[b]
+            else:
+                alibi_slopes_b = alibi_slopes
+        
+        # call core attention function
+        o_b, softmax_lse_b, _ = attention_forward_core_ref_impl(
+            q_b, k_b, v_b, sm_scale, causal, window_size_left, window_size_right,
+            dropout_p=0.0, philox_seed=None, philox_offset=None, 
+            alibi_slopes=alibi_slopes_b, use_exp2=True
+        )
+        
+        # store outputs
+        o[b, :, :, :] = o_b.reshape(nheads_q, seq_len_q, head_dim)
+        softmax_lse[b, :, :] = softmax_lse_b.reshape(nheads_q, seq_len_q)
+    
+    # restore original layout if necessary
+    if layout == "bshd":
+        o = o.transpose(1, 2)
+    
+    # copy output to the provided tensor
+    out.copy_(o.to(out.dtype))
+    
+    return softmax_lse
