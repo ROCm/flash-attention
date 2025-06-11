@@ -359,8 +359,9 @@ def attn_fwd_new(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     # Program decision
     program_early_exit = False  # Should this program exit without computation?
     
-    # Causal-specific values
-    causal_offset = 0
+    # Masking related values
+    seqlen_delta_qk = seqlen_q - seqlen_k
+    # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
     elif seqlen_k % BLOCK_N:
@@ -378,13 +379,12 @@ def attn_fwd_new(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         """
 
         # Calculate causal boundary for this Q block
-        causal_offset = seqlen_q - seqlen_k
         m_block_start = start_m * BLOCK_M
         m_block_end = min((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
         
         # First, check if this program can see ANY K blocks
-        first_visible_k_pos = m_block_start - causal_offset
-        last_visible_k_pos = m_block_end - causal_offset
+        first_visible_k_pos = m_block_start - seqlen_delta_qk
+        last_visible_k_pos = m_block_end - seqlen_delta_qk
         
         if last_visible_k_pos < 0:
             """
@@ -401,7 +401,7 @@ def attn_fwd_new(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             """
             
             # Which K blocks are visible (not skipped)?
-            last_visible_k_pos = m_block_end - causal_offset
+            last_visible_k_pos = m_block_end - seqlen_delta_qk
             last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
             
             # Visible blocks: [0, last_visible_k_block]
@@ -592,7 +592,7 @@ def attn_fwd_new(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         
         # Calculate masking parameters
         if IS_CAUSAL:
-            offs_n_causal = offs_n + causal_offset
+            offs_n_causal = offs_n + seqlen_delta_qk
         else:
             offs_n_causal = 0
         
