@@ -1926,23 +1926,23 @@ def save_tensor_to_csv(tensor, filename, decimal_places=2):
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if skip_bfloat16 else [torch.float16, torch.bfloat16]))
 @pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.parametrize("num_splits", [0])
+@pytest.mark.parametrize("num_splits", [1, 0])
 # @pytest.mark.parametrize("num_splits", [1])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("new_kv", [False])
+@pytest.mark.parametrize("new_kv", [False, True])
 # @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("alibi", [False])
 # @pytest.mark.parametrize("alibi", [False])
-@pytest.mark.parametrize("local", [True])
+@pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
+@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
-@pytest.mark.parametrize("rotary_interleaved", [False])
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
 # @pytest.mark.parametrize("rotary_interleaved", [False])
-@pytest.mark.parametrize("rotary_fraction", [0.0])
+@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("paged_kv_block_size", [None])
 # @pytest.mark.parametrize("paged_kv_block_size", [256, 512])
@@ -1951,7 +1951,7 @@ def save_tensor_to_csv(tensor, filename, decimal_places=2):
 # @pytest.mark.parametrize("has_leftpad", [True])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("d", [32])
+@pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
@@ -1959,17 +1959,17 @@ def save_tensor_to_csv(tensor, filename, decimal_places=2):
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # (1, 128),
-        # (1, 339),
-        # (3, 1024),
-        # (64, 800),
-        (64, 256), # fail
-        # (3, 799),
-        # (64, 2048),
-        # (16, 20000),
-        # (1, 128 * 1024),
-        # (16, 128 * 1024),
-        # (128, 128), # fail
+        (1, 128),
+        (1, 339),
+        (3, 1024),
+        (64, 800),
+        (64, 256),
+        (3, 799),
+        (64, 2048),
+        (16, 20000),
+        (1, 128 * 1024),
+        (16, 128 * 1024),
+        (128, 128),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -1991,7 +1991,7 @@ def test_flash_attn_kvcache(
     num_splits,
     dtype,
 ):
-    DEBUG = True
+    DEBUG = False
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -2226,8 +2226,8 @@ def test_flash_attn_kvcache(
     if DEBUG:
         print("out:", out, out.shape)
         print("out_ref:", out_ref, out_ref.shape)
-        save_tensor_to_csv(out, "out.csv")
-        save_tensor_to_csv(out_ref, "out_ref.csv")
+        # save_tensor_to_csv(out, "out.csv")
+        # save_tensor_to_csv(out_ref, "out_ref.csv")
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 

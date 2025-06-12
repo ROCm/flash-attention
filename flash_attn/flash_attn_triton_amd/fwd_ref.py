@@ -5,7 +5,12 @@ from .utils import DEBUG, compute_alibi_tensor_ref
 
 DEBUG_CORE = False
 
-def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size_left, window_size_right, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):
+def attention_forward_core_ref_impl(
+    q, k, v, sm_scale, causal, window_size_left, window_size_right, 
+    dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2,
+    cache_seqlens=None, 
+    max_cache_len=None
+):
     if DEBUG_CORE:
         print()
         print("attention_forward_core_ref_impl")
@@ -20,6 +25,8 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size_left,
         print("philox_seed:", philox_seed)
         print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
+        print("cache_seqlens:", cache_seqlens)
+        print("max_cache_len:", max_cache_len)
 
     # cast to float32
     q = q.to(torch.float32)
@@ -56,11 +63,24 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size_left,
     row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
     col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
     
-    # Calculate offset for when seqlen_q != seqlen_k
-    # This offset aligns query positions to key positions
-    # When L_q < L_k, offset is positive, meaning query i maps to key position (i + offset)
-    # This is consistent with construct_local_mask in the tests which uses (sk - sq)
-    col_offset = L_k - L_q
+    if cache_seqlens is not None:
+        # We're in decode mode with a KV cache
+        # k and v are full allocated size, but only cache_seqlens positions are valid
+        
+        # Create a mask for valid cache positions
+        cache_mask = col_idx < cache_seqlens
+        
+        # Use cache_seqlens for offset calculation to match test's construct_local_mask
+        # which uses key_padding_mask.sum() as the sequence length
+        col_offset = cache_seqlens - L_q
+        
+        if DEBUG_CORE:
+            print(f"Cache mode: valid_len={cache_seqlens}, L_k={L_k}")
+            print(f"Using col_offset={col_offset} based on valid cache length")
+    else:
+        # Standard mode
+        col_offset = L_k - L_q
+        cache_mask = None
 
     mask_applied = False
     if causal and (window_size_left, window_size_right) == (-1, -1):
@@ -72,10 +92,10 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size_left,
             print("causal_mask:", mask)
     elif (window_size_left, window_size_right) != (-1, -1):
         # Handle the case where window sizes exceed sequence length
-        if window_size_left >= L_k:
-            window_size_left = -1  # No left limit
-        if window_size_right >= L_k:
-            window_size_right = -1  # No right limit
+        if window_size_left >= max_cache_len if max_cache_len else L_k:
+            window_size_left = -1
+        if window_size_right >= max_cache_len if max_cache_len else L_k:
+            window_size_right = -1
         
         if causal:
             # Causal + sliding window: ensure we don't attend to future
@@ -103,6 +123,14 @@ def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, window_size_left,
         mask_applied = True
         if DEBUG_CORE:
             print(f"sliding_window_mask (left={window_size_left}, right={window_size_right}):", mask)
+        
+    # Apply cache mask if needed
+    if cache_mask is not None:
+        if mask_applied:
+            mask = mask & cache_mask
+        else:
+            mask = cache_mask
+            mask_applied = True
     
     # Apply the mask if created
     if mask_applied:
@@ -530,30 +558,30 @@ def attention_decode_forward_ref_impl(
             if torch.is_tensor(cache_seqlens):
                 cache_len = cache_seqlens[b].item()
                 if k_new is not None:
-                    # if we added new keys, include them in the length
-                    _, seq_len_new, _, _ = k_new.shape  # bshd layout
+                    _, seq_len_new, _, _ = k_new.shape
                     cache_len += seq_len_new
             else:
                 cache_len = cache_seqlens
                 if k_new is not None:
-                    _, seq_len_new, _, _ = k_new.shape  # bshd layout
+                    _, seq_len_new, _, _ = k_new.shape
                     cache_len += seq_len_new
         else:
             cache_len = max_cache_len
         
-        # extract relevant portions of k and v from cache
-        k_b = k_cache[cache_idx, :, :cache_len, :]  # [nheads_k, cache_len, head_dim]
-        v_b = v_cache[cache_idx, :, :cache_len, :]  # [nheads_v, cache_len, head_dim]
-        q_b = q[b:b+1, :, :, :]  # [1, nheads_q, 1, head_dim]
+        # CHANGE: Extract the full cache, not just valid portion
+        # This matches what the test does - it uses full k_cache_rep/v_cache_rep
+        k_b = k_cache[cache_idx, :, :, :]  # [nheads_k, max_cache_len, head_dim]
+        v_b = v_cache[cache_idx, :, :, :]  # [nheads_v, max_cache_len, head_dim]
+        q_b = q[b:b+1, :, :, :]  # [1, nheads_q, seq_len_q, head_dim]
         
         # handle MQA/GQA by expanding k and v
         if group_size != 1:
             # expand k and v to match q's number of heads
-            k_b = k_b.unsqueeze(1).expand(-1, group_size, -1, -1)  # [nheads_k, group_size, cache_len, head_dim]
-            k_b = k_b.reshape(nheads_q, cache_len, head_dim)  # [nheads_q, cache_len, head_dim]
+            k_b = k_b.unsqueeze(1).expand(-1, group_size, -1, -1)
+            k_b = k_b.reshape(nheads_q, max_cache_len, head_dim)
             
-            v_b = v_b.unsqueeze(1).expand(-1, group_size, -1, -1)  # [nheads_v, group_size, cache_len, head_dim]
-            v_b = v_b.reshape(nheads_q, cache_len, head_dim)  # [nheads_q, cache_len, head_dim]
+            v_b = v_b.unsqueeze(1).expand(-1, group_size, -1, -1)
+            v_b = v_b.reshape(nheads_q, max_cache_len, head_dim)
         
         # reshape for attention_forward_core_ref_impl
         q_b = q_b.reshape(nheads_q, seq_len_q, head_dim)
@@ -566,11 +594,13 @@ def attention_decode_forward_ref_impl(
             else:
                 alibi_slopes_b = alibi_slopes
         
-        # call core attention function
+        # call core attention function with cache information
         o_b, softmax_lse_b, _ = attention_forward_core_ref_impl(
             q_b, k_b, v_b, sm_scale, causal, window_size_left, window_size_right,
             dropout_p=0.0, philox_seed=None, philox_offset=None, 
-            alibi_slopes=alibi_slopes_b, use_exp2=True
+            alibi_slopes=alibi_slopes_b, use_exp2=True,
+            cache_seqlens=cache_len,      # Pass valid cache length
+            max_cache_len=max_cache_len   # Not needed now since k_b is full size
         )
         
         # store outputs
