@@ -46,14 +46,48 @@ def attention_forward_core_ref_impl(
     # Apply ALiBi if slopes are provided
     if alibi_slopes is not None:
         L_q, L_k = q.shape[1], k.shape[1]
-        if DEBUG_CORE:
-            print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
-        alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
-        if DEBUG_CORE:
-            print("alibi_bias:", alibi_bias, alibi_bias.shape)
-        alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
-        if DEBUG_CORE:
-            print("alibi_bias_flat:", alibi_bias, alibi_bias.shape)
+        
+        if cache_seqlens is not None:
+            # DECODE MODE: Special ALiBi handling
+            # In decode mode, k has shape [nheads, max_cache_len, head_dim]
+            # but only cache_seqlens positions are valid
+            
+            # The test's attn_bias_from_alibi_slopes uses this formula:
+            # relative_pos = torch.abs(row_idx + sk - sq - col_idx)
+            # where sk = actual valid key length, sq = query length
+            
+            row_idx = torch.arange(L_q, device=q.device, dtype=torch.float32).unsqueeze(1)
+            col_idx = torch.arange(L_k, device=q.device, dtype=torch.float32).unsqueeze(0)
+            
+            # Compute relative positions
+            # cache_seqlens is the actual number of valid keys (sk in the test)
+            # L_q is the query sequence length (sq in the test)
+            relative_pos = torch.abs(row_idx + cache_seqlens - L_q - col_idx)
+            
+            # Apply slopes
+            if alibi_slopes.dim() == 1:
+                # Shape: [nheads] -> [nheads, 1, 1]
+                alibi_slopes_expanded = alibi_slopes.view(-1, 1, 1)
+            else:
+                # Already has batch dimension
+                alibi_slopes_expanded = alibi_slopes
+            
+            alibi_bias = -alibi_slopes_expanded * relative_pos
+            
+            if DEBUG_CORE:
+                print(f"Decode ALiBi: cache_seqlens={cache_seqlens}, L_q={L_q}, L_k={L_k}")
+                print(f"relative_pos shape: {relative_pos.shape}")
+                print(f"alibi_bias shape: {alibi_bias.shape}")
+        else:
+            if DEBUG_CORE:
+                print("alibi_slopes:", alibi_slopes, alibi_slopes.shape)
+            alibi_bias = compute_alibi_tensor_ref(alibi_slopes, L_q, L_k)
+            if DEBUG_CORE:
+                print("alibi_bias:", alibi_bias, alibi_bias.shape)
+            alibi_bias = alibi_bias.reshape(-1, L_q, L_k)
+            if DEBUG_CORE:
+                print("alibi_bias_flat:", alibi_bias, alibi_bias.shape)
+
         attention_scaled_scores = attention_scaled_scores + alibi_bias
         if DEBUG_CORE:
             print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
