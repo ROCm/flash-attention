@@ -6,7 +6,8 @@ import random
 import functools
 import triton
 import triton.language as tl
-from typing import Literal, Optional, Union
+import numpy as np
+from typing import Literal, Optional
 
 # -------------------------------
 # Gloabl Variables
@@ -693,6 +694,25 @@ def compute_alibi_tensor_ref(alibi_slopes, seqlen_q, seqlen_k):
     k_idx = torch.arange(seqlen_k, dtype=torch.int32, device="cuda").unsqueeze(0)  # (1, N_CTX_K)
     relative_pos = torch.abs(q_idx + seqlen_k - seqlen_q - k_idx)  # (N_CTX_Q, N_CTX_K)
     return -1 * alibi_slopes.unsqueeze(-1).unsqueeze(-1) * relative_pos  # (Z, H, N_CTX_Q, N_CTX_K)
+
+def save_tensor_to_csv(tensor, filename, decimal_places=2):
+    """
+    save a 2d tensor to csv file
+    
+    args:
+        tensor: torch tensor of shape [rows, cols]
+        filename: output csv filename
+        decimal_places: number of decimal places (default: 2)
+    """
+    # ensure tensor is 2d
+    if tensor.ndim != 2:
+        raise ValueError(f"tensor must be 2d, got shape {tensor.shape}")
+    
+    # save to csv using numpy
+    np.savetxt(filename, 
+               tensor.cpu().numpy(), 
+               delimiter=',',
+               fmt=f'%.{decimal_places}f')
 
 # -------------------------------
 # Dropouts

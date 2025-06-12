@@ -16,7 +16,7 @@ from flash_attn import (
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, generate_bshd_tensor, is_hip, is_rdna
+from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, generate_bshd_tensor, is_hip, is_rdna, save_tensor_to_csv
 
 MAX_HEADDIM_SM8x = 192
 
@@ -1902,26 +1902,6 @@ def test_flash_attn_splitkv(
     assert (dq - dq_ref).abs().max().item() <= mult * (dq_pt - dq_ref).abs().max().item() + 2e-4
     assert (dk - dk_ref).abs().max().item() <= mult * (dk_pt - dk_ref).abs().max().item() + 2e-4
     assert (dv - dv_ref).abs().max().item() <= mult * (dv_pt - dv_ref).abs().max().item() + 2e-4
-
-
-def save_tensor_to_csv(tensor, filename, decimal_places=2):
-    import numpy as np
-    """
-    save a 4d tensor of shape [1, 64, 1, 32] to csv file of shape [64, 32]
-    
-    args:
-        tensor: torch tensor of shape [1, 64, 1, 32]
-        filename: output csv filename
-        decimal_places: number of decimal places (default: 6)
-    """
-    # squeeze out singleton dimensions
-    tensor_2d = tensor.squeeze()  # shape: [64, 32]
-    
-    # save to csv using numpy
-    np.savetxt(filename, 
-               tensor_2d.cpu().numpy(), 
-               delimiter=',',
-               fmt=f'%.{decimal_places}f')
 
 
 # @pytest.mark.parametrize("dtype", ([torch.float16] if skip_bfloat16 else [torch.float16, torch.bfloat16]))

@@ -8,8 +8,7 @@ DEBUG_CORE = False
 def attention_forward_core_ref_impl(
     q, k, v, sm_scale, causal, window_size_left, window_size_right, 
     dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2,
-    cache_seqlens=None, 
-    max_cache_len=None
+    cache_seqlens=None
 ):
     if DEBUG_CORE:
         print()
@@ -26,12 +25,14 @@ def attention_forward_core_ref_impl(
         print("philox_offset:", philox_offset)
         print("use_exp2:", use_exp2)
         print("cache_seqlens:", cache_seqlens)
-        print("max_cache_len:", max_cache_len)
 
     # cast to float32
     q = q.to(torch.float32)
     k = k.to(torch.float32)
     v = v.to(torch.float32)
+
+    # get seqlens
+    L_q, L_k = q.shape[1], k.shape[1]
     
     # Compute attention scores
     attention_scores = torch.matmul(q, k.transpose(-2, -1))
@@ -45,8 +46,6 @@ def attention_forward_core_ref_impl(
 
     # Apply ALiBi if slopes are provided
     if alibi_slopes is not None:
-        L_q, L_k = q.shape[1], k.shape[1]
-        
         if cache_seqlens is not None:
             # DECODE MODE: Special ALiBi handling
             # In decode mode, k has shape [nheads, max_cache_len, head_dim]
@@ -93,7 +92,6 @@ def attention_forward_core_ref_impl(
             print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
 
     # Apply masks
-    L_q, L_k = q.shape[1], k.shape[1]
     row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
     col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
     
@@ -112,7 +110,10 @@ def attention_forward_core_ref_impl(
             print(f"Cache mode: valid_len={cache_seqlens}, L_k={L_k}")
             print(f"Using col_offset={col_offset} based on valid cache length")
     else:
-        # Standard mode
+        # Calculate offset for when seqlen_q != seqlen_k
+        # This offset aligns query positions to key positions
+        # When L_q < L_k, offset is positive, meaning query i maps to key position (i + offset)
+        # This is consistent with construct_local_mask in the tests which uses (sk - sq)
         col_offset = L_k - L_q
         cache_mask = None
 
@@ -126,10 +127,10 @@ def attention_forward_core_ref_impl(
             print("causal_mask:", mask)
     elif (window_size_left, window_size_right) != (-1, -1):
         # Handle the case where window sizes exceed sequence length
-        if window_size_left >= max_cache_len if max_cache_len else L_k:
-            window_size_left = -1
-        if window_size_right >= max_cache_len if max_cache_len else L_k:
-            window_size_right = -1
+        if window_size_left >= L_k:
+            window_size_left = -1  # No left limit
+        if window_size_right >= L_k:
+            window_size_right = -1  # No right limit
         
         if causal:
             # Causal + sliding window: ensure we don't attend to future
@@ -634,7 +635,6 @@ def attention_decode_forward_ref_impl(
             dropout_p=0.0, philox_seed=None, philox_offset=None, 
             alibi_slopes=alibi_slopes_b, use_exp2=True,
             cache_seqlens=cache_len,      # Pass valid cache length
-            max_cache_len=max_cache_len   # Not needed now since k_b is full size
         )
         
         # store outputs
