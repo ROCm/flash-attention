@@ -813,6 +813,147 @@ def attention_prefill_forward_triton_impl(
     return softmax_lse, sd_mask if return_softmax else None 
 
 
+
+
+@triton.jit
+def _attn_fwd_inner_old(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn, start_m,
+                    actual_seqlen_k, actual_seqlen_q, dropout_p, philox_seed, philox_ptrs, sd_mask_ptrs, dropout_mask_ptrs,
+                    block_min, block_max, offs_n_causal, masked_blocks, n_extra_tokens, alibi_slope,
+                    descale_q, descale_k, descale_v, IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr,
+                    IS_CAUSAL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,
+                    OFFS_M: tl.constexpr, OFFS_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, MASK_STEPS: tl.constexpr,
+                    ENABLE_DROPOUT: tl.constexpr, PADDED_HEAD: tl.constexpr,
+                    ACTUAL_BLOCK_DMODEL: tl.constexpr, SM_SCALE: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr,
+                    RETURN_SCORES: tl.constexpr, ACCUMULATOR_TYPE):
+    if USE_EXP2:
+        RCP_LN2: tl.constexpr = 1.4426950408889634
+    
+    # loop over k, v, and update accumulator
+    for start_n in range(block_min, block_max, BLOCK_N):
+        # For padded blocks, we will overrun the tensor size if
+        # we load all BLOCK_N. For others, the blocks are all within range.
+        if MASK_STEPS:
+            k_offs_n = start_n + tl.arange(0, BLOCK_N)
+        else:
+            k_offs_n = None
+        k_offs_k = None if not PADDED_HEAD else tl.arange(0, BLOCK_DMODEL)
+        k = load_fn(k_ptrs, k_offs_k, k_offs_n, ACTUAL_BLOCK_DMODEL, actual_seqlen_k)
+        if PRE_LOAD_V:
+            # We can use the same offsets as k, just with dims transposed.
+            v = load_fn(v_ptrs, k_offs_n, k_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+        # We start from end of seqlen_k so only the first iteration would need
+        # to be checked for padding if it is not a multiple of block_n
+        # TODO: This can be optimized to only be true for the padded block.
+        if MASK_STEPS:
+            # If this is the last block / iteration, we want to
+            # mask if the sequence length is not a multiple of block size
+            # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
+            # last step might get wasted but that is okay. check if this masking works For
+            # that case.
+            if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
+                boundary_m = tl.full([BLOCK_M], actual_seqlen_k, dtype=tl.int32)
+                size_n = start_n + OFFS_N[None, :]
+                mask = size_n < boundary_m[:, None]
+                qk = tl.where(mask, qk, float("-inf"))
+
+        # compute masks
+        q_mask = (OFFS_M[:, None] < actual_seqlen_q)
+        k_mask = ((start_n + tl.arange(0, BLOCK_N))[None, :] < actual_seqlen_k)
+        p_mask = q_mask & k_mask
+
+        # -- compute qk ----
+        if IS_FP8 :
+            qk += (tl.dot(q, k) * descale_q * descale_k)
+        else:
+            qk += tl.dot(q, k)
+        qk_scaled =  qk * SM_SCALE
+
+        if USE_ALIBI:
+            # compute the global position of each token within the sequence
+            global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            global_n_positions = start_n + tl.arange(0, BLOCK_N)
+            alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, global_m_positions,
+                                              global_n_positions)
+            qk_scaled += alibi_block
+
+        if IS_CAUSAL:
+            causal_boundary = start_n + offs_n_causal
+            causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
+            qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+        
+        if bias_ptrs is not None:
+            bias_offs_n = start_n + tl.arange(0, BLOCK_N) if MASK_STEPS else None
+            bias = load_fn(bias_ptrs, OFFS_M, bias_offs_n, actual_seqlen_q, actual_seqlen_k)
+            qk_scaled += bias
+
+        # get max scores so far
+        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+
+        # scale and subtract max
+        q_shifted = qk_scaled - m_ij[:, None]
+        
+        # Compute scaled QK and softmax probabilities
+        if USE_EXP2:
+            p = tl.math.exp2(q_shifted * RCP_LN2)
+        else:
+            p = tl.math.exp(q_shifted)
+
+        # CAVEAT: Must update l_ij before applying dropout
+        l_ij = tl.sum(p, 1)
+        if ENABLE_DROPOUT:
+            if tl_DROPOUT_USE_PYTORCH:
+                dropout_mask = tl.load(dropout_mask_ptrs, mask=p_mask)
+            else:
+                rng_output = tl.rand(philox_seed, philox_ptrs)  # TODO: use tl.randint for better performance
+                dropout_mask = rng_output > dropout_p
+                if tl_DROPOUT_DUMP:
+                    tl.store(dropout_mask_ptrs, dropout_mask, mask=p_mask)
+
+            # return scores with negative values for dropped vals
+            sd_mask = tl.where(dropout_mask, p, -p)
+            tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
+
+            # apply dropout mask in place
+            p = tl.where(dropout_mask, p, 0.0)
+        elif RETURN_SCORES:
+            # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
+            tl.store(sd_mask_ptrs, p, mask=p_mask)
+        
+        # -- update output accumulator --
+        # alpha is an adjustment factor for acc and li as we loop and find new maxes
+        # store the diff in maxes to adjust acc and li as we discover new maxes
+        m_diff = m_i - m_ij
+        if USE_EXP2:
+            alpha = tl.math.exp2(m_diff * RCP_LN2)
+        else:
+            alpha = tl.math.exp(m_diff)
+        acc = acc * alpha[:, None]
+        if not PRE_LOAD_V:
+            v = load_fn(v_ptrs, k_offs_n, k_offs_k, actual_seqlen_k, ACTUAL_BLOCK_DMODEL)
+        # -- update m_i and l_i
+        l_i = l_i * alpha + l_ij
+        # update m_i and l_i
+        m_i = m_ij
+
+        if IS_FP8:
+            scale_p, descale_p = compute_fp8_scaling_factors(p, FP8_MAX)
+            acc += (tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v)
+        else:
+            acc += tl.dot(p.to(v.type.element_ty), v)
+
+        k_ptrs += BLOCK_N * stride_kn
+        v_ptrs += BLOCK_N * stride_vk
+        if bias_ptrs is not None:
+            bias_ptrs += BLOCK_N * stride_bn
+        if RETURN_SCORES:
+            sd_mask_ptrs += BLOCK_N * stride_sn
+        
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += BLOCK_N * stride_sn
+            philox_ptrs += BLOCK_N * stride_sn
+    return acc, l_i, m_i
+
 @triton.autotune(
     configs=autotune_configs,
     key=autotune_keys,
@@ -1011,7 +1152,7 @@ def attn_fwd_old(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     # value because there is no masking. Similarly we do not need padding.
     if n_full_blocks > 0:
         block_max = (n_blocks - masked_blocks) * BLOCK_N
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
+        acc, l_i, m_i = _attn_fwd_inner_old(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
                                         start_m, seqlen_k, seqlen_q, dropout_p, philox_seed, philox_ptrs,
                                         sd_mask_ptrs, dropout_mask_ptrs,
                                         # _, _, offs_n_causal, masked_blocks, n_extra_tokens, _
@@ -1041,7 +1182,7 @@ def attn_fwd_old(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         if ENABLE_DROPOUT:
             dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
             philox_ptrs += n_full_blocks * BLOCK_N * stride_sn
-        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
+        acc, l_i, m_i = _attn_fwd_inner_old(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stride_vk, stride_bn, stride_sn,
                                         start_m, seqlen_k, seqlen_q, dropout_p, philox_seed, philox_ptrs,
                                         sd_mask_ptrs, dropout_mask_ptrs, block_min, block_max, offs_n_causal, masked_blocks,
                                         n_extra_tokens, alibi_slope, descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
