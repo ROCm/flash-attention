@@ -98,7 +98,7 @@ autotune_configs, autotune_keys = get_autotune_configs()
 def _attn_fwd_no_mask(acc, l_i, m_i, 
                     q, k_ptrs, v_ptrs, bias_ptrs, 
                     stride_kn, stride_vk, stride_bn, stride_sn, 
-                    start_m, actual_seqlen_k, actual_seqlen_q, 
+                    start_m, seqlen_k, seqlen_q, 
                     dropout_p, philox_seed, philox_ptrs, 
                     sd_mask_ptrs, dropout_mask_ptrs,
                     offs_m, offs_n, offs_d,
@@ -136,12 +136,12 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, q_offs_m,
+            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, q_offs_m,
                                               kv_offs_n)
             qk_scaled += alibi_block
 
         # compute qk mask
-        qk_mask = (offs_m[:, None] < actual_seqlen_q) & (kv_offs_n[None, :] < actual_seqlen_k)
+        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         
         # compute bias
         if bias_ptrs is not None:
@@ -220,7 +220,7 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
 def _attn_fwd_mask(acc, l_i, m_i, 
                     q, k_ptrs, v_ptrs, bias_ptrs, 
                     stride_kn, stride_vk, stride_bn, stride_sn, start_m,
-                    actual_seqlen_k, actual_seqlen_q, 
+                    seqlen_k, seqlen_q, 
                     dropout_p, philox_seed, philox_ptrs, 
                     sd_mask_ptrs, dropout_mask_ptrs,
                     offs_m, offs_n, offs_d,
@@ -235,15 +235,15 @@ def _attn_fwd_mask(acc, l_i, m_i,
         RCP_LN2: tl.constexpr = 1.4426950408889634
 
     # seqlen diff
-    seqlen_delta_qk = actual_seqlen_q - actual_seqlen_k
+    seqlen_delta_qk = seqlen_k - seqlen_q
     
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
-        k_mask = (kv_offs_n[None, :] < actual_seqlen_k)
-        v_mask = (kv_offs_n[:, None] < actual_seqlen_k)
+        k_mask = (kv_offs_n[None, :] < seqlen_k)
+        v_mask = (kv_offs_n[:, None] < seqlen_k)
         if PADDED_HEAD:
             k_mask = k_mask & (offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
             v_mask = v_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
@@ -264,7 +264,7 @@ def _attn_fwd_mask(acc, l_i, m_i,
         # last step might get wasted but that is okay. check if this masking works For
         # that case.
         if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
-            boundary_m = tl.full([BLOCK_M], actual_seqlen_k, dtype=tl.int32)
+            boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
             size_n = start_n + offs_n[None, :]
             mask = size_n < boundary_m[:, None]
             qk = tl.where(mask, qk, float("-inf"))
@@ -279,17 +279,17 @@ def _attn_fwd_mask(acc, l_i, m_i,
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            alibi_block = compute_alibi_block(alibi_slope, actual_seqlen_q, actual_seqlen_k, q_offs_m,
+            alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, q_offs_m,
                                               kv_offs_n)
             qk_scaled += alibi_block
 
         if IS_CAUSAL:
-            causal_boundary = start_n + offs_n + seqlen_delta_qk
+            causal_boundary = start_n + offs_n - seqlen_delta_qk
             causal_mask = offs_m[:, None] >= causal_boundary[None, :]
             qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
         
         # compute qk mask
-        qk_mask = (offs_m[:, None] < actual_seqlen_q) & (kv_offs_n[None, :] < actual_seqlen_k)
+        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
         # compute bias
         if bias_ptrs is not None:
@@ -397,8 +397,8 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
         m_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
         
         # Check if this program can see ANY K blocks
-        seqlen_delta_qk = seqlen_q - seqlen_k
-        last_visible_k_pos = m_block_end - seqlen_delta_qk
+        seqlen_delta_qk = seqlen_k - seqlen_q
+        last_visible_k_pos = m_block_end + seqlen_delta_qk
         
         if last_visible_k_pos < 0:
             # PROGRAM EARLY EXIT: All K blocks are SKIPPED blocks
