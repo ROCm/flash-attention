@@ -710,24 +710,8 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
-    # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
-    # then we have one block with a row of all NaNs which come from computing
-    # softmax over a row of all -infs (-inf - inf = NaN). We check for that here
-    # and store 0s where there are NaNs as these rows should've been zeroed out.
-    end_m_idx = (start_m + 1) * BLOCK_M
-    start_m_idx = start_m * BLOCK_M
-    causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:
-        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full((BLOCK_DMODEL, ), causal_start_idx, dtype=tl.int32)
-            mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
-            z = 0.0
-            acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
 
-    # write back LSE(Log Sum Exponents), the log of the normalization constant
-    l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
-    l_ptrs = l_offset + offs_m * stride_lse_m 
+    # compute log-sum-exp
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
@@ -739,20 +723,44 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     else:
         softmax_lse = m_i + tl.math.log(l_i)
 
+    # Handle causal masking edge cases
     if IS_CAUSAL:
-        # zero out nans caused by -infs when doing causal
-        lse_mask = (start_m_idx + tl.arange(0, BLOCK_M)) < causal_start_idx
-        softmax_lse = tl.where(lse_mask, 0.0, softmax_lse)
+        # When seqlen_q > seqlen_k, some rows are completely above the causal diagonal
+        # These rows have all -inf attention scores, resulting in NaN after softmax
+        causal_start_idx = seqlen_q - seqlen_k
+        start_m_idx = start_m * BLOCK_M
+        
+        # Create mask for rows that need zeroing
+        row_indices = start_m_idx + tl.arange(0, BLOCK_M)
+        causal_mask = row_indices < causal_start_idx
+        
+        # Zero out both acc and LSE for these rows
+        if causal_start_idx > start_m_idx:
+            end_m_idx = (start_m + 1) * BLOCK_M
+            if causal_start_idx < end_m_idx:
+                # This block contains the boundary - need to mask acc
+                out_mask_boundary = tl.full((BLOCK_DMODEL, ), causal_start_idx, dtype=tl.int32)
+                out_ptrs_mask = row_indices[:, None] >= out_mask_boundary[None, :]
+                z = 0.0
+                acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+        
+        # Zero out LSE for rows above diagonal
+        softmax_lse = tl.where(causal_mask, 0.0, softmax_lse)
+
+    # write back LSE(Log Sum Exponents), the log of the normalization constant
+    l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
+    l_ptrs = l_offset + offs_m * stride_lse_m
 
     # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
     # This is only true for the last Q block. For others, overflow_size will be -ve
+    end_m_idx = (start_m + 1) * BLOCK_M
     overflow_size = end_m_idx - seqlen_q
     if overflow_size > 0:
         boundary = tl.full((BLOCK_M, ), BLOCK_M - overflow_size, dtype=tl.int32)
         l_ptrs_mask = tl.arange(0, BLOCK_M) < boundary
-        tl.store(l_ptrs, softmax_lse, mask=l_ptrs_mask) # the log of the normalization constant
+        tl.store(l_ptrs, softmax_lse, mask=l_ptrs_mask)
     else:
-        tl.store(l_ptrs, softmax_lse) # the log of the normalization constant
+        tl.store(l_ptrs, softmax_lse)
 
     # write back O
     o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
