@@ -253,6 +253,86 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
             philox_ptrs += BLOCK_N * stride_sn
     return acc, l_i, m_i
 
+
+@triton.jit
+def compute_masking(seqlen_k, seqlen_q, start_m,
+                      IS_CAUSAL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """
+    Classify K blocks for attention computation.
+    
+    Returns:
+        - program_early_exit: Should this program exit without computation?
+        - n_full_blocks: How many full blocks (no masking) to process
+        - n_masked_blocks: How many masked blocks (need masking) to process
+        - n_skipped_blocks: How many blocks are skipped (above diagonal)
+        - n_visible_k_blocks
+        - n_extra_tokens
+    """
+    # Total K blocks in the key sequence
+    total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+
+    # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
+    if seqlen_k < BLOCK_N:
+        n_extra_tokens = BLOCK_N - seqlen_k
+    elif seqlen_k % BLOCK_N:
+        n_extra_tokens = seqlen_k % BLOCK_N
+    else:
+        n_extra_tokens = 0 
+    
+    if IS_CAUSAL:
+        # ========== CAUSAL MODE: Classify K Blocks ==========
+        # Calculate causal boundary for this Q block
+        m_block_start = start_m * BLOCK_M
+        m_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+        
+        # Check if this program can see ANY K blocks
+        seqlen_delta_qk = seqlen_q - seqlen_k
+        last_visible_k_pos = m_block_end - seqlen_delta_qk
+        
+        if last_visible_k_pos < 0:
+            # PROGRAM EARLY EXIT: All K blocks are SKIPPED blocks
+            program_early_exit = True
+            n_full_blocks = 0
+            n_masked_blocks = 0
+            n_skipped_blocks = total_k_blocks
+            n_visible_k_blocks = 0
+        else:
+            # NORMAL PROCESSING: This program can see some K blocks
+            program_early_exit = False
+            
+            # Which K blocks are visible (not skipped)?
+            last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
+            n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
+            n_skipped_blocks = total_k_blocks - n_visible_k_blocks
+            
+            # Of the visible blocks, which are FULL vs MASKED?
+            # calculate is_modulo_mn
+            padded_block_k = n_extra_tokens != 0
+            is_modulo_mn = (not padded_block_k) & (seqlen_q % BLOCK_M == 0)
+            
+            # Count masked blocks
+            n_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
+            n_masked_blocks = tl.minimum(n_masked_blocks, n_visible_k_blocks)
+            
+            # The rest are full blocks
+            n_full_blocks = n_visible_k_blocks - n_masked_blocks
+    
+    else:
+        program_early_exit = False  # Never early exit in non-causal
+        n_visible_k_blocks = total_k_blocks  # All blocks are visible
+        n_skipped_blocks = 0  # No causal skipping
+        
+        # Check if last K block needs padding
+        if (seqlen_k % BLOCK_N) != 0:
+            n_masked_blocks = 1  # Last block needs padding mask
+            n_full_blocks = total_k_blocks - 1
+        else:
+            n_masked_blocks = 0  # All blocks are aligned
+            n_full_blocks = total_k_blocks
+    
+    return program_early_exit, n_full_blocks, n_masked_blocks, n_skipped_blocks, n_visible_k_blocks, n_extra_tokens
+
+
 @triton.autotune(
     configs=autotune_configs,
     key=autotune_keys,
@@ -337,117 +417,11 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     else:
         descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
     
-    # ============================================================
-    #              K BLOCK CLASSIFICATION FOR THIS PROGRAM
-    # ============================================================
-    """
-    This section classifies ALL K blocks that this program might need to examine.
-    We determine:
-    1. How many K blocks exist in total
-    2. Which K blocks are visible to this Q block (not skipped)
-    3. Of the visible blocks, which are full vs masked
-    """
 
-    # Total K blocks in the key sequence
-    total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
-    
-    # Classification results
-    n_visible_k_blocks = 0    # How many K blocks this program will process
-    n_full_blocks = 0         # How many are full blocks (no masking)
-    n_masked_blocks = 0       # How many are masked blocks (need masking)
-    n_skipped_blocks = 0      # How many are skipped blocks (above diagonal)
-    
-    # Program decision
-    program_early_exit = False  # Should this program exit without computation?
-    
-    # Masking related values
-    seqlen_delta_qk = seqlen_q - seqlen_k
-    # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
-    if seqlen_k < BLOCK_N:
-        n_extra_tokens = BLOCK_N - seqlen_k
-    elif seqlen_k % BLOCK_N:
-        n_extra_tokens = seqlen_k % BLOCK_N
-    else:
-        n_extra_tokens = 0  
-    
-    if IS_CAUSAL:
-        # ========== CAUSAL MODE: Classify K Blocks ==========
-        """
-        In causal attention, K blocks can be:
-        - FULL: All positions in the block are below the diagonal
-        - MASKED: The diagonal cuts through this block
-        - SKIPPED: All positions in the block are above the diagonal
-        """
-
-        # Calculate causal boundary for this Q block
-        m_block_start = start_m * BLOCK_M
-        m_block_end = min((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-        
-        # First, check if this program can see ANY K blocks
-        first_visible_k_pos = m_block_start - seqlen_delta_qk
-        last_visible_k_pos = m_block_end - seqlen_delta_qk
-        
-        if last_visible_k_pos < 0:
-            """
-            PROGRAM EARLY EXIT: All K blocks are SKIPPED blocks for this Q block.
-            """
-            program_early_exit = True
-            n_visible_k_blocks = 0
-            n_skipped_blocks = total_k_blocks  # All blocks are skipped
-            
-        else:
-            """
-            NORMAL PROCESSING: This program can see some K blocks.
-            Now we classify each K block as FULL, MASKED, or SKIPPED.
-            """
-            
-            # Which K blocks are visible (not skipped)?
-            last_visible_k_pos = m_block_end - seqlen_delta_qk
-            last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
-            
-            # Visible blocks: [0, last_visible_k_block]
-            n_visible_k_blocks = min(last_visible_k_block + 1, total_k_blocks)
-            n_skipped_blocks = total_k_blocks - n_visible_k_blocks
-
-            
-            # Of the visible blocks, which are FULL vs MASKED?
-            """
-            MASKED blocks are those where the causal diagonal cuts through.
-            There are always at least BLOCK_M // BLOCK_N masked blocks.
-            Additionally there might be one more due to dissimilar seqlens.
-            """
-            # calculate is_modulo_mn
-            padded_block_k = n_extra_tokens != 0
-            is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
-            
-            # Count masked blocks
-            n_masked_blocks = BLOCK_M // BLOCK_N + (1 if not is_modulo_mn else 0)
-            n_masked_blocks = min(n_masked_blocks, n_visible_k_blocks)
-            
-            # The rest are full blocks
-            n_full_blocks = n_visible_k_blocks - n_masked_blocks
-    
-    else:
-        # ========== NON-CAUSAL MODE: Classify K Blocks ==========
-        """
-        Without causal masking, classification is simple:
-        - Most blocks are FULL blocks
-        - Only the last block might be MASKED (if padding needed)
-        - No blocks are SKIPPED
-        """
-        
-        program_early_exit = False  # Never early exit in non-causal
-        n_visible_k_blocks = total_k_blocks  # All blocks are visible
-        n_skipped_blocks = 0  # No causal skipping
-        
-        # Check if last K block needs padding
-        if (seqlen_k % BLOCK_N) != 0:
-            n_masked_blocks = 1  # Last block needs padding mask
-            n_full_blocks = total_k_blocks - 1
-        else:
-            n_masked_blocks = 0  # All blocks are aligned
-            n_full_blocks = total_k_blocks
-    
+    # figure out masking pattern
+    program_early_exit,n_full_blocks, n_masked_blocks, n_skipped_blocks, n_visible_k_blocks, n_extra_tokens = compute_masking(
+        seqlen_k, seqlen_q, start_m, IS_CAUSAL, BLOCK_M, BLOCK_N
+    )
 
     # ============================================================
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
@@ -593,6 +567,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         
         # Calculate masking parameters
         if IS_CAUSAL:
+            seqlen_delta_qk = seqlen_q - seqlen_k
             offs_n_causal = offs_n + seqlen_delta_qk
         else:
             offs_n_causal = 0
