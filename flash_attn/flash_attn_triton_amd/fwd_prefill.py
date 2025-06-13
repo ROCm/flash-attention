@@ -468,18 +468,9 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
 
     # compute offsets
     if FLIP_GRID:
-        #NUM_XCDS: tl.constexpr = 8
         off_z = tl.program_id(0)
         off_h_q = tl.program_id(1)
         start_m = tl.program_id(2)
-
-        #start_m = (tl.cdiv(MAX_SEQLENS_Q, BLOCK_M) - 1) - start_m
-
-        # Remap heads to the same XCD
-        #pids_per_xcd = HQ // NUM_XCDS
-        #xcd_group = off_h_q % NUM_XCDS
-        #pid_in_xcd = off_h_q // NUM_XCDS
-        #off_h_q = xcd_group * pids_per_xcd + pid_in_xcd
     else:
         start_m = tl.program_id(0)
         off_h_q = tl.program_id(1)
