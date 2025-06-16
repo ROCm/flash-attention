@@ -461,7 +461,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
              stride_sz, stride_sh, stride_sm, stride_sn, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
              dropout_p, philox_seed, philox_offset_base, sd_mask, dropout_mask, alibi_slopes, HQ: tl.constexpr,
              HK: tl.constexpr, ACTUAL_BLOCK_DMODEL: tl.constexpr, MAX_SEQLENS_Q: tl.constexpr,
-             MAX_SEQLENS_K: tl.constexpr, IS_VARLEN: tl.constexpr, IS_INFERENCE: tl.constexpr,  IS_CAUSAL: tl.constexpr,
+             MAX_SEQLENS_K: tl.constexpr, IS_VARLEN: tl.constexpr, IS_CAUSAL: tl.constexpr,
              USE_SLIDING_WINDOW: tl.constexpr, WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr, BLOCK_M: tl.constexpr,
              BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr, PRE_LOAD_V: tl.constexpr, USE_BIAS: tl.constexpr,
              ENABLE_DROPOUT: tl.constexpr, RETURN_SCORES: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr, 
@@ -503,11 +503,6 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         cu_seqlens_k_start = tl.load(cu_seqlens_k + off_z)
         cu_seqlens_k_end = tl.load(cu_seqlens_k + off_z + 1)
         seqlen_k = cu_seqlens_k_end - cu_seqlens_k_start
-    elif IS_INFERENCE:
-        cu_seqlens_q_start = 0
-        cu_seqlens_k_start = 0
-        seqlen_q = MAX_SEQLENS_Q        
-        seqlen_k = tl.load(Cache_seqlens + off_z)
     else:
         cu_seqlens_q_start = 0
         cu_seqlens_k_start = 0
@@ -914,7 +909,7 @@ def attention_prefill_forward_triton_impl(
                         *bias_strides, stride_az, stride_ah, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
                         dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 
                         HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size, MAX_SEQLENS_Q=max_seqlens_q,
-                        MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, USE_SLIDING_WINDOW=use_sliding_window, WINDOW_SIZE_LEFT=window_size_left, WINDOW_SIZE_RIGHT=window_size_right, IS_VARLEN=is_varlen, IS_INFERENCE=is_inference,
+                        MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, USE_SLIDING_WINDOW=use_sliding_window, WINDOW_SIZE_LEFT=window_size_left, WINDOW_SIZE_RIGHT=window_size_right, IS_VARLEN=is_varlen,
                         BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
                         USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p
                         > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, FLIP_GRID=FLIP_GRID)
