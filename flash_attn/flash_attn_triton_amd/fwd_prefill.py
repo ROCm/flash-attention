@@ -230,7 +230,9 @@ def _attn_fwd_mask(acc, l_i, m_i,
                     PRE_LOAD_V: tl.constexpr,
                     ENABLE_DROPOUT: tl.constexpr, PADDED_HEAD: tl.constexpr,
                     ACTUAL_BLOCK_DMODEL: tl.constexpr, SM_SCALE: tl.constexpr, USE_ALIBI: tl.constexpr, USE_EXP2: tl.constexpr,
-                    RETURN_SCORES: tl.constexpr, ACCUMULATOR_TYPE):
+                    RETURN_SCORES: tl.constexpr, 
+                    USE_SLIDING_WINDOW: tl.constexpr, WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr,
+                    ACCUMULATOR_TYPE):
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
 
@@ -367,7 +369,9 @@ def _attn_fwd_mask(acc, l_i, m_i,
 
 @triton.jit
 def compute_masking(seqlen_k, seqlen_q, start_m,
-                      IS_CAUSAL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+                      IS_CAUSAL: tl.constexpr, USE_SLIDING_WINDOW: tl.constexpr,
+                      WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     """
     Classify K blocks for attention computation.
     
@@ -442,7 +446,6 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
             n_full_blocks = total_k_blocks
     
     return program_early_exit, n_full_blocks, n_masked_blocks, n_skipped_blocks, n_visible_k_blocks, n_extra_tokens
-
 
 @triton.autotune(
     configs=autotune_configs,
@@ -522,7 +525,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
 
     # figure out masking pattern
     program_early_exit,n_full_blocks, n_masked_blocks, n_skipped_blocks, n_visible_k_blocks, n_extra_tokens = compute_masking(
-        seqlen_k, seqlen_q, start_m, IS_CAUSAL, BLOCK_M, BLOCK_N
+        seqlen_k, seqlen_q, start_m, IS_CAUSAL, USE_SLIDING_WINDOW, WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT, BLOCK_M, BLOCK_N
     )
 
     # ============================================================
@@ -689,7 +692,11 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             ENABLE_DROPOUT, PADDED_HEAD,
             ACTUAL_BLOCK_DMODEL, SM_SCALE, 
             USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
-            RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
+            RETURN_SCORES=RETURN_SCORES, 
+            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW, 
+            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT, 
+            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
         )
 
     # ============================================================
