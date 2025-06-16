@@ -376,12 +376,9 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
     Classify K blocks for attention computation.
     
     Returns:
-        - program_early_exit: Should this program exit without computation?
         - n_full_blocks: How many full blocks (no masking) to process
         - n_masked_blocks: How many masked blocks (need masking) to process
-        - n_skipped_blocks: How many blocks are skipped (above diagonal)
-        - n_visible_k_blocks
-        - n_extra_tokens
+        - n_extra_tokens: Padding tokens in last K block
     """
     # Total K blocks in the key sequence
     total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
@@ -405,20 +402,14 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
         last_visible_k_pos = m_block_end + seqlen_delta_qk
         
         if last_visible_k_pos < 0:
-            # PROGRAM EARLY EXIT: All K blocks are SKIPPED blocks
-            program_early_exit = True
+            # All K blocks are SKIPPED blocks
             n_full_blocks = 0
             n_masked_blocks = 0
-            n_skipped_blocks = total_k_blocks
-            n_visible_k_blocks = 0
         else:
-            # NORMAL PROCESSING: This program can see some K blocks
-            program_early_exit = False
-            
+            # This program can see some K blocks
             # Which K blocks are visible (not skipped)?
             last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
             n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
-            n_skipped_blocks = total_k_blocks - n_visible_k_blocks
             
             # Of the visible blocks, which are FULL vs MASKED?
             # calculate is_modulo_mn
@@ -431,21 +422,17 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
             
             # The rest are full blocks
             n_full_blocks = n_visible_k_blocks - n_masked_blocks
-    
     else:
-        program_early_exit = False  # Never early exit in non-causal
-        n_visible_k_blocks = total_k_blocks  # All blocks are visible
-        n_skipped_blocks = 0  # No causal skipping
-        
+        # ========== NON-CAUSAL MODE ==========
         # Check if last K block needs padding
-        if (seqlen_k % BLOCK_N) != 0:
+        if n_extra_tokens != 0:
             n_masked_blocks = 1  # Last block needs padding mask
             n_full_blocks = total_k_blocks - 1
         else:
             n_masked_blocks = 0  # All blocks are aligned
             n_full_blocks = total_k_blocks
     
-    return program_early_exit, n_full_blocks, n_masked_blocks, n_skipped_blocks, n_visible_k_blocks, n_extra_tokens
+    return n_full_blocks, n_masked_blocks, n_extra_tokens
 
 @triton.autotune(
     configs=autotune_configs,
@@ -519,14 +506,14 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     
 
     # figure out masking pattern
-    program_early_exit,n_full_blocks, n_masked_blocks, n_skipped_blocks, n_visible_k_blocks, n_extra_tokens = compute_masking(
+    n_full_blocks, n_masked_blocks, n_extra_tokens = compute_masking(
         seqlen_k, seqlen_q, start_m, IS_CAUSAL, USE_SLIDING_WINDOW, WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT, BLOCK_M, BLOCK_N
     )
 
     # ============================================================
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
     # ============================================================
-    if program_early_exit:
+    if n_full_blocks == 0 and n_masked_blocks == 0:
         """
         This program's Q block can't attend to ANY K blocks.
         All K blocks are SKIPPED blocks (above causal diagonal).
@@ -548,7 +535,7 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         l = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
         tl.store(l_ptrs, l, mask=l_ptrs_mask)
         
-        return  # ← PROGRAM EXITS EARLY HERE!
+        return
     
     # ============================================================
     #         NORMAL PROCESSING (Some K Blocks Visible)
@@ -665,8 +652,8 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             philox_ptrs += n_full_blocks * BLOCK_N * stride_sn
        
         # define the range for masked blocks
-        block_min = n_full_blocks * BLOCK_N           # Start after full blocks
-        block_max = n_visible_k_blocks * BLOCK_N      # End at last visible block
+        block_min = n_full_blocks * BLOCK_N         # Start after full blocks
+        block_max = (n_full_blocks + n_masked_blocks) * BLOCK_N      # End at last visible block
         
         acc, l_i, m_i = _attn_fwd_mask(
             acc, l_i, m_i, 
