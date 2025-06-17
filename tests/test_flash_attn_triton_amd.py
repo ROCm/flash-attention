@@ -874,7 +874,7 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize("deterministic", [True])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
@@ -887,6 +887,7 @@ def test_flash_attn_varlen_qkvpacked(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        (32, 32),
         (113, 203),
         (128, 217),
         (113, 211),
@@ -906,7 +907,11 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    DEBUG = False
+    DEBUG = True
+    DEBUG_INPUT_TYPE = "ones"
+    if DEBUG:
+        print()
+
     if USE_TRITON_ROCM:
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:
@@ -935,7 +940,7 @@ def test_flash_attn_output(
     else:
         window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     if DEBUG:
-        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, mode="incremental")
+        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, mode=DEBUG_INPUT_TYPE)
     else:
         q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
@@ -947,8 +952,8 @@ def test_flash_attn_output(
         )
     else:
         if DEBUG:
-            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="incremental")
-            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="incremental")
+            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode=DEBUG_INPUT_TYPE)
+            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode=DEBUG_INPUT_TYPE)
         else:
             k = torch.randn(
                 batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
@@ -961,6 +966,12 @@ def test_flash_attn_output(
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
     else:
         alibi_slopes, attn_bias = None, None
+
+    if DEBUG:
+        print("q:", q, q.shape)
+        print("k:", k, k.shape)
+        print("v:", v, v.shape)
+        print("window_size:", window_size)
 
     if kvpacked:
         out, lse, S_dmask = flash_attn_kvpacked_func(
@@ -1143,12 +1154,16 @@ def test_flash_attn_output(
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
     if DEBUG:
-        print("out:", out)
-        print("out_ref:", out_ref)
+        print("out:", out, out.shape)
+        print("out_ref:", out_ref, out_ref.shape)
+        save_tensor_to_csv(out[0,:,0,:], "out.csv")
+        save_tensor_to_csv(out_ref[0,:,0,:], "out_ref")
+        
+
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-    # return
+    return
 
     if dropout_p > 0.0:
         # assert (attn - attn_ref).abs().max().item() <= 2 * (attn_pt - attn_ref).abs().max().item()

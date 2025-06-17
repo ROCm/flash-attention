@@ -168,7 +168,7 @@ def generate_varlen_tensor(
     equal_seqlens: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
-    mode: Literal["random", "incremental"] = "random"
+    mode: Literal["random", "ones", "incremental"] = "random"
 ):
     if DEBUG:
         print("total_seqlen", total_seqlen)
@@ -217,6 +217,8 @@ def generate_varlen_tensor(
             )
     elif mode == "random":
         x = torch.randn((total_seqlen, num_heads, head_size), dtype=dtype, device=device)
+    elif mode == "ones":
+        x = torch.ones((total_seqlen, num_heads, head_size), dtype=dtype, device=device)
     else:
         raise ValueError(f"Unkown mode {mode}")
 
@@ -229,7 +231,7 @@ def generate_varlen_tensor(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
-def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", mode: Literal["random", "incremental"] = "random"):
+def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -242,6 +244,8 @@ def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda"
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, SEQ_LEN, 1, 1).expand(*tensor_shape).contiguous()
     elif mode == "random":
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    elif mode == "ones":
+        x = torch.ones(tensor_shape, dtype=dtype, device=device)
     else:
         raise ValueError(f"Unkown mode {mode}")
     
@@ -254,7 +258,7 @@ def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda"
         x.requires_grad_()
         return x
 
-def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", mode: Literal["random", "incremental"] = "random"):
+def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -267,6 +271,8 @@ def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda"
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, 1, SEQ_LEN, 1).expand(*tensor_shape).contiguous()
     elif mode == "random":
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    elif mode == "ones":
+        x = torch.ones(tensor_shape, dtype=dtype, device=device)
     else:
         raise ValueError(f"Unkown mode {mode}")
     
@@ -708,9 +714,13 @@ def save_tensor_to_csv(tensor, filename, decimal_places=2):
     if tensor.ndim != 2:
         raise ValueError(f"tensor must be 2d, got shape {tensor.shape}")
     
+    # ensure filename ends with .csv
+    if not filename.endswith('.csv'):
+        filename = filename + '.csv'
+    
     # save to csv using numpy
     np.savetxt(filename, 
-               tensor.cpu().numpy(), 
+               tensor.detach().cpu().numpy(), 
                delimiter=',',
                fmt=f'%.{decimal_places}f')
 
