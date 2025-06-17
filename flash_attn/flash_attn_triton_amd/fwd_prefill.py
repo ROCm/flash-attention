@@ -394,34 +394,27 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
     if IS_CAUSAL:
         # ========== CAUSAL MODE: Classify K Blocks ==========
         # Calculate causal boundary for this Q block
-        m_block_start = start_m * BLOCK_M
         m_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
         
         # Check if this program can see ANY K blocks
-        seqlen_delta_qk = seqlen_k - seqlen_q
-        last_visible_k_pos = m_block_end + seqlen_delta_qk
+        last_visible_k_pos = m_block_end + (seqlen_k - seqlen_q)
         
         if last_visible_k_pos < 0:
-            # All K blocks are SKIPPED blocks
-            n_full_blocks = 0
-            n_masked_blocks = 0
-        else:
-            # This program can see some K blocks
-            # Which K blocks are visible (not skipped)?
-            last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
-            n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
-            
-            # Of the visible blocks, which are FULL vs MASKED?
-            # calculate is_modulo_mn
-            padded_block_k = n_extra_tokens != 0
-            is_modulo_mn = (not padded_block_k) & (seqlen_q % BLOCK_M == 0)
-            
-            # Count masked blocks
-            n_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
-            n_masked_blocks = tl.minimum(n_masked_blocks, n_visible_k_blocks)
-            
-            # The rest are full blocks
-            n_full_blocks = n_visible_k_blocks - n_masked_blocks
+            # All K blocks are above the diagonal
+            return 0, 0, n_extra_tokens
+        
+        # Calculate visible blocks directly
+        n_visible_k_blocks = tl.minimum(tl.cdiv(last_visible_k_pos + 1, BLOCK_N), total_k_blocks)
+        
+        # Count masked blocks (blocks that intersect the diagonal)
+        # If Q and K blocks are aligned, we need BLOCK_M//BLOCK_N masked blocks
+        # Otherwise we need one extra
+        is_aligned = (n_extra_tokens == 0) & (seqlen_q % BLOCK_M == 0)
+        n_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_aligned, 0, 1)
+        n_masked_blocks = tl.minimum(n_masked_blocks, n_visible_k_blocks)
+        
+        # The rest are full blocks
+        n_full_blocks = n_visible_k_blocks - n_masked_blocks
     else:
         # ========== NON-CAUSAL MODE ==========
         # Check if last K block needs padding
@@ -515,26 +508,19 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     # ============================================================
     if n_full_blocks == 0 and n_masked_blocks == 0:
         """
-        This program's Q block can't attend to ANY K blocks.
-        All K blocks are SKIPPED blocks (above causal diagonal).
-        
-        No computation needed - just write zeros and exit.
+        No K blocks visible - write zeros and exit.
         """
-        
         # Write zeros to output
         o_offset = Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
         o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
-        o_ptrs_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
-        acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=Out.type.element_ty)
-        tl.store(o_ptrs, acc, mask=o_ptrs_mask)
+        o_mask = (offs_m[:, None] < seqlen_q)
+        if PADDED_HEAD:
+            o_mask = o_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
+        tl.store(o_ptrs, tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=Out.type.element_ty), mask=o_mask)
         
         # Write zeros to LSE
-        l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
-        l_ptrs = l_offset + offs_m * stride_lse_m
-        l_ptrs_mask = offs_m < MAX_SEQLENS_Q
-        l = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
-        tl.store(l_ptrs, l, mask=l_ptrs_mask)
-        
+        l_ptrs = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m + offs_m * stride_lse_m
+        tl.store(l_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32), mask=offs_m < seqlen_q)
         return
     
     # ============================================================
