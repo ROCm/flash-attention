@@ -390,8 +390,11 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
     else:
         n_extra_tokens = 0 
     
-    if USE_SLIDING_WINDOW:
-        return 0, 0, 0, 0, 0
+    if USE_SLIDING_WINDOW: # TODO: impl sliding window
+        if IS_CAUSAL:
+            return 0, 0, 0, 0, 0
+        else:
+            return 0, 0, 0, 0, 0
     else:
         if IS_CAUSAL:
             # ========== CAUSAL MODE: Classify K Blocks ==========
@@ -570,10 +573,12 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     else:
         dropout_mask_ptrs = None
         philox_ptrs = 0
+
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=ACCUMULATOR_TYPE)
     l_i = tl.full([BLOCK_M], 1.0, dtype=ACCUMULATOR_TYPE)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=ACCUMULATOR_TYPE)
+
     # Q is loaded once at the beginning and shared by all N blocks.
     q_ptrs_mask = offs_m[:, None] < seqlen_q
     if PADDED_HEAD:
@@ -585,24 +590,16 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         pass
 
 
-    # ========== Process MASKED K Blocks after window ==========
+    # ========== Process MASKED K Blocks in the front ==========
     if n_front_masked_blocks > 0:
+        block_min = n_front_skip_blocks * BLOCK_N
+        block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
         pass
     
     # ========== Process FULL K Blocks (Fast Path) ==========
     if n_full_blocks > 0:
-        """
-        Process K blocks that are FULL blocks (no masking needed).
-        
-        These blocks are completely below the causal diagonal.
-        We can skip all masking logic for maximum performance.
-        
-        Loop will process K blocks: [0, n_full_blocks)
-        """
-        
-        # define the range for full blocks
-        block_min = 0                              # Start from first K block
-        block_max = n_full_blocks * BLOCK_N        # Process n_full_blocks K blocks
+        block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
+        block_max = (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * BLOCK_N
         
         acc, l_i, m_i = _attn_fwd_no_mask(
             acc, l_i, m_i, 
@@ -624,24 +621,10 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
         )
     
-    # ========== Process MASKED K Blocks after window ==========
+    # ========== Process MASKED K Blocks in the back ==========
     if n_back_masked_blocks > 0:
-        """
-        Process K blocks that are MASKED blocks (need masking).
-        
-        These blocks either:
-        - Intersect with the causal diagonal (need causal masking)
-        - Are the last block with padding (need boundary checks)
-        
-        Loop will process K blocks: [n_full_blocks, n_visible_k_blocks)
-        
-        NOTE: SKIPPED K blocks are never reached because the loop stops
-        at n_visible_k_blocks, not total_k_blocks!
-        """
-        
-        # define the range for masked blocks
-        block_min = n_full_blocks * BLOCK_N         # Start after full blocks
-        block_max = (n_full_blocks + n_back_masked_blocks) * BLOCK_N      # End at last visible block
+        block_min = (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks) * BLOCK_N
+        block_max = (n_front_skip_blocks + n_front_masked_blocks + n_full_blocks + n_back_masked_blocks) * BLOCK_N
         
         acc, l_i, m_i = _attn_fwd_mask(
             acc, l_i, m_i, 
@@ -691,29 +674,32 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     else:
         softmax_lse = m_i + tl.math.log(l_i)
 
-    # Handle causal masking edge cases
-    if IS_CAUSAL:
-        # When seqlen_q > seqlen_k, some rows are completely above the causal diagonal
-        # These rows have all -inf attention scores, resulting in NaN after softmax
-        causal_start_idx = seqlen_q - seqlen_k
-        start_m_idx = start_m * BLOCK_M
-        
-        # Create mask for rows that need zeroing
-        row_indices = start_m_idx + tl.arange(0, BLOCK_M)
-        causal_mask = row_indices < causal_start_idx
-        
-        # Zero out both acc and LSE for these rows
-        if causal_start_idx > start_m_idx:
-            end_m_idx = (start_m + 1) * BLOCK_M
-            if causal_start_idx < end_m_idx:
-                # This block contains the boundary - need to mask acc
-                out_mask_boundary = tl.full((BLOCK_DMODEL, ), causal_start_idx, dtype=tl.int32)
-                out_ptrs_mask = row_indices[:, None] >= out_mask_boundary[None, :]
-                z = 0.0
-                acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
-        
-        # Zero out LSE for rows above diagonal
-        softmax_lse = tl.where(causal_mask, 0.0, softmax_lse)
+    # handle masking edge cases
+    if USE_SLIDING_WINDOW:
+        pass
+    else:
+        if IS_CAUSAL:
+            # When seqlen_q > seqlen_k, some rows are completely above the causal diagonal
+            # These rows have all -inf attention scores, resulting in NaN after softmax
+            causal_start_idx = seqlen_q - seqlen_k
+            start_m_idx = start_m * BLOCK_M
+            
+            # Create mask for rows that need zeroing
+            row_indices = start_m_idx + tl.arange(0, BLOCK_M)
+            causal_mask = row_indices < causal_start_idx
+            
+            # Zero out both acc and LSE for these rows
+            if causal_start_idx > start_m_idx:
+                end_m_idx = (start_m + 1) * BLOCK_M
+                if causal_start_idx < end_m_idx:
+                    # This block contains the boundary - need to mask acc
+                    out_mask_boundary = tl.full((BLOCK_DMODEL, ), causal_start_idx, dtype=tl.int32)
+                    out_ptrs_mask = row_indices[:, None] >= out_mask_boundary[None, :]
+                    z = 0.0
+                    acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+            
+            # Zero out LSE for rows above diagonal
+            softmax_lse = tl.where(causal_mask, 0.0, softmax_lse)
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
