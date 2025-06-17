@@ -96,11 +96,11 @@ autotune_configs, autotune_keys = get_autotune_configs()
 
 @triton.jit
 def _attn_fwd_no_mask(acc, l_i, m_i, 
-                    q, k_ptrs, v_ptrs, bias_ptrs, 
+                    q, k_base_ptrs, v_base_ptrs, bias_base_ptrs, 
                     stride_kn, stride_vk, stride_bn, stride_sn, 
                     start_m, seqlen_k, seqlen_q, 
-                    dropout_p, philox_seed, philox_ptrs, 
-                    sd_mask_ptrs, dropout_mask_ptrs,
+                    dropout_p, philox_seed, philox_base_ptrs, 
+                    sd_mask_base_ptrs, dropout_mask_base_ptrs,
                     offs_m, offs_n, offs_d,
                     block_min, block_max, alibi_slope,
                     descale_q, descale_k, descale_v, IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr,
@@ -114,6 +114,10 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
     
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
+        # get ptrs
+        k_ptrs = k_base_ptrs + start_n * stride_kn
+        v_ptrs = v_base_ptrs + start_n * stride_vk
+
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
         if PADDED_HEAD:
             k_mask, k_mask_other = (offs_d[:, None] < ACTUAL_BLOCK_DMODEL), 0.0
@@ -144,7 +148,8 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
         
         # compute bias
-        if bias_ptrs is not None:
+        if bias_base_ptrs is not None:
+            bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
 
@@ -163,6 +168,9 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
         if ENABLE_DROPOUT:
+            dropout_mask_ptrs = dropout_mask_base_ptrs + start_n * stride_sn
+            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
+            philox_ptrs = philox_base_ptrs + start_n * stride_sn
             if tl_DROPOUT_USE_PYTORCH:
                 dropout_mask = tl.load(dropout_mask_ptrs, mask=qk_mask)
             else:
@@ -179,6 +187,7 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
+            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
             tl.store(sd_mask_ptrs, p, mask=qk_mask)
         
         # -- update output accumulator --
@@ -202,27 +211,16 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
             acc += (tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v)
         else:
             acc += tl.dot(p.to(v.type.element_ty), v)
-
-        # move to next block along seqlen_k
-        k_ptrs += BLOCK_N * stride_kn
-        v_ptrs += BLOCK_N * stride_vk
-        if bias_ptrs is not None:
-            bias_ptrs += BLOCK_N * stride_bn
-        if RETURN_SCORES:
-            sd_mask_ptrs += BLOCK_N * stride_sn
-        if ENABLE_DROPOUT:
-            dropout_mask_ptrs += BLOCK_N * stride_sn
-            philox_ptrs += BLOCK_N * stride_sn
     
     return acc, l_i, m_i
 
 @triton.jit
 def _attn_fwd_mask(acc, l_i, m_i, 
-                    q, k_ptrs, v_ptrs, bias_ptrs, 
+                    q, k_base_ptrs, v_base_ptrs, bias_base_ptrs, 
                     stride_kn, stride_vk, stride_bn, stride_sn, start_m,
                     seqlen_k, seqlen_q, 
-                    dropout_p, philox_seed, philox_ptrs, 
-                    sd_mask_ptrs, dropout_mask_ptrs,
+                    dropout_p, philox_seed, philox_base_ptrs, 
+                    sd_mask_base_ptrs, dropout_mask_base_ptrs,
                     offs_m, offs_n, offs_d,
                     block_min, block_max, n_extra_tokens, alibi_slope,
                     descale_q, descale_k, descale_v, IS_FP8: tl.constexpr, FP8_MAX: tl.constexpr,
@@ -241,6 +239,10 @@ def _attn_fwd_mask(acc, l_i, m_i,
     
     # loop over k, v, and update accumulator
     for start_n in range(block_min, block_max, BLOCK_N):
+        # get ptrs
+        k_ptrs = k_base_ptrs + start_n * stride_kn
+        v_ptrs = v_base_ptrs + start_n * stride_vk
+
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -294,7 +296,8 @@ def _attn_fwd_mask(acc, l_i, m_i,
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
 
         # compute bias
-        if bias_ptrs is not None:
+        if bias_base_ptrs is not None:
+            bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
 
@@ -313,6 +316,9 @@ def _attn_fwd_mask(acc, l_i, m_i,
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
         if ENABLE_DROPOUT:
+            dropout_mask_ptrs = dropout_mask_base_ptrs + start_n * stride_sn
+            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
+            philox_ptrs = philox_base_ptrs + start_n * stride_sn
             if tl_DROPOUT_USE_PYTORCH:
                 dropout_mask = tl.load(dropout_mask_ptrs, mask=qk_mask)
             else:
@@ -329,6 +335,7 @@ def _attn_fwd_mask(acc, l_i, m_i,
             p = tl.where(dropout_mask, p, 0.0)
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
+            sd_mask_ptrs = sd_mask_base_ptrs + start_n * stride_sn
             tl.store(sd_mask_ptrs, p, mask=qk_mask)
         
         # -- update output accumulator --
@@ -352,17 +359,6 @@ def _attn_fwd_mask(acc, l_i, m_i,
             acc += (tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v)
         else:
             acc += tl.dot(p.to(v.type.element_ty), v)
-
-        # move to next block along seqlen_k
-        k_ptrs += BLOCK_N * stride_kn
-        v_ptrs += BLOCK_N * stride_vk
-        if bias_ptrs is not None:
-            bias_ptrs += BLOCK_N * stride_bn
-        if RETURN_SCORES:
-            sd_mask_ptrs += BLOCK_N * stride_sn
-        if ENABLE_DROPOUT:
-            dropout_mask_ptrs += BLOCK_N * stride_sn
-            philox_ptrs += BLOCK_N * stride_sn
     
     return acc, l_i, m_i
 
@@ -627,17 +623,6 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
             RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
         )
-
-        # Advance pointers past the full blocks
-        k_ptrs += n_full_blocks * BLOCK_N * stride_kn
-        v_ptrs += n_full_blocks * BLOCK_N * stride_vk
-        if USE_BIAS:
-            bias_ptrs += n_full_blocks * BLOCK_N * stride_bn
-        if RETURN_SCORES:
-            sd_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
-        if ENABLE_DROPOUT:
-            dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
-            philox_ptrs += n_full_blocks * BLOCK_N * stride_sn
     
     # ========== Process MASKED K Blocks after window ==========
     if n_back_masked_blocks > 0:
