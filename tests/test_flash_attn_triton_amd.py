@@ -935,7 +935,7 @@ def test_flash_attn_output(
     else:
         window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     if DEBUG:
-        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG)
+        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, mode="incremental")
     else:
         q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
@@ -947,8 +947,8 @@ def test_flash_attn_output(
         )
     else:
         if DEBUG:
-            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG)
-            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, DEBUG_INPUT=DEBUG)
+            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="incremental")
+            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="incremental")
         else:
             k = torch.randn(
                 batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True

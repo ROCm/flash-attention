@@ -168,7 +168,7 @@ def generate_varlen_tensor(
     equal_seqlens: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
-    DEBUG_INPUT: bool = False
+    mode: Literal["random", "incremental"] = "random"
 ):
     if DEBUG:
         print("total_seqlen", total_seqlen)
@@ -202,8 +202,8 @@ def generate_varlen_tensor(
     cu_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32, device=device), seqlens.cumsum(dim=0)]).to(torch.int32).to(device=device)
     max_seqlen = torch.max(seqlens).to(torch.int32).item()
 
-    # create varlen tensor
-    if DEBUG_INPUT:
+    # create varlen tensor based on mode
+    if mode == "incremental":
         x = torch.zeros(total_seqlen, num_heads, head_size, dtype=dtype, device=device)
         for i in range(batch_size):
             start = cu_seqlens[i].item()
@@ -215,8 +215,10 @@ def generate_varlen_tensor(
                 .view(length, 1, 1)
                 .expand(length, num_heads, head_size)
             )
-    else:
+    elif mode == "random":
         x = torch.randn((total_seqlen, num_heads, head_size), dtype=dtype, device=device)
+    else:
+        raise ValueError(f"Unkown mode {mode}")
 
     if is_fp8_dtype:
         # cast to fp8
@@ -227,19 +229,21 @@ def generate_varlen_tensor(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
-def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
+def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", mode: Literal["random", "incremental"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
         og_fp8_dtype = dtype
         dtype = torch.float32
 
-    # gen tensor
+    # gen tensor based on mode
     tensor_shape = (BATCH, SEQ_LEN, NUM_HEADS, D_HEAD)
-    if DEBUG_INPUT:
+    if mode == "incremental":
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, SEQ_LEN, 1, 1).expand(*tensor_shape).contiguous()
-    else:
+    elif mode == "random":
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    else:
+        raise ValueError(f"Unkown mode {mode}")
     
     if is_fp8_dtype:
         # cast to fp8
@@ -250,30 +254,33 @@ def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda"
         x.requires_grad_()
         return x
 
-def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", DEBUG_INPUT=False):
+def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", mode: Literal["random", "incremental"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
         og_fp8_dtype = dtype
         dtype = torch.float32
     
-    # gen tensor
+    # gen tensor based on mode
     tensor_shape = (BATCH, NUM_HEADS, SEQ_LEN, D_HEAD)
-    if DEBUG_INPUT:
+    if mode == "incremental":
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, 1, SEQ_LEN, 1).expand(*tensor_shape).contiguous()
-    else:
+    elif mode == "random":
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
+    else:
+        raise ValueError(f"Unkown mode {mode}")
     
-
     if is_fp8_dtype:
         # cast to fp8
-        x, descale_x = cast_to_fp8(x, og_fp8_dtype, "bhsd") # FIXME: I don't the casting fn supports this atm
-        x.requires_grad_()
-        return x, descale_x
+        raise ValueError("fp8 not supported for bhsd yet")
+        # x, descale_x = cast_to_fp8(x, og_fp8_dtype, "bhsd") # FIXME: I don't the casting fn supports this atm
+        # x.requires_grad_()
+        # return x, descale_x
     else:
         x.requires_grad_()
         return x
 
+# update input_helper to use the new mode parameter
 def input_helper(
     BATCH: int,
     HQ: int,
@@ -286,8 +293,7 @@ def input_helper(
     dtype: torch.dtype,
     layout: Literal["bshd", "bhsd", "thd"],
     packing: Optional[Literal["kv", "qkv"]] = None,
-    device: Literal["cpu", "cuda"] = "cuda",
-    DEBUG_INPUT: bool = False,
+    device: Literal["cpu", "cuda"] = "cuda"
 ):
     torch.manual_seed(20)
     is_fp8_dtype = is_dtype_fp8(dtype)
@@ -301,21 +307,18 @@ def input_helper(
         # gen tensors
         # TODO: the gen functions should maybe have different gen modes like random, ones, increasing seqlen
         if is_fp8_dtype:
-            q, cu_seqlens_q, max_seqlen_q, descale_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            k, cu_seqlens_k, max_seqlen_k, descale_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            v, _, _ , descale_v = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
+            q, cu_seqlens_q, max_seqlen_q, descale_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+            k, cu_seqlens_k, max_seqlen_k, descale_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+            v, _, _ , descale_v = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
             do, _, _ , descale_do = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
         else:
-            q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            v, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens, DEBUG_INPUT=DEBUG_INPUT)
-            do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+            q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+            k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+            v, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+            do, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
         
         # setup metadata
-        if DEBUG_INPUT:
-            sm_scale = 1
-        else:
-            sm_scale = D_HEAD**-0.5
+        sm_scale = D_HEAD**-0.5
         metadata = MetaData(sm_scale=sm_scale)
         metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
         metadata.need_causal(CAUSAL)
@@ -324,32 +327,29 @@ def input_helper(
         # gen tensors
         if layout == "bshd":
             if is_fp8_dtype:
-                q, descale_q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k, descale_k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v, descale_v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                q, descale_q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
+                k, descale_k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device)
+                v, descale_v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device)
                 do, descale_do = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
             else:
-                q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+                q = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
+                k = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device)
+                v = generate_bshd_tensor(BATCH, N_CTX_K, HK, D_HEAD, dtype=dtype, device=device)
+                do = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
         elif layout == "bhsd":
             if is_fp8_dtype:
-                q, descale_q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k, descale_k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v, descale_v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
+                q, descale_q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
+                k, descale_k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device)
+                v, descale_v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device)
                 do, descale_do = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
             else:
-                q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device, DEBUG_INPUT=DEBUG_INPUT)
-                do = torch.ones_like(q) if DEBUG_INPUT else torch.randn_like(q)
+                q = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
+                k = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device)
+                v = generate_bhsd_tensor(BATCH, HK, N_CTX_K, D_HEAD, dtype=dtype, device=device)
+                do = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
 
         # setup metadata
-        if DEBUG_INPUT:
-            sm_scale = 1
-        else:
-            sm_scale = D_HEAD**-0.5
+        sm_scale = D_HEAD**-0.5
         metadata = MetaData(sm_scale=sm_scale)
         metadata.max_seqlens_q = N_CTX_Q
         metadata.max_seqlens_k = N_CTX_K
