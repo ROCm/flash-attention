@@ -168,7 +168,7 @@ def generate_varlen_tensor(
     equal_seqlens: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.float32,
-    mode: Literal["random", "ones", "incremental"] = "random"
+    mode: Literal["random", "ones", "incremental", "identity"] = "random"
 ):
     if DEBUG:
         print("total_seqlen", total_seqlen)
@@ -215,6 +215,17 @@ def generate_varlen_tensor(
                 .view(length, 1, 1)
                 .expand(length, num_heads, head_size)
             )
+    elif mode == "identity":
+        x = torch.zeros(total_seqlen, num_heads, head_size, dtype=dtype, device=device)
+        # for each batch, create identity pattern within that batch's sequence
+        for i in range(batch_size):
+            start = cu_seqlens[i].item()
+            end   = cu_seqlens[i+1].item()
+            length = end - start
+            
+            # create identity pattern for positions within this batch
+            for pos in range(min(length, head_size)):
+                x[start + pos, :, pos] = 1.0
     elif mode == "random":
         x = torch.randn((total_seqlen, num_heads, head_size), dtype=dtype, device=device)
     elif mode == "ones":
@@ -231,7 +242,7 @@ def generate_varlen_tensor(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
-def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental"] = "random"):
+def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental", "identity"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -242,6 +253,11 @@ def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda"
     tensor_shape = (BATCH, SEQ_LEN, NUM_HEADS, D_HEAD)
     if mode == "incremental":
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, SEQ_LEN, 1, 1).expand(*tensor_shape).contiguous()
+    elif mode == "identity":
+        x = torch.zeros(tensor_shape, dtype=dtype, device=device)
+        # create identity pattern: position i has value 1 at dimension i
+        for i in range(min(SEQ_LEN, D_HEAD)):
+            x[:, i, :, i] = 1.0
     elif mode == "random":
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
     elif mode == "ones":
@@ -258,7 +274,7 @@ def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda"
         x.requires_grad_()
         return x
 
-def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental"] = "random"):
+def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental", "identity"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -269,6 +285,11 @@ def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda"
     tensor_shape = (BATCH, NUM_HEADS, SEQ_LEN, D_HEAD)
     if mode == "incremental":
         x = torch.arange(SEQ_LEN, dtype=dtype, device=device).view(1, 1, SEQ_LEN, 1).expand(*tensor_shape).contiguous()
+    elif mode == "identity":
+        x = torch.zeros(tensor_shape, dtype=dtype, device=device)
+        # create identity pattern: position i has value 1 at dimension i
+        for i in range(min(SEQ_LEN, D_HEAD)):
+            x[:, :, i, i] = 1.0
     elif mode == "random":
         x = torch.randn(tensor_shape, dtype=dtype, device=device)
     elif mode == "ones":

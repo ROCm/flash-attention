@@ -908,9 +908,9 @@ def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     DEBUG = True
-    DEBUG_INPUT_TYPE = "ones"
     if DEBUG:
         print()
+        print("Debugging")
 
     if USE_TRITON_ROCM:
         if causal:
@@ -936,11 +936,11 @@ def test_flash_attn_output(
         nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     if DEBUG:
-        window_size = (-1, -1) if not local else ( seqlen_k//4, (seqlen_k*3)//4)
+        window_size = (-1, -1) if not local else (seqlen_k//4, (seqlen_k*3)//4)
     else:
         window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     if DEBUG:
-        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, mode=DEBUG_INPUT_TYPE)
+        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, mode="ones")
     else:
         q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
@@ -952,8 +952,8 @@ def test_flash_attn_output(
         )
     else:
         if DEBUG:
-            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode=DEBUG_INPUT_TYPE)
-            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode=DEBUG_INPUT_TYPE)
+            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="ones")
+            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="identity")
         else:
             k = torch.randn(
                 batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
