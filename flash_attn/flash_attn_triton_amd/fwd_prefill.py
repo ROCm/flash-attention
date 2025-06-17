@@ -290,7 +290,10 @@ def _attn_fwd_mask(acc, l_i, m_i,
             qk_scaled += alibi_block
 
         if USE_SLIDING_WINDOW:
-            pass
+            if IS_CAUSAL:
+                pass
+            else:
+                pass
         else:
             if IS_CAUSAL:
                 causal_boundary = start_n + offs_n - seqlen_delta_qk
@@ -412,15 +415,19 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
             if last_visible_k_pos < 0:
                 # All K blocks are above the diagonal
                 return 0, 0, 0, 0, n_extra_tokens
+
+            # This program can see some K blocks
+            # Which K blocks are visible (not skipped)?
+            last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
+            n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
             
-            # Calculate visible blocks directly
-            n_visible_k_blocks = tl.minimum(tl.cdiv(last_visible_k_pos + 1, BLOCK_N), total_k_blocks)
+            # Of the visible blocks, which are FULL vs MASKED?
+            # calculate is_modulo_mn
+            padded_block_k = n_extra_tokens != 0
+            is_modulo_mn = (not padded_block_k) & (seqlen_q % BLOCK_M == 0)
             
-            # Count masked blocks (blocks that intersect the diagonal)
-            # If Q and K blocks are aligned, we need BLOCK_M//BLOCK_N masked blocks
-            # Otherwise we need one extra
-            is_aligned = (n_extra_tokens == 0) & (seqlen_q % BLOCK_M == 0)
-            n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_aligned, 0, 1)
+            # Count masked blocks
+            n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
             n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
             
             # The rest are full blocks
@@ -590,16 +597,37 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         q_ptrs_mask = q_ptrs_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
-    # ========== skip front blocks by advancing pointers ==========
-    if n_front_skip_blocks > 0:
-        pass
-
 
     # ========== Process MASKED K Blocks in the front ==========
     if n_front_masked_blocks > 0:
         block_min = n_front_skip_blocks * BLOCK_N
         block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-        pass
+        
+        # acc, l_i, m_i = _attn_fwd_mask(
+        #     acc, l_i, m_i, 
+        #     q, k_ptrs, v_ptrs, bias_ptrs, 
+        #     stride_kn, stride_vk, stride_bn, stride_sn,
+        #     start_m, seqlen_k, seqlen_q, 
+        #     dropout_p, philox_seed, philox_ptrs,
+        #     sd_mask_ptrs, dropout_mask_ptrs,
+        #     offs_m, offs_n, offs_d,
+        #     block_min,        # Start of front masked blocks
+        #     block_max,        # End of front masked blocks
+        #     0,                # n_extra_tokens (0 for front blocks, only relevant for last block)
+        #     alibi_slope, 
+        #     descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
+        #     IS_CAUSAL,
+        #     BLOCK_M, BLOCK_DMODEL, BLOCK_N,
+        #     PRE_LOAD_V,
+        #     ENABLE_DROPOUT, PADDED_HEAD,
+        #     ACTUAL_BLOCK_DMODEL, SM_SCALE, 
+        #     USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
+        #     RETURN_SCORES=RETURN_SCORES, 
+        #     USE_SLIDING_WINDOW=USE_SLIDING_WINDOW, 
+        #     WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT, 
+        #     WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+        #     ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
+        # )
     
     # ========== Process FULL K Blocks (Fast Path) ==========
     if n_full_blocks > 0:
@@ -681,7 +709,10 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
 
     # handle masking edge cases
     if USE_SLIDING_WINDOW:
-        pass
+        if IS_CAUSAL:
+            pass
+        else:
+            pass
     else:
         if IS_CAUSAL:
             # When seqlen_q > seqlen_k, some rows are completely above the causal diagonal
