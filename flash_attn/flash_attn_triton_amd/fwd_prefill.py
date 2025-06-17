@@ -586,59 +586,12 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
 
     # ========== skip front blocks by advancing pointers ==========
     if n_front_skip_blocks > 0:
-        # advance pointers past the skipped blocks
-        k_ptrs += n_front_skip_blocks * BLOCK_N * stride_kn
-        v_ptrs += n_front_skip_blocks * BLOCK_N * stride_vk
-        if USE_BIAS:
-            bias_ptrs += n_front_skip_blocks * BLOCK_N * stride_bn
-        if RETURN_SCORES:
-            sd_mask_ptrs += n_front_skip_blocks * BLOCK_N * stride_sn
-        if ENABLE_DROPOUT:
-            dropout_mask_ptrs += n_front_skip_blocks * BLOCK_N * stride_sn
-            philox_ptrs += n_front_skip_blocks * BLOCK_N * stride_sn
+        pass
 
 
     # ========== Process MASKED K Blocks after window ==========
     if n_front_masked_blocks > 0:
-        # process front masked blocks
-        # acc, l_i, m_i = _attn_fwd_mask(
-        #     acc, l_i, m_i, 
-        #     q, k_ptrs, v_ptrs, bias_ptrs, 
-        #     stride_kn, stride_vk, stride_bn, stride_sn,
-        #     start_m, seqlen_k, seqlen_q, 
-        #     dropout_p, philox_seed, philox_ptrs,
-        #     sd_mask_ptrs, dropout_mask_ptrs,
-        #     offs_m, offs_n, offs_d,
-        #     block_min,        # Start of range: n_full_blocks * BLOCK_N
-        #     block_max,        # End of range: n_visible_k_blocks * BLOCK_N
-        #     n_extra_tokens,   # Padding tokens in last block
-        #     alibi_slope, 
-        #     descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
-        #     IS_CAUSAL,        # Use actual causal flag
-        #     BLOCK_M, BLOCK_DMODEL, BLOCK_N,
-        #     PRE_LOAD_V,
-        #     ENABLE_DROPOUT, PADDED_HEAD,
-        #     ACTUAL_BLOCK_DMODEL, SM_SCALE, 
-        #     USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
-        #     RETURN_SCORES=RETURN_SCORES, 
-        #     USE_SLIDING_WINDOW=USE_SLIDING_WINDOW, 
-        #     WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT, 
-        #     WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-        #     ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
-        # )  
-
-
-        # advance pointers past front masked blocks
-        k_ptrs += n_front_masked_blocks * BLOCK_N * stride_kn
-        v_ptrs += n_front_masked_blocks * BLOCK_N * stride_vk
-        if USE_BIAS:
-            bias_ptrs += n_front_masked_blocks * BLOCK_N * stride_bn
-        if RETURN_SCORES:
-            sd_mask_ptrs += n_front_masked_blocks * BLOCK_N * stride_sn
-        if ENABLE_DROPOUT:
-            dropout_mask_ptrs += n_front_masked_blocks * BLOCK_N * stride_sn
-            philox_ptrs += n_front_masked_blocks * BLOCK_N * stride_sn
-
+        pass
     
     # ========== Process FULL K Blocks (Fast Path) ==========
     if n_full_blocks > 0:
