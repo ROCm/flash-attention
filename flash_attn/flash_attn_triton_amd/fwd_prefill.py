@@ -599,35 +599,36 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
 
 
     # ========== Process MASKED K Blocks in the front ==========
-    if n_front_masked_blocks > 0:
+    # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
+    if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
         block_min = n_front_skip_blocks * BLOCK_N
         block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
         
-        # acc, l_i, m_i = _attn_fwd_mask(
-        #     acc, l_i, m_i, 
-        #     q, k_ptrs, v_ptrs, bias_ptrs, 
-        #     stride_kn, stride_vk, stride_bn, stride_sn,
-        #     start_m, seqlen_k, seqlen_q, 
-        #     dropout_p, philox_seed, philox_ptrs,
-        #     sd_mask_ptrs, dropout_mask_ptrs,
-        #     offs_m, offs_n, offs_d,
-        #     block_min,        # Start of front masked blocks
-        #     block_max,        # End of front masked blocks
-        #     0,                # n_extra_tokens (0 for front blocks, only relevant for last block)
-        #     alibi_slope, 
-        #     descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
-        #     IS_CAUSAL,
-        #     BLOCK_M, BLOCK_DMODEL, BLOCK_N,
-        #     PRE_LOAD_V,
-        #     ENABLE_DROPOUT, PADDED_HEAD,
-        #     ACTUAL_BLOCK_DMODEL, SM_SCALE, 
-        #     USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
-        #     RETURN_SCORES=RETURN_SCORES, 
-        #     USE_SLIDING_WINDOW=USE_SLIDING_WINDOW, 
-        #     WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT, 
-        #     WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-        #     ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
-        # )
+        acc, l_i, m_i = _attn_fwd_mask(
+            acc, l_i, m_i, 
+            q, k_ptrs, v_ptrs, bias_ptrs, 
+            stride_kn, stride_vk, stride_bn, stride_sn,
+            start_m, seqlen_k, seqlen_q, 
+            dropout_p, philox_seed, philox_ptrs,
+            sd_mask_ptrs, dropout_mask_ptrs,
+            offs_m, offs_n, offs_d,
+            block_min,        # Start of front masked blocks
+            block_max,        # End of front masked blocks
+            0,                # n_extra_tokens (0 for front blocks, only relevant for last block)
+            alibi_slope, 
+            descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
+            IS_CAUSAL,
+            BLOCK_M, BLOCK_DMODEL, BLOCK_N,
+            PRE_LOAD_V,
+            ENABLE_DROPOUT, PADDED_HEAD,
+            ACTUAL_BLOCK_DMODEL, SM_SCALE, 
+            USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
+            RETURN_SCORES=RETURN_SCORES, 
+            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW, 
+            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT, 
+            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
+        )
     
     # ========== Process FULL K Blocks (Fast Path) ==========
     if n_full_blocks > 0:
