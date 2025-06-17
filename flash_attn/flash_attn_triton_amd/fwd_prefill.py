@@ -128,6 +128,7 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=v_mask_other) if PADDED_HEAD else tl.load(v_ptrs)
         
+        # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # -- compute qk ----
@@ -257,17 +258,18 @@ def _attn_fwd_mask(acc, l_i, m_i,
         if PRE_LOAD_V:
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
         
+        # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
+        
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
-        
         # If this is the last block / iteration, we want to
         # mask if the sequence length is not a multiple of block size
         # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
         # last step might get wasted but that is okay. check if this masking works For
         # that case.
-        if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
+        if (n_extra_tokens != 0) and (start_n + BLOCK_N == block_max):
             boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
             size_n = start_n + offs_n[None, :]
             mask = size_n < boundary_m[:, None]
@@ -287,10 +289,13 @@ def _attn_fwd_mask(acc, l_i, m_i,
                                               kv_offs_n)
             qk_scaled += alibi_block
 
-        if IS_CAUSAL:
-            causal_boundary = start_n + offs_n - seqlen_delta_qk
-            causal_mask = offs_m[:, None] >= causal_boundary[None, :]
-            qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+        if USE_SLIDING_WINDOW:
+            pass
+        else:
+            if IS_CAUSAL:
+                causal_boundary = start_n + offs_n - seqlen_delta_qk
+                causal_mask = offs_m[:, None] >= causal_boundary[None, :]
+                qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
         
         # compute qk mask
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
