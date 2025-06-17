@@ -373,13 +373,16 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
                       WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr,
                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     """
-    Classify K blocks for attention computation.
+    Classify K blocks for attention computation with sliding window support.
     
     Returns:
-        - n_full_blocks: How many full blocks (no masking) to process
-        - n_masked_blocks: How many masked blocks (need masking) to process
+        - n_front_skip_blocks: Blocks completely before the window
+        - n_front_masked_blocks: Blocks partially overlapping window front
+        - n_full_blocks: Blocks completely inside the window
+        - n_back_masked_blocks: Blocks partially overlapping window back
         - n_extra_tokens: Padding tokens in last K block
     """
+
     # Total K blocks in the key sequence
     total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
 
@@ -391,41 +394,44 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
     else:
         n_extra_tokens = 0 
     
-    if IS_CAUSAL:
-        # ========== CAUSAL MODE: Classify K Blocks ==========
-        # Calculate causal boundary for this Q block
-        m_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-        
-        # Check if this program can see ANY K blocks
-        last_visible_k_pos = m_block_end + (seqlen_k - seqlen_q)
-        
-        if last_visible_k_pos < 0:
-            # All K blocks are above the diagonal
-            return 0, 0, n_extra_tokens
-        
-        # Calculate visible blocks directly
-        n_visible_k_blocks = tl.minimum(tl.cdiv(last_visible_k_pos + 1, BLOCK_N), total_k_blocks)
-        
-        # Count masked blocks (blocks that intersect the diagonal)
-        # If Q and K blocks are aligned, we need BLOCK_M//BLOCK_N masked blocks
-        # Otherwise we need one extra
-        is_aligned = (n_extra_tokens == 0) & (seqlen_q % BLOCK_M == 0)
-        n_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_aligned, 0, 1)
-        n_masked_blocks = tl.minimum(n_masked_blocks, n_visible_k_blocks)
-        
-        # The rest are full blocks
-        n_full_blocks = n_visible_k_blocks - n_masked_blocks
+    if USE_SLIDING_WINDOW:
+        return 0, 0, 0, 0, 0
     else:
-        # ========== NON-CAUSAL MODE ==========
-        # Check if last K block needs padding
-        if n_extra_tokens != 0:
-            n_masked_blocks = 1  # Last block needs padding mask
-            n_full_blocks = total_k_blocks - 1
+        if IS_CAUSAL:
+            # ========== CAUSAL MODE: Classify K Blocks ==========
+            # Calculate causal boundary for this Q block
+            m_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+            
+            # Check if this program can see ANY K blocks
+            last_visible_k_pos = m_block_end + (seqlen_k - seqlen_q)
+            
+            if last_visible_k_pos < 0:
+                # All K blocks are above the diagonal
+                return 0, 0, 0, 0, n_extra_tokens
+            
+            # Calculate visible blocks directly
+            n_visible_k_blocks = tl.minimum(tl.cdiv(last_visible_k_pos + 1, BLOCK_N), total_k_blocks)
+            
+            # Count masked blocks (blocks that intersect the diagonal)
+            # If Q and K blocks are aligned, we need BLOCK_M//BLOCK_N masked blocks
+            # Otherwise we need one extra
+            is_aligned = (n_extra_tokens == 0) & (seqlen_q % BLOCK_M == 0)
+            n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_aligned, 0, 1)
+            n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
+            
+            # The rest are full blocks
+            n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
         else:
-            n_masked_blocks = 0  # All blocks are aligned
-            n_full_blocks = total_k_blocks
+            # ========== NON-CAUSAL MODE ==========
+            # Check if last K block needs padding
+            if n_extra_tokens != 0:
+                n_back_masked_blocks = 1  # Last block needs padding mask
+                n_full_blocks = total_k_blocks - 1
+            else:
+                n_back_masked_blocks = 0  # All blocks are aligned
+                n_full_blocks = total_k_blocks
     
-    return n_full_blocks, n_masked_blocks, n_extra_tokens
+        return 0, 0, n_full_blocks, n_back_masked_blocks, n_extra_tokens
 
 @triton.autotune(
     configs=autotune_configs,
@@ -499,14 +505,16 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     
 
     # figure out masking pattern
-    n_full_blocks, n_masked_blocks, n_extra_tokens = compute_masking(
-        seqlen_k, seqlen_q, start_m, IS_CAUSAL, USE_SLIDING_WINDOW, WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT, BLOCK_M, BLOCK_N
+    n_front_skip_blocks, n_front_masked_blocks, n_full_blocks, n_back_masked_blocks, n_extra_tokens = compute_masking(
+        seqlen_k, seqlen_q, start_m, IS_CAUSAL, USE_SLIDING_WINDOW, 
+        WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT, BLOCK_M, BLOCK_N
     )
 
     # ============================================================
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
     # ============================================================
-    if n_full_blocks == 0 and n_masked_blocks == 0:
+    total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
+    if total_visible_blocks == 0:
         """
         No K blocks visible - write zeros and exit.
         """
@@ -576,7 +584,63 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         q_ptrs_mask = q_ptrs_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
-    # ========== CALL 1: Process FULL K Blocks (Fast Path) ==========
+    # ========== skip front blocks by advancing pointers ==========
+    if n_front_skip_blocks > 0:
+        # advance pointers past the skipped blocks
+        k_ptrs += n_front_skip_blocks * BLOCK_N * stride_kn
+        v_ptrs += n_front_skip_blocks * BLOCK_N * stride_vk
+        if USE_BIAS:
+            bias_ptrs += n_front_skip_blocks * BLOCK_N * stride_bn
+        if RETURN_SCORES:
+            sd_mask_ptrs += n_front_skip_blocks * BLOCK_N * stride_sn
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += n_front_skip_blocks * BLOCK_N * stride_sn
+            philox_ptrs += n_front_skip_blocks * BLOCK_N * stride_sn
+
+
+    # ========== Process MASKED K Blocks after window ==========
+    if n_front_masked_blocks > 0:
+        # process front masked blocks
+        # acc, l_i, m_i = _attn_fwd_mask(
+        #     acc, l_i, m_i, 
+        #     q, k_ptrs, v_ptrs, bias_ptrs, 
+        #     stride_kn, stride_vk, stride_bn, stride_sn,
+        #     start_m, seqlen_k, seqlen_q, 
+        #     dropout_p, philox_seed, philox_ptrs,
+        #     sd_mask_ptrs, dropout_mask_ptrs,
+        #     offs_m, offs_n, offs_d,
+        #     block_min,        # Start of range: n_full_blocks * BLOCK_N
+        #     block_max,        # End of range: n_visible_k_blocks * BLOCK_N
+        #     n_extra_tokens,   # Padding tokens in last block
+        #     alibi_slope, 
+        #     descale_q, descale_k, descale_v, IS_FP8, FP8_MAX,
+        #     IS_CAUSAL,        # Use actual causal flag
+        #     BLOCK_M, BLOCK_DMODEL, BLOCK_N,
+        #     PRE_LOAD_V,
+        #     ENABLE_DROPOUT, PADDED_HEAD,
+        #     ACTUAL_BLOCK_DMODEL, SM_SCALE, 
+        #     USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
+        #     RETURN_SCORES=RETURN_SCORES, 
+        #     USE_SLIDING_WINDOW=USE_SLIDING_WINDOW, 
+        #     WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT, 
+        #     WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+        #     ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
+        # )  
+
+
+        # advance pointers past front masked blocks
+        k_ptrs += n_front_masked_blocks * BLOCK_N * stride_kn
+        v_ptrs += n_front_masked_blocks * BLOCK_N * stride_vk
+        if USE_BIAS:
+            bias_ptrs += n_front_masked_blocks * BLOCK_N * stride_bn
+        if RETURN_SCORES:
+            sd_mask_ptrs += n_front_masked_blocks * BLOCK_N * stride_sn
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += n_front_masked_blocks * BLOCK_N * stride_sn
+            philox_ptrs += n_front_masked_blocks * BLOCK_N * stride_sn
+
+    
+    # ========== Process FULL K Blocks (Fast Path) ==========
     if n_full_blocks > 0:
         """
         Process K blocks that are FULL blocks (no masking needed).
@@ -610,9 +674,20 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
             USE_ALIBI=USE_ALIBI, USE_EXP2=USE_EXP2, 
             RETURN_SCORES=RETURN_SCORES, ACCUMULATOR_TYPE=ACCUMULATOR_TYPE
         )
+
+        # Advance pointers past the full blocks
+        k_ptrs += n_full_blocks * BLOCK_N * stride_kn
+        v_ptrs += n_full_blocks * BLOCK_N * stride_vk
+        if USE_BIAS:
+            bias_ptrs += n_full_blocks * BLOCK_N * stride_bn
+        if RETURN_SCORES:
+            sd_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
+            philox_ptrs += n_full_blocks * BLOCK_N * stride_sn
     
-    # ========== CALL 2: Process MASKED K Blocks (Slow Path) ==========
-    if n_masked_blocks > 0:
+    # ========== Process MASKED K Blocks after window ==========
+    if n_back_masked_blocks > 0:
         """
         Process K blocks that are MASKED blocks (need masking).
         
@@ -626,20 +701,9 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         at n_visible_k_blocks, not total_k_blocks!
         """
         
-        # Advance pointers past the full blocks
-        k_ptrs += n_full_blocks * BLOCK_N * stride_kn
-        v_ptrs += n_full_blocks * BLOCK_N * stride_vk
-        if USE_BIAS:
-            bias_ptrs += n_full_blocks * BLOCK_N * stride_bn
-        if RETURN_SCORES:
-            sd_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
-        if ENABLE_DROPOUT:
-            dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sn
-            philox_ptrs += n_full_blocks * BLOCK_N * stride_sn
-       
         # define the range for masked blocks
         block_min = n_full_blocks * BLOCK_N         # Start after full blocks
-        block_max = (n_full_blocks + n_masked_blocks) * BLOCK_N      # End at last visible block
+        block_max = (n_full_blocks + n_back_masked_blocks) * BLOCK_N      # End at last visible block
         
         acc, l_i, m_i = _attn_fwd_mask(
             acc, l_i, m_i, 
