@@ -386,11 +386,20 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
         - n_back_masked_blocks: Blocks partially overlapping window back
         - n_extra_tokens: Padding tokens in last K block
     """
+    # Example case
+    # BLOCK_M = 4, BLOCK_N = 4, seqlen_q = 8, seqlen_k = 10
 
     # Total K blocks in the key sequence
     total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
 
     # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
+    # n_extra_tokens = 10 % 4 = 2
+    # This means the last K block has 2 valid tokens and 2 padding positions
+    # K blocks visualization:
+    #         Block 0         Block 1         Block 2 (last)
+    #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
+    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
+    #         full block     full block      valid  pad
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
     elif seqlen_k % BLOCK_N:
@@ -407,11 +416,23 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
         if IS_CAUSAL:
             # ========== CAUSAL MODE: Classify K Blocks ==========
             # Calculate causal boundary for this Q block
-            m_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-            
+            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
+            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
+            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
+            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
+            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
+            #                            ↑ can see up to K5
+            #
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
+            #                                           ↑ can see up to K9
+            # q_block_start = start_m * BLOCK_M
+            q_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+
             # Check if this program can see ANY K blocks
-            last_visible_k_pos = m_block_end + (seqlen_k - seqlen_q)
-            
+            last_visible_k_pos = q_block_end + (seqlen_k - seqlen_q) 
             if last_visible_k_pos < 0:
                 # All K blocks are above the diagonal
                 return 0, 0, 0, 0, n_extra_tokens
@@ -425,7 +446,7 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
             # calculate is_modulo_mn
             padded_block_k = n_extra_tokens != 0
             is_modulo_mn = (not padded_block_k) & (seqlen_q % BLOCK_M == 0)
-            
+
             # Count masked blocks
             n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
             n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
@@ -434,7 +455,19 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
             n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
         else:
             # ========== NON-CAUSAL MODE ==========
-            # Check if last K block needs padding
+            # Without causal mask, all positions can attend to all positions
+            # Only need to handle the padding in the last block
+            #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
+            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            
             if n_extra_tokens != 0:
                 n_back_masked_blocks = 1  # Last block needs padding mask
                 n_full_blocks = total_k_blocks - 1
@@ -718,6 +751,16 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         if IS_CAUSAL:
             # When seqlen_q > seqlen_k, some rows are completely above the causal diagonal
             # These rows have all -inf attention scores, resulting in NaN after softmax
+            # e.g.
+            # Q length: 6, K length: 4
+            # Causal mask (X = can attend, . = cannot):
+            #    K0 K1 K2 K3
+            # Q0   .  .  .  .  <- All masked, would give NaN
+            # Q1   .  .  .  .  <- All masked, would give NaN  
+            # Q2   X  .  .  .  <- First valid row
+            # Q3   X  X  .  .
+            # Q4   X  X  X  .
+            # Q5   X  X  X  X
             causal_start_idx = seqlen_q - seqlen_k
             start_m_idx = start_m * BLOCK_M
             

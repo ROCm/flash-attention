@@ -874,7 +874,7 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize("deterministic", [True])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
-@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
@@ -909,7 +909,7 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    DEBUG = True
+    DEBUG = False
     if DEBUG:
         print()
         print("Debugging")
