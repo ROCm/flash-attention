@@ -427,32 +427,49 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
             #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
-            #                                           ↑ can see up to K9
-            # q_block_start = start_m * BLOCK_M
-            q_block_end = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
 
-            # Check if this program can see ANY K blocks
-            last_visible_k_pos = q_block_end + (seqlen_k - seqlen_q) 
-            if last_visible_k_pos < 0:
-                # All K blocks are above the diagonal
+            # ------------------------------------------------------------
+            # 1. figure out, in tokens, the right-most K position
+            #    this Q-block may attend to
+            # ------------------------------------------------------------
+            q_start      = start_m * BLOCK_M
+            q_end        = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+
+            # causal diagonal offset between the two streams
+            diag         = seqlen_k - seqlen_q          # 0 when |Q| == |K|
+            k_max_token  = q_end + diag                 # last visible K index
+
+            # this Q-block is entirely above the diagonal ⇒ nothing to do
+            if k_max_token < 0:
                 return 0, 0, 0, 0, n_extra_tokens
 
-            # This program can see some K blocks
-            # Which K blocks are visible (not skipped)?
-            last_visible_k_block = tl.cdiv(last_visible_k_pos + 1, BLOCK_N) - 1
-            n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
-            
-            # Of the visible blocks, which are FULL vs MASKED?
-            # calculate is_modulo_mn
-            padded_block_k = n_extra_tokens != 0
-            is_modulo_mn = (not padded_block_k) & (seqlen_q % BLOCK_M == 0)
+            k_max_token  = tl.minimum(k_max_token, seqlen_k - 1)
 
-            # Count masked blocks
+            # ------------------------------------------------------------
+            # 2. translate token indices into K-block indices
+            # ------------------------------------------------------------
+            last_visible_k_block = k_max_token // BLOCK_N
+            n_visible_k_blocks   = tl.minimum(last_visible_k_block + 1, total_k_blocks)
+
+            # ------------------------------------------------------------
+            # 3. classify those visible blocks
+            #    – we *never* skip or mask blocks in front, because causal
+            #      attention always starts at K0
+            #    – the back side can require several masked blocks:
+            #         • intersection of the causal diagonal with K-grid
+            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
+            #         • plus one extra block if this Q-block stops in the
+            #           middle of a K-block or the last K-block is padded
+            # ------------------------------------------------------------
+            padded_last_k = n_extra_tokens != 0
+            is_modulo_mn  = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
+
             n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
             n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
-            
-            # The rest are full blocks
-            n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
+
+            n_front_skip_blocks   = 0        # causal never skips the left side
+            n_front_masked_blocks = 0        # ditto
+            n_full_blocks         = n_visible_k_blocks - n_back_masked_blocks
         else:
             # ========== NON-CAUSAL MODE ==========
             # Without causal mask, all positions can attend to all positions
@@ -468,6 +485,8 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
             
+            n_front_skip_blocks   = 0        # never skips the left side
+            n_front_masked_blocks = 0        # ditto
             if n_extra_tokens != 0:
                 n_back_masked_blocks = 1  # Last block needs padding mask
                 n_full_blocks = total_k_blocks - 1
@@ -475,7 +494,7 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
                 n_back_masked_blocks = 0  # All blocks are aligned
                 n_full_blocks = total_k_blocks
     
-        return 0, 0, n_full_blocks, n_back_masked_blocks, n_extra_tokens
+        return n_front_skip_blocks, n_front_masked_blocks, n_full_blocks, n_back_masked_blocks, n_extra_tokens
 
 @triton.autotune(
     configs=autotune_configs,
