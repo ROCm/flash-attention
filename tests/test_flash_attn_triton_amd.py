@@ -888,6 +888,8 @@ def test_flash_attn_varlen_qkvpacked(
     "seqlen_q,seqlen_k",
     [
         (32, 32),
+        (32, 64),
+        (64, 64),
         (113, 203),
         (128, 217),
         (113, 211),
