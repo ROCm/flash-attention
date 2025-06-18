@@ -158,7 +158,9 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
         # scale and subtract max
-        q_shifted = qk_scaled - m_ij[:, None]
+        q_shifted = tl.where(m_ij[:, None] == float("-inf"), 
+                                float("-inf"), 
+                                qk_scaled - m_ij[:, None])
         
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -194,7 +196,9 @@ def _attn_fwd_no_mask(acc, l_i, m_i,
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = m_i - m_ij
+        m_diff = tl.where(m_ij == float("-inf"), 
+                                float("-inf"), 
+                                m_i - m_ij)
         if USE_EXP2:
             alpha = tl.math.exp2(m_diff * RCP_LN2)
         else:
@@ -293,7 +297,46 @@ def _attn_fwd_mask(acc, l_i, m_i,
             if IS_CAUSAL:
                 pass
             else:
-                pass
+                # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
+                # Exactly matching reference construct_local_mask:
+                # row_idx = query positions, col_idx = key positions
+                # sk = seqlen_k, sq = seqlen_q
+                
+                # Get positions  
+                row_idx = start_m * BLOCK_M + offs_m  # Query positions
+                col_idx = kv_offs_n  # Key positions
+                
+                # sk and sq from reference (no padding masks in this test)
+                sk = seqlen_k
+                sq = seqlen_q
+                
+                # Expand for broadcasting
+                row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
+                col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
+                
+                # Reference logic for mask computation
+                if WINDOW_SIZE_LEFT < 0:
+                    # Reference: return col_idx > row_idx + sk - sq + window_size[1]
+                    mask = col_idx_expanded > (row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT)
+                else:
+                    # Reference: 
+                    # sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+                    # return torch.logical_or(
+                    #     col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
+                    #     col_idx < row_idx + sk - sq - window_size[0],
+                    # )
+                    sk_expanded = tl.full((1, 1), sk, dtype=tl.int32)
+                    
+                    # Compute boundaries
+                    right_bound_val = row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
+                    right_bound = tl.minimum(right_bound_val, sk_expanded)
+                    left_bound = row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
+                    
+                    # Mask where True = cannot attend (matching reference)
+                    mask = (col_idx_expanded > right_bound) | (col_idx_expanded < left_bound)
+                
+                # Apply mask (set to -inf where mask is True)
+                qk_scaled = tl.where(~mask, qk_scaled, float("-inf"))
         else:
             if IS_CAUSAL:
                 causal_boundary = start_n + offs_n - seqlen_delta_qk
@@ -313,7 +356,17 @@ def _attn_fwd_mask(acc, l_i, m_i,
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
         # scale and subtract max
-        q_shifted = qk_scaled - m_ij[:, None]
+        # IMPORTANT: Handle the case where all values are -inf
+        # When m_ij = -inf and qk_scaled = -inf, subtraction gives NaN
+        # We need to handle this explicitly
+        if USE_SLIDING_WINDOW:
+            # Check if this block has any valid values (m_ij != -inf)
+            # For rows where everything is -inf, set q_shifted to -inf (not NaN)
+            q_shifted = tl.where(m_ij[:, None] == float("-inf"), 
+                                float("-inf"), 
+                                qk_scaled - m_ij[:, None])
+        else:
+            q_shifted = qk_scaled - m_ij[:, None]
         
         # Compute scaled QK and softmax probabilities
         if USE_EXP2:
@@ -349,7 +402,9 @@ def _attn_fwd_mask(acc, l_i, m_i,
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = m_i - m_ij
+        m_diff = tl.where(m_ij == float("-inf"), 
+                                float("-inf"), 
+                                m_i - m_ij)
         if USE_EXP2:
             alpha = tl.math.exp2(m_diff * RCP_LN2)
         else:
@@ -411,7 +466,14 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
         if IS_CAUSAL:
             return 0, 0, 0, 0, 0
         else:
-            return 0, 0, 0, 0, 0
+            # ========== NON-CAUSAL SLIDING WINDOW ==========
+            # For now, we'll use a simple approach: 
+            # Process all blocks with masking since we have a sliding window
+            # This is less efficient than skipping blocks, but ensures correctness
+            
+            # TODO: Optimize by computing which blocks can be fully skipped
+            # For now, process all blocks with the mask function
+            return 0, 0, 0, total_k_blocks, n_extra_tokens
     else:
         if IS_CAUSAL:
             # ========== CAUSAL MODE: Classify K Blocks ==========
@@ -742,7 +804,17 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
     #                        EPILOGUE
     # ============================================================
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
-    l_recip = 1 / l_i[:, None]
+    # Instead of directly computing 1/l_i which can be inf, 
+    # we check for the invalid case first
+    if USE_SLIDING_WINDOW:
+        # For rows where m_i is still -inf, no keys were valid
+        # Set l_i to 1.0 to avoid division by zero (acc is already 0)
+        invalid_mask = m_i == float("-inf")
+        l_i_safe = tl.where(invalid_mask, 1.0, l_i)
+        l_recip = 1 / l_i_safe[:, None]
+    else:
+        # Original code path
+        l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
@@ -754,11 +826,24 @@ def attn_fwd(Q, K, V, bias, Cache_seqlens, Cache_batch_idx,
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
         mi_base2 = m_i * RCP_LN2
-        softmax_lse = mi_base2 + tl.math.log2(l_i)
+        # For invalid rows, log(l_i) would be -inf, but we want LSE to be -inf
+        # So we handle this case explicitly
+        if USE_SLIDING_WINDOW:
+            log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i))
+            softmax_lse = mi_base2 + log_l_i
+            # Ensure invalid rows have LSE = -inf
+            softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
+        else:
+            softmax_lse = mi_base2 + tl.math.log2(l_i)
         # convert back to natural units
         softmax_lse *= LN2
     else:
-        softmax_lse = m_i + tl.math.log(l_i)
+        if USE_SLIDING_WINDOW:
+            log_l_i = tl.where(invalid_mask, 0.0, tl.math.log(l_i))
+            softmax_lse = m_i + log_l_i
+            softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
+        else:
+            softmax_lse = m_i + tl.math.log(l_i)
 
     # handle masking edge cases
     if USE_SLIDING_WINDOW:
