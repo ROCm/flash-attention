@@ -864,15 +864,15 @@ def test_flash_attn_varlen_qkvpacked(
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
-@pytest.mark.parametrize("kvpacked", [False])
+@pytest.mark.parametrize("kvpacked", [True, False])
 # @pytest.mark.parametrize("kvpacked", [False])
-@pytest.mark.parametrize("dtype", ([torch.float16] ))
+@pytest.mark.parametrize("dtype", ([torch.float16] if skip_bfloat16 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("deterministic", [True])
-@pytest.mark.parametrize("alibi", [False])
+@pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [True])
 # @pytest.mark.parametrize("local", [False])
@@ -907,7 +907,7 @@ def test_flash_attn_varlen_qkvpacked(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-@pytest.mark.parametrize("dropout_p", [0.0])
+@pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("softcap", [0.0])
 def test_flash_attn_output(
