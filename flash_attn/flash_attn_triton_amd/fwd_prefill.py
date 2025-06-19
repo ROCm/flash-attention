@@ -303,7 +303,7 @@ def _attn_fwd_mask(acc, l_i, m_i,
                 # sk = seqlen_k, sq = seqlen_q
                 
                 # Get positions  
-                row_idx = start_m * BLOCK_M + offs_m  # Query positions
+                row_idx = offs_m  # Query positions
                 col_idx = kv_offs_n  # Key positions
                 
                 # sk and sq from reference (no padding masks in this test)
@@ -325,18 +325,20 @@ def _attn_fwd_mask(acc, l_i, m_i,
                     #     col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
                     #     col_idx < row_idx + sk - sq - window_size[0],
                     # )
-                    sk_expanded = tl.full((1, 1), sk, dtype=tl.int32)
+                    # Create sk tensor with proper shape for broadcasting
+                    # sk represents the key sequence length, which should be compared per column
+                    sk_full = tl.full((1, BLOCK_N), sk, dtype=tl.int32)
                     
                     # Compute boundaries
                     right_bound_val = row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
-                    right_bound = tl.minimum(right_bound_val, sk_expanded)
+                    right_bound = tl.minimum(right_bound_val, sk_full)
                     left_bound = row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
                     
                     # Mask where True = cannot attend (matching reference)
                     mask = (col_idx_expanded > right_bound) | (col_idx_expanded < left_bound)
                 
                 # Apply mask (set to -inf where mask is True)
-                qk_scaled = tl.where(~mask, qk_scaled, float("-inf"))
+                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
         else:
             if IS_CAUSAL:
                 causal_boundary = start_n + offs_n - seqlen_delta_qk

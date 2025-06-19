@@ -878,7 +878,7 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("causal", [True])
-@pytest.mark.parametrize("d", [32])
+@pytest.mark.parametrize("d", [32, 40, 59, 64, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -887,20 +887,23 @@ def test_flash_attn_varlen_qkvpacked(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (32, 32),
-        (32, 64),
-        (64, 32),
-        (64, 64),
-        # (113, 203),
-        # (128, 217),
-        # (113, 211),
-        # (108, 256),
-        # (256, 512),
-        # (512, 256),
-        # (1024, 1024),
-        # (1023, 1024),
-        # (1024, 1023),
-        # (2048, 2048),
+        # debug
+        # (32, 32),
+        # (32, 64),
+        # (64, 32),
+        # (64, 64),
+        # (128, 128),
+        # og
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -911,6 +914,8 @@ def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     DEBUG = False
+    BATCH_AND_HEAD_ONE = False
+    SAVE_TO_CSV = False
     TEST_BACKWARD = False
     if DEBUG:
         print()
@@ -930,7 +935,7 @@ def test_flash_attn_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    if DEBUG:
+    if BATCH_AND_HEAD_ONE:
         batch_size = 1
         nheads = 1
         nheads_k = 1
@@ -1158,10 +1163,16 @@ def test_flash_attn_output(
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
     if DEBUG:
+        print("window_size:", window_size)
         print("out:", out, out.shape)
         print("out_ref:", out_ref, out_ref.shape)
-        save_tensor_to_csv(out[0,:,0,:], "out.csv")
-        save_tensor_to_csv(out_ref[0,:,0,:], "out_ref")
+    if SAVE_TO_CSV:
+        for batch_idx in range(batch_size):
+            for head_idx in range(nheads):
+                save_tensor_to_csv(out[batch_idx, :, head_idx, :], 
+                                f"out_b{batch_idx}_h{head_idx}.csv")
+                save_tensor_to_csv(out_ref[batch_idx, :, head_idx, :], 
+                                f"out_ref_b{batch_idx}_h{head_idx}.csv")
         
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
