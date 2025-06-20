@@ -931,3 +931,15 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
 
     for file, fp8_found in ttir_files_fp8_found_status.items():
         assert fp8_found, f"{fp8_types} not found in {file}"
+
+
+def test_torch_compile():
+    # flash_attn_func
+    q = torch.rand(32, 531, 32, 128).to(torch.bfloat16).to("cuda:0").requires_grad_()
+    k = torch.rand(32, 531, 32, 128).to(torch.bfloat16).to("cuda:0").requires_grad_()
+    v = torch.rand(32, 531, 32, 128).to(torch.bfloat16).to("cuda:0").requires_grad_()
+    sdpa = torch.compile(flash_attn_func)
+    o = sdpa(q,k,v)
+    print(type(o))
+    o.sum().backward()
+    print("SUCCESS")
