@@ -1157,7 +1157,10 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk_strides
     stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv_strides
     stride_dob, stride_doh, stride_dom, stride_dod = do_strides
-    stride_lse_b, stride_lse_h, stride_lse_m = (0, softmax_lse.stride(0), softmax_lse.stride(1)) if IS_VARLEN else softmax_lse.stride()
+    if IS_VARLEN:
+        stride_lse_b, stride_lse_m, stride_lse_h = (0, softmax_lse.stride(0), softmax_lse.stride(1))
+    else:
+        stride_lse_b, stride_lse_h, stride_lse_m = softmax_lse.stride()
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
 
     # get closest power of 2 over or equal to 32.
@@ -1169,7 +1172,10 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     # init delta
     if OLD_LSE:
         delta = torch.empty_like(softmax_lse)
-        stride_delta_b, stride_delta_h, stride_delta_m =  (0, delta.stride(0), delta.stride(1)) if IS_VARLEN else delta.stride()
+        if IS_VARLEN:
+            stride_delta_b, stride_delta_m, stride_delta_h = (0, delta.stride(0), delta.stride(1))
+        else:
+            stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
     else:
         if IS_VARLEN:
             delta = torch.empty_like(softmax_lse)
@@ -1302,4 +1308,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     if OLD_LSE:
         return delta
     else:
-        return delta_padded
+        if IS_VARLEN:
+            return delta
+        else:
+            return delta_padded
