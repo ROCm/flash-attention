@@ -20,7 +20,7 @@ from flash_attn import (
     flash_attn_varlen_qkvpacked_fp8_func
 )
 
-from .utils import DEBUG, input_helper, arch_supports_fp8
+from .utils import DEBUG, input_helper, arch_supports_fp8, generate_varlen_tensor
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
@@ -932,14 +932,29 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
     for file, fp8_found in ttir_files_fp8_found_status.items():
         assert fp8_found, f"{fp8_types} not found in {file}"
 
-
-def test_torch_compile():
+@pytest.mark.parametrize(
+    "BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD",
+    [
+        (32, 32, 32, 531, 531, 128),
+    ],
+)
+def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
     # flash_attn_func
-    q = torch.rand(32, 531, 32, 128).to(torch.bfloat16).to("cuda:0").requires_grad_()
-    k = torch.rand(32, 531, 32, 128).to(torch.bfloat16).to("cuda:0").requires_grad_()
-    v = torch.rand(32, 531, 32, 128).to(torch.bfloat16).to("cuda:0").requires_grad_()
+    q = torch.rand(BATCH, N_CTX_Q, HQ, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
+    k = torch.rand(BATCH, N_CTX_K, HK, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
+    v = torch.rand(BATCH, N_CTX_K, HK, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
     sdpa = torch.compile(flash_attn_func)
     o = sdpa(q,k,v)
+    print(type(o))
+    o.sum().backward()
+    print("SUCCESS")
+
+    # flash_attn_varlen_func
+    q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(BATCH * N_CTX_Q, HQ, D_HEAD, batch_size=BATCH)
+    k, cu_seqlens_k, max_seqlen_k = generate_varlen_tensor(BATCH * N_CTX_K, HK, D_HEAD, batch_size=BATCH)
+    v, _, _ = generate_varlen_tensor(BATCH * N_CTX_K, HK, D_HEAD, batch_size=BATCH)
+    sdpa_varlen = torch.compile(flash_attn_varlen_func)
+    o = sdpa_varlen(q,k,v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
     print(type(o))
     o.sum().backward()
     print("SUCCESS")
