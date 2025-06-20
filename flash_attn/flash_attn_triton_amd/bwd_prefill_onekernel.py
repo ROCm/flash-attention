@@ -1063,7 +1063,7 @@ def is_contiguous(x, name):
         return x.contiguous() 
     
 
-ROUNDED_LSE = os.environ.get('ROUNDED_LSE', '0').lower() in ('1', 'true', 'yes')
+OLD_LSE = os.environ.get('OLD_LSE', '0').lower() in ('1', 'true', 'yes')
 
 def attention_prefill_backward_triton_split_oneKernel_impl(
     do: torch.Tensor,
@@ -1167,7 +1167,10 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
     ACTUAL_HEAD_DIM = head_size
 
     # init delta
-    if ROUNDED_LSE:
+    if OLD_LSE:
+        delta = torch.empty_like(softmax_lse)
+        stride_delta_b, stride_delta_h, stride_delta_m =  (0, delta.stride(0), delta.stride(1)) if IS_VARLEN else delta.stride()
+    else:
         if IS_VARLEN:
             delta = torch.empty_like(softmax_lse)
             stride_delta_b, stride_delta_m, stride_delta_h = (0, delta.stride(0), delta.stride(1))
@@ -1178,9 +1181,6 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
                             device=softmax_lse.device, dtype=torch.float32)
             delta = delta_padded[:, :, :max_seqlen_q_final]
             stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
-    else:
-        delta = torch.empty_like(softmax_lse)
-        stride_delta_b, stride_delta_h, stride_delta_m =  (0, delta.stride(0), delta.stride(1)) if IS_VARLEN else delta.stride()
 
     pre_grid = lambda META:  (triton.cdiv(max_seqlen_q_final, META['PRE_BLOCK']), batch, nheads_q)
     _bwd_preprocess[pre_grid](
@@ -1299,7 +1299,7 @@ def attention_prefill_backward_triton_split_oneKernel_impl(
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
 
-    if ROUNDED_LSE:
-        return delta_padded
-    else:
+    if OLD_LSE:
         return delta
+    else:
+        return delta_padded
