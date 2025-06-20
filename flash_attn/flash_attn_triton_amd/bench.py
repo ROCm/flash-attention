@@ -80,7 +80,7 @@ class EnvVariableConfig:
     backend: Optional[Literal["triton", "ck"]] = None
 
 ENV_VARIABLE_CONFIGS : List[EnvVariableConfig] = [
-    # EnvVariableConfig(key="BWD_MODE", values=["split", "fused", "jingning"], backend="triton"),
+    # EnvVariableConfig(key="BWD_MODE", values=["split", "fused_atomics", "fused_no_atomics"], backend="triton"),
 ]
 
 class FunctionConfig:

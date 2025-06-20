@@ -23,7 +23,7 @@ from flash_attn import (
 from .utils import DEBUG, input_helper, arch_supports_fp8
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .fwd_prefill import attention_prefill_forward_triton_impl
-from .bwd_prefill_onekernel import attention_prefill_backward_triton_split_oneKernel_impl
+from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 
 # set print options
@@ -334,7 +334,7 @@ def test_op_prefill_bwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
     dq_triton = torch.zeros_like(q_triton, dtype=q.dtype) # NOTE: the kernel does inplace accumlation on dq so dq has to be zeros
     dk_triton = torch.zeros_like(k_triton, dtype=k.dtype) if DEBUG_INPUT else torch.empty_like(k_triton, dtype=k.dtype)
     dv_triton = torch.zeros_like(v_triton, dtype=v.dtype) if DEBUG_INPUT else torch.empty_like(v_triton, dtype=v.dtype)
-    delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+    delta_triton = attention_prefill_backward_triton_split_fused_no_atomics_impl(
         do_triton,
         q_triton,
         k_triton,

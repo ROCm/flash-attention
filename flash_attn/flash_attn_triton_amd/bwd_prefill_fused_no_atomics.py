@@ -1065,7 +1065,7 @@ def is_contiguous(x, name):
 
 OLD_LSE = os.environ.get('OLD_LSE', '0').lower() in ('1', 'true', 'yes')
 
-def attention_prefill_backward_triton_split_oneKernel_impl(
+def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     do: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,

@@ -3,8 +3,8 @@ import os
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill import attention_prefill_backward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
-from .bwd_prefill_fused import _flash_attn_backward as attention_prefill_backward_triton_fused_impl
-from .bwd_prefill_onekernel import attention_prefill_backward_triton_split_oneKernel_impl
+from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atmoics_impl
+from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
@@ -15,7 +15,7 @@ from typing import Literal, Optional, Union
 
 
 USE_EXP2 = True
-BWD_MODE = os.environ.get('BWD_MODE', 'jingning').lower()
+BWD_MODE = os.environ.get('BWD_MODE', 'fused_no_atomics').lower()
 
 def fwd(q: torch.Tensor,
         k: torch.Tensor,
@@ -303,8 +303,8 @@ def bwd(
                 descale_dv,
             )
             delta = delta_triton
-        elif BWD_MODE == "fused":
-            delta_triton = attention_prefill_backward_triton_fused_impl(
+        elif BWD_MODE == "fused_atomics":
+            delta_triton = attention_prefill_backward_triton_fused_atmoics_impl(
                 dout,
                 q,
                 k,
@@ -331,8 +331,8 @@ def bwd(
                 True,
             )
             delta = delta_triton
-        elif BWD_MODE == "jingning":
-            delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+        elif BWD_MODE == "fused_no_atomics":
+            delta_triton = attention_prefill_backward_triton_split_fused_no_atomics_impl(
                 dout,
                 q,
                 k,
@@ -680,8 +680,8 @@ def varlen_bwd(
                 descale_dv,
             )
             delta = delta_triton
-        elif BWD_MODE == "fused":
-            delta_triton = attention_prefill_backward_triton_fused_impl(
+        elif BWD_MODE == "fused_atomics":
+            delta_triton = attention_prefill_backward_triton_fused_atmoics_impl(
                 dout,
                 q,
                 k,
@@ -708,8 +708,8 @@ def varlen_bwd(
                 True,
             )
             delta = delta_triton
-        elif BWD_MODE == "jingning":
-            delta_triton = attention_prefill_backward_triton_split_oneKernel_impl(
+        elif BWD_MODE == "fused_no_atomics":
+            delta_triton = attention_prefill_backward_triton_split_fused_no_atomics_impl(
                 dout,
                 q,
                 k,
