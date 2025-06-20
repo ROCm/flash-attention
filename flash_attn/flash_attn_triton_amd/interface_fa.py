@@ -458,11 +458,9 @@ def varlen_fwd(
             raise ValueError("Alibi can be (nheads,) or (batch_size, nheads).")
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
-    if dropout_p > 0.0:
-        metadata.need_dropout(dropout_p)
-        rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
-    else:
-        rng_state = None
+    # store rng state
+    metadata.need_dropout(dropout_p)
+    rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
 
     # Check arguments
     metadata.check_args(q, k, v, out)

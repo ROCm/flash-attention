@@ -1173,13 +1173,17 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     if OLD_LSE:
         delta = torch.empty_like(softmax_lse)
         if IS_VARLEN:
-            stride_delta_b, stride_delta_m, stride_delta_h = (0, delta.stride(0), delta.stride(1))
+            stride_delta_b, stride_delta_h, stride_delta_m = 0, delta.stride(0), delta.stride(1)
         else:
             stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
     else:
         if IS_VARLEN:
-            delta = torch.empty_like(softmax_lse)
-            stride_delta_b, stride_delta_m, stride_delta_h = (0, delta.stride(0), delta.stride(1))
+            batch_size = cu_seqlens_q.numel() - 1
+            total_q, num_heads, _ = q.shape
+            total_q_rounded = total_q + 128 * batch_size
+            delta_padded = torch.zeros((nheads_q, total_q_rounded), device=q.device, dtype=torch.float32)
+            delta = delta_padded[:, :q.shape[0]]
+            stride_delta_b, stride_delta_h, stride_delta_m = 0, delta.stride(0), delta.stride(1)
         else:
             # the interface expects the sequence dimension to be rounded to 128
             max_seqlen_q_rounded = round_multiple(max_seqlen_q_final, 128)
@@ -1308,7 +1312,4 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     if OLD_LSE:
         return delta
     else:
-        if IS_VARLEN:
-            return delta
-        else:
-            return delta_padded
+        return delta_padded
