@@ -2,7 +2,7 @@ import torch
 import os
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
-from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atmoics_impl
+from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_forward_pytorch_ref_impl
@@ -303,7 +303,7 @@ def bwd(
             )
             delta = delta_triton
         elif BWD_MODE == "fused_atomics":
-            delta_triton = attention_prefill_backward_triton_fused_atmoics_impl(
+            delta_triton = attention_prefill_backward_triton_fused_atomics_impl(
                 dout,
                 q,
                 k,
@@ -678,7 +678,7 @@ def varlen_bwd(
             )
             delta = delta_triton
         elif BWD_MODE == "fused_atomics":
-            delta_triton = attention_prefill_backward_triton_fused_atmoics_impl(
+            delta_triton = attention_prefill_backward_triton_fused_atomics_impl(
                 dout,
                 q,
                 k,

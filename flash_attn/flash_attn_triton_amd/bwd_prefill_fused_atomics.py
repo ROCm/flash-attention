@@ -1478,7 +1478,7 @@ def _bwd_kernel_dq_noncausal(
         dq *= sm_scale
         tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
-def attention_prefill_backward_triton_fused_atmoics_impl(
+def attention_prefill_backward_triton_fused_atomics_impl(
     do: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
