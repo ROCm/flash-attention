@@ -20,11 +20,13 @@ from flash_attn import (
     flash_attn_varlen_qkvpacked_fp8_func
 )
 
-from .utils import DEBUG, input_helper, arch_supports_fp8, generate_varlen_tensor
+from .utils import input_helper, arch_supports_fp8, generate_varlen_tensor
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
+
+DEBUG = False
 
 # set print options
 # torch.set_printoptions(linewidth=5e5, edgeitems=10, sci_mode=False)

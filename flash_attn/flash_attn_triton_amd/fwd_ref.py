@@ -1,8 +1,9 @@
 import torch
 import math
 from typing import Literal, Optional
-from .utils import DEBUG, compute_alibi_tensor_ref
+from .utils import compute_alibi_tensor_ref
 
+DEBUG = False
 DEBUG_CORE = False
 
 def attention_forward_core_ref_impl(q, k, v, sm_scale, causal, dropout_p, philox_seed, philox_offset, alibi_slopes, use_exp2):

@@ -3,9 +3,10 @@ import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
-from .utils import DEBUG, AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shapes_from_layout, compute_fp8_scaling_factors, \
+from .utils import AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shapes_from_layout, compute_fp8_scaling_factors, \
     get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_cdna, is_fp8, is_rdna, round_multiple
 
+DEBUG= False
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
@@ -1182,7 +1183,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             total_q, num_heads, _ = q.shape
             total_q_rounded = total_q + 128 * batch_size
             delta_padded = torch.zeros((nheads_q, total_q_rounded), device=q.device, dtype=torch.float32)
-            delta = delta_padded[:, :q.shape[0]]
+            delta = delta_padded[:, :total_q]
             stride_delta_b, stride_delta_h, stride_delta_m = 0, delta.stride(0), delta.stride(1)
         else:
             # the interface expects the sequence dimension to be rounded to 128
