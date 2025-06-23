@@ -1,7 +1,6 @@
 import torch
 import os
 from .fwd_prefill import attention_prefill_forward_triton_impl
-from .bwd_prefill import attention_prefill_backward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atmoics_impl
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_split_fused_no_atomics_impl
