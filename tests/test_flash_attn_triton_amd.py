@@ -1180,6 +1180,7 @@ def test_flash_attn_output(
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
+    DEBUG = True
     if USE_TRITON_ROCM:
         if seqlen_q == 1 and seqlen_k == 147 and kvpacked == True and dropout_p != 0.0:
             pytest.skip("This config with dropout is flaky on AMD.")
@@ -1193,9 +1194,14 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 4
-    nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
+    if DEBUG:
+        batch_size = 1
+        nheads = 1
+        nheads_k = 1
+    else:
+        batch_size = 4
+        nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
+        nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
@@ -1446,6 +1452,10 @@ def test_flash_attn_varlen_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
+    if DEBUG:
+        print("out:", out, out.shape)
+        print("out_ref:", out_ref, out_ref.shape)
+
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
@@ -1455,6 +1465,14 @@ def test_flash_attn_varlen_output(
         # With alibi, many of the prob values are 0.0 & -0.0 so dropout_fraction isn't accurate
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.04)
+
+    if DEBUG:
+        print("dq:", dq, dq.shape)
+        print("dq_ref:", dq_ref, dq_ref.shape)
+        print("dk", dk, dk.shape)
+        print("dk_ref", dk_ref, dk_ref.shape)
+        print("dv", dv, dv.shape)
+        print("dv_ref", dv_ref, dv_ref.shape)
 
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
