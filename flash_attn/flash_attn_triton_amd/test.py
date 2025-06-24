@@ -17,7 +17,8 @@ from flash_attn import (
     flash_attn_varlen_fp8_func,
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
-    flash_attn_varlen_qkvpacked_fp8_func
+    flash_attn_varlen_qkvpacked_fp8_func,
+    flash_attn_with_kvcache
 )
 
 from .utils import generate_bshd_kv_packed, generate_bshd_qkv_packed, generate_bshd_tensor, generate_varlen_kv_packed, generate_varlen_qkv_packed, input_helper, arch_supports_fp8, generate_varlen_tensor
@@ -1069,6 +1070,53 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         # cleanup
         del q, kv, o, cu_seqlens_q, cu_seqlens_k
         torch.cuda.empty_cache()
+
+
+        # Test 7: flash_attn_with_kvcache
+        print("\n7. Testing flash_attn_with_kvcache...")
+        clear_compile_cache()
+        
+        # setup cache dimensions
+        CACHE_SEQLEN = 1024  # max cache size
+        NEW_SEQLEN = 1       # for incremental decoding, usually 1 token at a time
+        
+        # create query for new tokens
+        q = generate_bshd_tensor(BATCH, NEW_SEQLEN, HQ, D_HEAD, dtype=torch.float16)
+        
+        # create kv cache using generators
+        k_cache = generate_bshd_tensor(BATCH, CACHE_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        v_cache = generate_bshd_tensor(BATCH, CACHE_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        
+        # cache sequence lengths
+        cache_seqlens = torch.full((BATCH,), 100, dtype=torch.int32, device='cuda')
+        
+        # new k,v to append to cache (optional)
+        k_new = generate_bshd_tensor(BATCH, NEW_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        v_new = generate_bshd_tensor(BATCH, NEW_SEQLEN, HK, D_HEAD, dtype=torch.float16)
+        
+        # Note: flash_attn_with_kvcache doesn't support backward pass
+        flash_attn_with_kvcache_compiled = torch.compile(flash_attn_with_kvcache)
+        
+        # Test without providing new k,v (just attention with existing cache)
+        with torch.no_grad():
+            o = flash_attn_with_kvcache_compiled(
+                q, k_cache, v_cache,
+                cache_seqlens=cache_seqlens,
+                causal=True
+            )
+            print(f"Output shape (no new kv): {o.shape}, dtype: {o.dtype}")
+        
+        # Test with new k,v (append to cache and do attention)
+        with torch.no_grad():
+            o = flash_attn_with_kvcache_compiled(
+                q, k_cache, v_cache,
+                k=k_new, v=v_new,
+                cache_seqlens=cache_seqlens,
+                causal=True
+            )
+            print(f"Output shape (with new kv): {o.shape}, dtype: {o.dtype}")
+        
+        print("✓ flash_attn_with_kvcache SUCCESS")
          
         print("\n\n✅ ALL TESTS PASSED! ✅")
         
