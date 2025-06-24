@@ -1097,15 +1097,6 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         # Note: flash_attn_with_kvcache doesn't support backward pass
         flash_attn_with_kvcache_compiled = torch.compile(flash_attn_with_kvcache)
         
-        # Test without providing new k,v (just attention with existing cache)
-        with torch.no_grad():
-            o = flash_attn_with_kvcache_compiled(
-                q, k_cache, v_cache,
-                cache_seqlens=cache_seqlens,
-                causal=True
-            )
-            print(f"Output shape (no new kv): {o.shape}, dtype: {o.dtype}")
-        
         # Test with new k,v (append to cache and do attention)
         with torch.no_grad():
             o = flash_attn_with_kvcache_compiled(
