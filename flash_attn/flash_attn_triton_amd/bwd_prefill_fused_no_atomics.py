@@ -1180,9 +1180,11 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     else:
         if IS_VARLEN:
             # interface expects the varlen sequence dims to rounded like this. Not sure why.
-            max_seqlen_q_rounded = max_seqlen_q_final + 128 * batch 
-            delta_padded = torch.zeros((nheads_q, max_seqlen_q_rounded), device=q.device, dtype=torch.float32)
-            delta = delta_padded[:, :max_seqlen_q_final]
+            batch_size = cu_seqlens_q.numel() - 1
+            total_q, num_heads, _ = q.shape
+            total_q_rounded = total_q + 128 * batch_size
+            delta_padded = torch.zeros((nheads_q, total_q_rounded), device=q.device, dtype=torch.float32)
+            delta = delta_padded[:, :total_q]
             stride_delta_b, stride_delta_h, stride_delta_m = 0, delta.stride(0), delta.stride(1)
         else:
             # the interface expects the sequence dimension to be rounded to 128
