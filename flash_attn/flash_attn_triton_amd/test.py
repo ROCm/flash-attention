@@ -943,16 +943,15 @@ def test_ir(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, layout, 
 def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
     print()
     try:
-        # # flash_attn_func
-        # q = torch.rand(BATCH, N_CTX_Q, HQ, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
-        # k = torch.rand(BATCH, N_CTX_K, HK, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
-        # v = torch.rand(BATCH, N_CTX_K, HK, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
-        # sdpa = torch.compile(flash_attn_func)
-        # o = sdpa(q,k,v)
-        # print(type(o))
-        # o.sum().backward()
-        # torch.cuda.synchronize()
-        # print("flash_attn_func SUCCESS")
+        # flash_attn_func
+        q = torch.rand(BATCH, N_CTX_Q, HQ, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
+        k = torch.rand(BATCH, N_CTX_K, HK, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
+        v = torch.rand(BATCH, N_CTX_K, HK, D_HEAD).to(torch.bfloat16).to("cuda:0").requires_grad_()
+        sdpa = torch.compile(flash_attn_func)
+        o = sdpa(q,k,v)
+        print(type(o))
+        o.sum().backward()
+        print("flash_attn_func SUCCESS")
 
         # flash_attn_varlen_func
         q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(BATCH * N_CTX_Q, HQ, D_HEAD, batch_size=BATCH)
@@ -962,10 +961,8 @@ def test_torch_compile(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD):
         o = sdpa_varlen(q,k,v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
         print(type(o))
         o.sum().backward()
-        torch.cuda.synchronize()
         print("flash_attn_varlen_func SUCCESS")
         
     except Exception as e:
-        # ensure we sync even on error to get proper error messages
-        torch.cuda.synchronize()
+        # ensure we sync even on error to get proper error message
         raise e

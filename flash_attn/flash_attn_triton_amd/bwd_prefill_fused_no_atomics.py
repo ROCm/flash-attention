@@ -3,8 +3,8 @@ import torch
 import triton # type: ignore
 import triton.language as tl # type: ignore
 from typing import Literal, Optional
-from .utils import AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, get_shapes_from_layout, compute_fp8_scaling_factors, \
-    get_strides_from_layout, create_dropout_mask, create_dropout_mask_varlen, is_cdna, is_fp8, is_rdna, round_multiple
+from .utils import AUTOTUNE, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, compute_fp8_scaling_factors, \
+    create_dropout_mask, create_dropout_mask_varlen, is_cdna, is_fp8, is_rdna, round_multiple
 
 DEBUG= False
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -1140,27 +1140,40 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
     use_dropout = (dropout_p > 0.0)
-    batch, nheads_q, nheads_k, head_size, max_seqlen_q_final, max_seqlen_k_final = \
-        get_shapes_from_layout(
-            q, k, layout,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k
-        )
-    q_strides, k_strides, v_strides, o_strides = \
-        get_strides_from_layout(q, k, v, o, layout)
-    stride_qb, stride_qh, stride_qm, stride_qd =  q_strides
-    stride_kb, stride_kh, stride_kn, stride_kd = k_strides
-    stride_vb, stride_vh, stride_vn, stride_vd = v_strides
-    stride_ob, stride_oh, stride_om, stride_od = o_strides
-    dq_strides, dk_strides, dv_strides, do_strides = \
-        get_strides_from_layout(dq, dk, dv, do, layout)
-    stride_dqb, stride_dqh, stride_dqm, stride_dqd =  dq_strides
-    stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk_strides
-    stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv_strides
-    stride_dob, stride_doh, stride_dom, stride_dod = do_strides
+    
+    # get shapes and strides        
     if IS_VARLEN:
+        # shape
+        _, nheads_q, head_size = q.shape
+        _, nheads_k, _ = k.shape
+        batch = len(cu_seqlens_q) - 1
+        max_seqlen_q_final = max_seqlen_q
+        max_seqlen_k_final = max_seqlen_k
+
+        # strides
+        stride_qb, stride_qh, stride_qm, stride_qd = 0, q.stride(1), q.stride(0), q.stride(2)
+        stride_kb, stride_kh, stride_kn, stride_kd = 0, k.stride(1), k.stride(0), k.stride(2)
+        stride_vb, stride_vh, stride_vn, stride_vd = 0, v.stride(1), v.stride(0), v.stride(2)
+        stride_ob, stride_oh, stride_om, stride_od = 0, o.stride(1), o.stride(0), o.stride(2)
+        stride_dqb, stride_dqh, stride_dqm, stride_dqd = 0, dq.stride(1), dq.stride(0), dq.stride(2)
+        stride_dkb, stride_dkh, stride_dkn, stride_dkd = 0, dk.stride(1), dk.stride(0), dk.stride(2)
+        stride_dvb, stride_dvh, stride_dvn, stride_dvd = 0, dv.stride(1), dv.stride(0), dv.stride(2)
+        stride_dob, stride_doh, stride_dom, stride_dod = 0, do.stride(1), do.stride(0), do.stride(2)
         stride_lse_b, stride_lse_h, stride_lse_m = (0, softmax_lse.stride(0), softmax_lse.stride(1))
     else:
+        # shapes
+        batch, max_seqlen_q_final, nheads_q, head_size = q.shape
+        _, max_seqlen_k_final, nheads_k, _ = k.shape
+
+        # strides
+        stride_qb, stride_qh, stride_qm, stride_qd = q.stride(0), q.stride(2), q.stride(1), q.stride(3)
+        stride_kb, stride_kh, stride_kn, stride_kd = k.stride(0), k.stride(2), k.stride(1), k.stride(3)
+        stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
+        stride_dqb, stride_dqh, stride_dqm, stride_dqd = dq.stride(0), dq.stride(2), dq.stride(1), dq.stride(3)
+        stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk.stride(0), dk.stride(2), dk.stride(1), dk.stride(3)
+        stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv.stride(0), dv.stride(2), dv.stride(1), dv.stride(3)
+        stride_dob, stride_doh, stride_dom, stride_dod = do.stride(0), do.stride(2), do.stride(1), do.stride(3)
         stride_lse_b, stride_lse_h, stride_lse_m = softmax_lse.stride()
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
 

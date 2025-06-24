@@ -7,7 +7,7 @@ from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_spli
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_forward_pytorch_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
-from .utils import DEBUG, USE_REF, MetaData, get_shapes_from_layout, is_fp8
+from .utils import DEBUG, USE_REF, MetaData, is_fp8
 from einops import rearrange, repeat
 from flash_attn.layers.rotary import apply_rotary_emb
 from typing import Literal, Optional, Union
