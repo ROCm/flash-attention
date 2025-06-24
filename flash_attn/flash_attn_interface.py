@@ -1,15 +1,97 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Sequence, Tuple, Union
+import os
+import warnings
+from typing import Optional, Tuple, Union
+from datetime import datetime
 
 import torch
-import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
 import flash_attn_2_cuda as flash_attn_cuda
 
 # isort: on
+
+# Global flag to track if we've already saved NaN outputs
+_nan_saved = False
+_nan_save_dir = os.environ.get("FLASH_ATTN_NAN_SAVE_DIR", "./flash_attn_nan_outputs")
+_print_stats = os.environ.get("FLASH_ATTN_PRINT_STATS", "0") == "1"
+
+def _save_nan_tensors(tensors_dict, prefix="nan_output"):
+    """Save tensors to disk when NaN is detected."""
+    global _nan_saved, _nan_save_dir
+
+    if _nan_saved:
+        return
+
+    # Create directory if it doesn't exist
+    os.makedirs(_nan_save_dir, exist_ok=True)
+
+    # Generate timestamp for unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    # Save each tensor
+    for name, tensor in tensors_dict.items():
+        if tensor is not None:
+            filename = os.path.join(_nan_save_dir, f"{prefix}_{timestamp}_{name}.pt")
+            torch.save(tensor, filename)
+            print(f"  Saved {name} to {filename}")
+
+    # Save metadata
+    metadata = {
+        "timestamp": timestamp,
+        "tensors": list(tensors_dict.keys()),
+        "shapes": {k: v.shape if v is not None else None for k, v in tensors_dict.items()},
+        "dtypes": {k: str(v.dtype) if v is not None else None for k, v in tensors_dict.items()},
+    }
+    metadata_file = os.path.join(_nan_save_dir, f"{prefix}_{timestamp}_metadata.pt")
+    torch.save(metadata, metadata_file)
+    print(f"  Saved metadata to {metadata_file}")
+
+    _nan_saved = True
+
+def _check_nan_and_warn(tensor, name, context="", save_tensors=None):
+    """Check if tensor contains NaN and print warning."""
+    if tensor is not None and tensor.isnan().any():
+        nan_count = tensor.isnan().sum().item()
+        total_elements = tensor.numel()
+        nan_percentage = (nan_count / total_elements) * 100
+
+        warning_msg = f"\n{'='*80}\n"
+        warning_msg += f"WARNING: NaN detected in {name}!\n"
+        warning_msg += f"Context: {context}\n"
+        warning_msg += f"Tensor shape: {tensor.shape}\n"
+        warning_msg += f"Tensor dtype: {tensor.dtype}\n"
+        warning_msg += f"NaN count: {nan_count}/{total_elements} ({nan_percentage:.2f}%)\n"
+        warning_msg += f"Min value (non-NaN): {tensor[~tensor.isnan()].min().item() if (~tensor.isnan()).any() else 'All NaN'}\n"
+        warning_msg += f"Max value (non-NaN): {tensor[~tensor.isnan()].max().item() if (~tensor.isnan()).any() else 'All NaN'}\n"
+        warning_msg += f"Mean value (non-NaN): {tensor[~tensor.isnan()].mean().item() if (~tensor.isnan()).any() else 'All NaN'}\n"
+        warning_msg += f"Std value (non-NaN): {tensor[~tensor.isnan()].std().item() if (~tensor.isnan()).any() else 'All NaN'}\n"
+
+        # Find first NaN location
+        nan_indices = torch.where(tensor.isnan())
+        if len(nan_indices[0]) > 0:
+            first_nan_location = tuple(idx[0].item() for idx in nan_indices)
+            warning_msg += f"First NaN location: {first_nan_location}\n"
+
+        # Check for inf values too
+        inf_count = tensor.isinf().sum().item()
+        if inf_count > 0:
+            warning_msg += f"Inf count: {inf_count}/{total_elements} ({(inf_count/total_elements)*100:.2f}%)\n"
+
+        warning_msg += f"{'='*80}\n"
+
+        print(warning_msg)
+        warnings.warn(warning_msg)
+
+        # Always save tensors when NaN is detected (not just when _nan_saved is False)
+        if save_tensors is not None and not _nan_saved:
+            print(f"Saving tensors to {_nan_save_dir}...")
+            _save_nan_tensors(save_tensors, prefix=f"{context}_{name}")
+
+        return True
+    return False
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -87,7 +169,43 @@ def _flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Helper function to print tensor statistics
+    def print_tensor_stats(tensor, name):
+        if tensor is None:
+            print(f"{name}: None")
+            return
+        print(f"{name}: shape={tensor.shape}, dtype={tensor.dtype}")
+        if tensor.numel() > 0:
+            has_nan = tensor.isnan().any().item()
+            has_inf = tensor.isinf().any().item()
+            if has_nan or has_inf:
+                print(f"  WARNING: contains {'NaN' if has_nan else ''}{' and ' if has_nan and has_inf else ''}{'Inf' if has_inf else ''}")
+            if not tensor.isnan().all():
+                valid_tensor = tensor[~tensor.isnan()]
+                if valid_tensor.numel() > 0:
+                    print(f"  min={valid_tensor.min().item():.6f}, max={valid_tensor.max().item():.6f}, "
+                          f"mean={valid_tensor.mean().item():.6f}, std={valid_tensor.std().item():.6f}")
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+
+    # Check inputs for NaN before forward
+    context = "flash_attn_forward_inputs"
+    input_save_dict = {"q": q, "k": k, "v": v}
+
+    has_nan_input = False
+    has_nan_input |= _check_nan_and_warn(q, "q", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(k, "k", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(v, "v", context, input_save_dict)
+
+    if has_nan_input:
+        print("\n=== Statistics for ALL forward inputs ===")
+        print_tensor_stats(q, "q")
+        print_tensor_stats(k, "k")
+        print_tensor_stats(v, "v")
+        print(f"\nParameters: dropout_p={dropout_p}, softmax_scale={softmax_scale}, causal={causal}")
+        print(f"window_size=({window_size_left}, {window_size_right}), softcap={softcap}")
+        print("="*80 + "\n")
+
     out, softmax_lse, S_dmask, rng_state = flash_attn_cuda.fwd(
         q,
         k,
@@ -103,6 +221,21 @@ def _flash_attn_forward(
         return_softmax,
         None,
     )
+
+    # Check for NaN in forward outputs
+    context = "flash_attn_forward_outputs"
+    output_save_dict = {"q": q, "k": k, "v": v, "out": out, "softmax_lse": softmax_lse}
+
+    has_nan_output = False
+    has_nan_output |= _check_nan_and_warn(out, "out", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(softmax_lse, "softmax_lse", context, output_save_dict)
+
+    if has_nan_output:
+        print("\n=== Statistics for ALL forward outputs ===")
+        print_tensor_stats(out, "out")
+        print_tensor_stats(softmax_lse, "softmax_lse")
+        print("="*80 + "\n")
+
     return out, softmax_lse, S_dmask, rng_state
 
 
@@ -160,7 +293,49 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Helper function to print tensor statistics
+    def print_tensor_stats(tensor, name):
+        if tensor is None:
+            print(f"{name}: None")
+            return
+        print(f"{name}: shape={tensor.shape}, dtype={tensor.dtype}")
+        if tensor.numel() > 0:
+            has_nan = tensor.isnan().any().item()
+            has_inf = tensor.isinf().any().item()
+            if has_nan or has_inf:
+                print(f"  WARNING: contains {'NaN' if has_nan else ''}{' and ' if has_nan and has_inf else ''}{'Inf' if has_inf else ''}")
+            if not tensor.isnan().all():
+                valid_tensor = tensor[~tensor.isnan()]
+                if valid_tensor.numel() > 0:
+                    print(f"  min={valid_tensor.min().item():.6f}, max={valid_tensor.max().item():.6f}, "
+                          f"mean={valid_tensor.mean().item():.6f}, std={valid_tensor.std().item():.6f}")
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+
+    # Check inputs for NaN before forward
+    context = "flash_attn_varlen_forward_inputs"
+    input_save_dict = {
+        "q": q, "k": k, "v": v,
+        "cu_seqlens_q": cu_seqlens_q, "cu_seqlens_k": cu_seqlens_k
+    }
+
+    has_nan_input = False
+    has_nan_input |= _check_nan_and_warn(q, "q", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(k, "k", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(v, "v", context, input_save_dict)
+
+    if has_nan_input:
+        print("\n=== Statistics for ALL varlen forward inputs ===")
+        print_tensor_stats(q, "q")
+        print_tensor_stats(k, "k")
+        print_tensor_stats(v, "v")
+        print_tensor_stats(cu_seqlens_q, "cu_seqlens_q")
+        print_tensor_stats(cu_seqlens_k, "cu_seqlens_k")
+        print(f"\nParameters: max_seqlen_q={max_seqlen_q}, max_seqlen_k={max_seqlen_k}")
+        print(f"dropout_p={dropout_p}, softmax_scale={softmax_scale}, causal={causal}")
+        print(f"window_size=({window_size_left}, {window_size_right}), softcap={softcap}")
+        print("="*80 + "\n")
+
     out, softmax_lse, S_dmask, rng_state = flash_attn_cuda.varlen_fwd(
         q,
         k,
@@ -184,8 +359,24 @@ def _flash_attn_varlen_forward(
         return_softmax,
         None,
     )
-    # if out.isnan().any() or softmax_lse.isnan().any():
-    #     breakpoint()
+
+    # Check for NaN in varlen forward outputs
+    context = "flash_attn_varlen_forward_outputs"
+    output_save_dict = {
+        "q": q, "k": k, "v": v, "out": out, "softmax_lse": softmax_lse,
+        "cu_seqlens_q": cu_seqlens_q, "cu_seqlens_k": cu_seqlens_k
+    }
+
+    has_nan_output = False
+    has_nan_output |= _check_nan_and_warn(out, "out", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(softmax_lse, "softmax_lse", context, output_save_dict)
+
+    if has_nan_output:
+        print("\n=== Statistics for ALL varlen forward outputs ===")
+        print_tensor_stats(out, "out")
+        print_tensor_stats(softmax_lse, "softmax_lse")
+        print("="*80 + "\n")
+
     return out, softmax_lse, S_dmask, rng_state
 
 
@@ -214,7 +405,7 @@ def _flash_attn_varlen_forward_fake(
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
-    
+
     out = torch.empty_like(q)
     softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
@@ -253,6 +444,49 @@ def _flash_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Helper function to print tensor statistics
+    def print_tensor_stats(tensor, name):
+        if tensor is None:
+            print(f"{name}: None")
+            return
+        print(f"{name}: shape={tensor.shape}, dtype={tensor.dtype}")
+        if tensor.numel() > 0:
+            has_nan = tensor.isnan().any().item()
+            has_inf = tensor.isinf().any().item()
+            if has_nan or has_inf:
+                print(f"  WARNING: contains {'NaN' if has_nan else ''}{' and ' if has_nan and has_inf else ''}{'Inf' if has_inf else ''}")
+            if not tensor.isnan().all():
+                valid_tensor = tensor[~tensor.isnan()]
+                if valid_tensor.numel() > 0:
+                    print(f"  min={valid_tensor.min().item():.6f}, max={valid_tensor.max().item():.6f}, "
+                          f"mean={valid_tensor.mean().item():.6f}, std={valid_tensor.std().item():.6f}")
+
+    # Check inputs for NaN before backward
+    context = "flash_attn_backward_inputs"
+    input_save_dict = {
+        "dout": dout, "q": q, "k": k, "v": v, "out": out, "softmax_lse": softmax_lse
+    }
+
+    has_nan_input = False
+    has_nan_input |= _check_nan_and_warn(dout, "dout", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(q, "q", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(k, "k", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(v, "v", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(out, "out", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(softmax_lse, "softmax_lse", context, input_save_dict)
+
+    if has_nan_input or _print_stats:
+        print("\n=== Statistics for ALL backward inputs (including non-NaN tensors) ===")
+        print_tensor_stats(dout, "dout")
+        print_tensor_stats(q, "q")
+        print_tensor_stats(k, "k")
+        print_tensor_stats(v, "v")
+        print_tensor_stats(out, "out")
+        print_tensor_stats(softmax_lse, "softmax_lse")
+        print(f"\nParameters: dropout_p={dropout_p}, softmax_scale={softmax_scale}, causal={causal}")
+        print(f"window_size=({window_size_left}, {window_size_right}), softcap={softcap}, deterministic={deterministic}")
+        print("="*80 + "\n")
+
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -281,6 +515,29 @@ def _flash_attn_backward(
         None,
         rng_state,
     )
+
+    # Check outputs for NaN
+    context = "flash_attn_backward_outputs"
+    output_save_dict = {
+        "dq": dq, "dk": dk, "dv": dv, "softmax_d": softmax_d,
+        # Include inputs for debugging
+        "dout": dout, "q": q, "k": k, "v": v, "out": out, "softmax_lse": softmax_lse
+    }
+
+    has_nan_output = False
+    has_nan_output |= _check_nan_and_warn(dq, "dq", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(dk, "dk", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(dv, "dv", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(softmax_d, "softmax_d", context, output_save_dict)
+
+    if has_nan_output or _print_stats:
+        print("\n=== Statistics for ALL backward outputs ===")
+        print_tensor_stats(dq, "dq")
+        print_tensor_stats(dk, "dk")
+        print_tensor_stats(dv, "dv")
+        print_tensor_stats(softmax_d, "softmax_d")
+        print("="*80 + "\n")
+
     return softmax_d
 
 
@@ -314,7 +571,7 @@ def _flash_attn_backward_fake(
         dv = torch.empty_like(v)
     batch_size, seqlen_q, num_heads, _ = q.shape
     softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
-    
+
     return softmax_d
 
 
@@ -349,6 +606,53 @@ def _flash_attn_varlen_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Helper function to print tensor statistics
+    def print_tensor_stats(tensor, name):
+        if tensor is None:
+            print(f"{name}: None")
+            return
+        print(f"{name}: shape={tensor.shape}, dtype={tensor.dtype}")
+        if tensor.numel() > 0:
+            has_nan = tensor.isnan().any().item()
+            has_inf = tensor.isinf().any().item()
+            if has_nan or has_inf:
+                print(f"  WARNING: contains {'NaN' if has_nan else ''}{' and ' if has_nan and has_inf else ''}{'Inf' if has_inf else ''}")
+            if not tensor.isnan().all():
+                valid_tensor = tensor[~tensor.isnan()]
+                if valid_tensor.numel() > 0:
+                    print(f"  min={valid_tensor.min().item():.6f}, max={valid_tensor.max().item():.6f}, "
+                          f"mean={valid_tensor.mean().item():.6f}, std={valid_tensor.std().item():.6f}")
+
+    # Check inputs for NaN before backward
+    context = "flash_attn_varlen_backward_inputs"
+    input_save_dict = {
+        "dout": dout, "q": q, "k": k, "v": v, "out": out, "softmax_lse": softmax_lse,
+        "cu_seqlens_q": cu_seqlens_q, "cu_seqlens_k": cu_seqlens_k
+    }
+
+    has_nan_input = False
+    has_nan_input |= _check_nan_and_warn(dout, "dout", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(q, "q", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(k, "k", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(v, "v", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(out, "out", context, input_save_dict)
+    has_nan_input |= _check_nan_and_warn(softmax_lse, "softmax_lse", context, input_save_dict)
+
+    if has_nan_input:
+        print("\n=== Statistics for ALL varlen backward inputs (including non-NaN tensors) ===")
+        print_tensor_stats(dout, "dout")
+        print_tensor_stats(q, "q")
+        print_tensor_stats(k, "k")
+        print_tensor_stats(v, "v")
+        print_tensor_stats(out, "out")
+        print_tensor_stats(softmax_lse, "softmax_lse")
+        print_tensor_stats(cu_seqlens_q, "cu_seqlens_q")
+        print_tensor_stats(cu_seqlens_k, "cu_seqlens_k")
+        print(f"\nParameters: max_seqlen_q={max_seqlen_q}, max_seqlen_k={max_seqlen_k}")
+        print(f"dropout_p={dropout_p}, softmax_scale={softmax_scale}, causal={causal}")
+        print(f"window_size=({window_size_left}, {window_size_right}), softcap={softcap}, deterministic={deterministic}")
+        print("="*80 + "\n")
+
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -382,8 +686,30 @@ def _flash_attn_varlen_backward(
         None,
         rng_state,
     )
-    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
-    #     breakpoint()
+
+    # Check outputs for NaN
+    context = "flash_attn_varlen_backward_outputs"
+    output_save_dict = {
+        "dq": dq, "dk": dk, "dv": dv, "softmax_d": softmax_d,
+        # Include inputs for debugging
+        "dout": dout, "q": q, "k": k, "v": v, "out": out, "softmax_lse": softmax_lse,
+        "cu_seqlens_q": cu_seqlens_q, "cu_seqlens_k": cu_seqlens_k
+    }
+
+    has_nan_output = False
+    has_nan_output |= _check_nan_and_warn(dq, "dq", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(dk, "dk", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(dv, "dv", context, output_save_dict)
+    has_nan_output |= _check_nan_and_warn(softmax_d, "softmax_d", context, output_save_dict)
+
+    if has_nan_output:
+        print("\n=== Statistics for ALL varlen backward outputs ===")
+        print_tensor_stats(dq, "dq")
+        print_tensor_stats(dk, "dk")
+        print_tensor_stats(dv, "dv")
+        print_tensor_stats(softmax_d, "softmax_d")
+        print("="*80 + "\n")
+
     return softmax_d
 
 
@@ -423,7 +749,7 @@ def _flash_attn_varlen_backward_fake(
     if dv is None:
         dv = torch.empty_like(v)
     softmax_d = torch.empty((num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32)
-    
+
     return softmax_d
 
 
