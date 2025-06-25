@@ -104,7 +104,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
         metadata.need_causal(True)
 
     # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-    metadata.need_dropout(dropout_p)
+    metadata.need_dropout(dropout_p, True)
 
 
     # call Triton's forward implementation directly
@@ -131,7 +131,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
                                                 metadata.dropout_p,
                                                 metadata.philox_seed, 
                                                 metadata.philox_offset, 
-                                                metadata.return_scores, 
+                                                metadata.return_softmax, 
                                                 use_exp2,
                                                 None,
                                                 None,
@@ -167,7 +167,7 @@ def test_op_prefill_fwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
         print("Compare Triton Impl with refernce Pytorch Impl")
 
     # this can be set to true manually or when using dropout
-    if metadata.return_scores:
+    if metadata.return_softmax:
         if DEBUG:
             print("sd_mask_triton:", sd_mask_triton, sd_mask_triton.shape)
             print("sd_mask_ref:", sd_mask_ref, sd_mask_ref.shape)
@@ -271,7 +271,7 @@ def test_op_prefill_bwd_impl(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dr
     q, k, v, do, metadata = input_helper(BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, causal, dropout_p, dtype, layout=layout, device=device)
 
     # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
-    metadata.need_dropout(dropout_p)
+    metadata.need_dropout(dropout_p, True)
 
     # =============================================== Reference ==============================================================
     # fwd

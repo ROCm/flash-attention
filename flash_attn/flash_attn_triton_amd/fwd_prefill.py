@@ -627,27 +627,33 @@ def attention_prefill_forward_triton_impl(
     # get shape and strides
     if IS_VARLEN:  # thd layout
         # shape
-        _, nheads_q, head_size = q.shape
+        total_q, nheads_q, head_size = q.shape
         _, nheads_k, _ = k.shape
         batch = len(cu_seqlens_q) - 1
-        seqlen_q = max_seqlens_q
-        seqlen_k = max_seqlens_k
+
+        # softmax_lse is the log of the normalization constant / sum of expoential score(unnormalzied probablities)
+        softmax_lse = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = 0, q.stride(1), q.stride(0), q.stride(2)
         stride_kb, stride_kh, stride_kn, stride_kd = 0, k.stride(1), k.stride(0), k.stride(2)
         stride_vb, stride_vh, stride_vn, stride_vd = 0, v.stride(1), v.stride(0), v.stride(2)
         stride_ob, stride_oh, stride_om, stride_od = 0, o.stride(1), o.stride(0), o.stride(2)
+        stride_lse_z, stride_lse_h, stride_lse_m = 0, softmax_lse.stride(0), softmax_lse.stride(1)
     else:  # bshd layout
         # shape
         batch, seqlen_q, nheads_q, head_size = q.shape
-        _, seqlen_k, nheads_k, _ = k.shape
+        _, _, nheads_k, _ = k.shape
+
+        # softmax_lse is the log of the normalization constant / sum of expoential score(unnormalzied probablities)
+        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = q.stride(0), q.stride(2), q.stride(1), q.stride(3)
         stride_kb, stride_kh, stride_kn, stride_kd = k.stride(0), k.stride(2), k.stride(1), k.stride(3)
         stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
         stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
+        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     # Get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (head_size - 1).bit_length()
@@ -660,6 +666,9 @@ def attention_prefill_forward_triton_impl(
         grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META['BLOCK_M']))
     else:
         grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
+
+    print("dropout_p:", dropout_p)
+    print("return_softmax:", return_softmax)
 
     # sd_mask is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
@@ -674,25 +683,20 @@ def attention_prefill_forward_triton_impl(
         else:
             dropout_mask = torch.zeros((batch, nheads_q, max_seqlens_q, max_seqlens_k), device=q.device,
                                         dtype=torch.float32)
-        scores_strides = (sd_mask.stride(0), sd_mask.stride(1), sd_mask.stride(2), sd_mask.stride(3))
+        stride_sz, stride_sh, stride_sm, stride_sn = (sd_mask.stride(0), sd_mask.stride(1), sd_mask.stride(2), sd_mask.stride(3))
     else:
         sd_mask = None
         dropout_mask = None
-        scores_strides = (0, 0, 0, 0)
+        stride_sz, stride_sh, stride_sm, stride_sn = (0, 0, 0, 0)
 
-    # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
-    if IS_VARLEN:
-        softmax_lse = torch.zeros((nheads_q, q.shape[0]), device=q.device, dtype=torch.float32)
-        stride_lse_z, stride_lse_h, stride_lse_m = 0, softmax_lse.stride(0), softmax_lse.stride(1)
-    else:
-        softmax_lse = torch.zeros((batch, nheads_q, max_seqlens_q), device=q.device, dtype=torch.float32)
-        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
+
+    print("sd_mask:", sd_mask.shape if sd_mask is not None else None)
 
     if bias is not None:
-        bias_strides = (bias.stride(0), bias.stride(1),bias.stride(2),
+        stride_bz, stride_bh, stride_bm, stride_bn = (bias.stride(0), bias.stride(1),bias.stride(2),
                         bias.stride(3))
     else:
-        bias_strides = (0, 0, 0, 0)
+        stride_bz, stride_bh, stride_bm, stride_bn = (0, 0, 0, 0)
 
     attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
@@ -701,7 +705,11 @@ def attention_prefill_forward_triton_impl(
                     stride_kb, stride_kh, stride_kn, stride_kd,
                     stride_vb, stride_vh, stride_vn, stride_vd,
                     stride_ob, stride_oh, stride_om, stride_od,
-                    *bias_strides, stride_az, stride_ah, *scores_strides, stride_lse_z, stride_lse_h, stride_lse_m, cu_seqlens_q, cu_seqlens_k,
+                    stride_bz, stride_bh, stride_bm, stride_bn, 
+                    stride_az, stride_ah, 
+                    stride_sz, stride_sh, stride_sm, stride_sn, 
+                    stride_lse_z, stride_lse_h, stride_lse_m, 
+                    cu_seqlens_q, cu_seqlens_k,
                     dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 
                     HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size, MAX_SEQLENS_Q=max_seqlens_q,
                     MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=IS_VARLEN, IS_INFERENCE=is_inference,

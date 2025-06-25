@@ -66,8 +66,6 @@ def fwd(q: torch.Tensor,
     metadata.max_seqlens_q = q.shape[1]
     metadata.max_seqlens_k = k.shape[1]
     metadata.layout = "bshd"
-    if return_softmax:
-        metadata.return_scores = True
 
     # get shape
     batch, _ , nheads_q, _= q.shape
@@ -85,7 +83,7 @@ def fwd(q: torch.Tensor,
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     # store rng state
-    metadata.need_dropout(dropout_p)
+    metadata.need_dropout(dropout_p, return_softmax)
     rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
 
     # check arguments
@@ -136,7 +134,7 @@ def fwd(q: torch.Tensor,
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.return_scores,
+                                                metadata.return_softmax,
                                                 USE_EXP2,
                                                 descale_q,
                                                 descale_k,
@@ -436,8 +434,6 @@ def varlen_fwd(
 
     # Setup metadata
     metadata = MetaData(sm_scale=softmax_scale)
-    if return_softmax:
-        metadata.return_scores = True
     metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)  # set layout to "thd" and other metdata
     assert metadata.layout is not None
 
@@ -458,7 +454,7 @@ def varlen_fwd(
         metadata.need_alibi(alibi_slopes, batch, nheads_q)
 
     # store rng state
-    metadata.need_dropout(dropout_p)
+    metadata.need_dropout(dropout_p, return_softmax)
     rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset]) # as_tensors uses the underlying data and doesnot cast
 
     # Check arguments
@@ -509,7 +505,7 @@ def varlen_fwd(
                                                             metadata.dropout_p,
                                                             metadata.philox_seed,
                                                             metadata.philox_offset,
-                                                            metadata.return_scores,
+                                                            metadata.return_softmax,
                                                             USE_EXP2,
                                                             descale_q,
                                                             descale_k,
@@ -900,7 +896,7 @@ def fwd_kvcache(
                                                 metadata.dropout_p,
                                                 metadata.philox_seed,
                                                 metadata.philox_offset,
-                                                metadata.return_scores,
+                                                metadata.return_softmax,
                                                 USE_EXP2,
                                                 None,
                                                 None,

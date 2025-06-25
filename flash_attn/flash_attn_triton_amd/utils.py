@@ -45,7 +45,7 @@ class MetaData():
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None
     cache_batch_idx = None
     packing: Optional[bool] = None
-    return_scores: bool = False
+    return_softmax: bool = False
     dropout_p: float = 0.0
     philox_seed: Optional[int] = None
     philox_offset : Optional[int]= None # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
@@ -72,7 +72,7 @@ class MetaData():
                 f"  cache_seqlens={self.cache_seqlens},\n"
                 f"  cache_batch_idx={self.cache_batch_idx},\n"
                 f"  dropout_p={self.dropout_p},\n"
-                f"  return_scores={self.return_scores}\n"
+                f"  return_softmax={self.return_softmax}\n"
                 f")")
 
     def __init__(self, sm_scale=1.0):
@@ -113,9 +113,9 @@ class MetaData():
         self.rotary_interleaved = rotary_interleaved
         self.rotary_conjunction = rotary_conjunction
 
-    def need_dropout(self, dropout_p, return_scores = True):
+    def need_dropout(self, dropout_p, return_softmax):
         self.dropout_p = dropout_p
-        self.return_scores = return_scores
+        self.return_softmax = return_softmax
         self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
 
     def check_args(self, q, k, v, o):
@@ -129,7 +129,7 @@ class MetaData():
             assert len(self.cu_seqlens_q) == len(self.cu_seqlens_k)
             # TODO: Remove once bias is supported with varlen
             assert self.bias is None
-            # assert not self.return_scores
+            # assert not self.return_softmax
         else:
             assert q.dim() == 4
             assert self.max_seqlens_q > 0 and self.max_seqlens_k > 0
@@ -568,7 +568,7 @@ def input_helper(
         metadata = MetaData(sm_scale=sm_scale)
         metadata.set_varlen_params(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
         metadata.need_causal(CAUSAL)
-        metadata.need_dropout(DROPOUT_P)
+        metadata.need_dropout(DROPOUT_P, True)
         
     elif layout == 'bshd' or layout == "bhsd":
         # deal with packing
@@ -634,7 +634,7 @@ def input_helper(
         metadata.max_seqlens_k = N_CTX_K
         metadata.layout = layout
         metadata.need_causal(CAUSAL)
-        metadata.need_dropout(DROPOUT_P)
+        metadata.need_dropout(DROPOUT_P, True)
     else:
         raise ValueError(f"Unknown layout: {layout}")
 
