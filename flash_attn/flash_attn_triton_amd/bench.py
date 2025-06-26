@@ -5,6 +5,7 @@ import triton
 import time
 import argparse
 import itertools
+import datetime
 import pandas as pd
 from logging import warning
 from typing import Dict, List, Literal, Optional, Tuple
@@ -973,9 +974,8 @@ def run_benchmark(func_config: FunctionConfig, input_configs):
     
     # calculate and print elapsed time
     elapsed_time = time.time() - start_time
-    print(f"Total time for benchmarking {fn_name} in {mode} mode with {dtype}: {elapsed_time:.2f} seconds")
 
-    return df
+    return df, elapsed_time
 
 def filter_modes(requested_modes, fn_name, supported_modes_for_fn):
     modes_to_run = []
@@ -1082,6 +1082,13 @@ def process_args():
         default="tflops",
         help="Output metric type: ms (milliseconds) or tflops (TFLOPS). Default: tflops",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["csv", "markdown"],
+        default="csv",
+        help="Output file format: csv or markdown. Default: csv",
+    )
     # config
     parser.add_argument("-b", type=int, default=None, help="Batch size")
     parser.add_argument("-hq", type=int, default=None, help="Q Number of heads")
@@ -1100,6 +1107,7 @@ def process_args():
     requested_modes = args.mode
     requested_backends = args.backend
     output_type: Literal["ms", "tflops"] = args.output
+    output_format: Literal["csv", "markdown"] = args.format
 
     # fenerate function configurations and input configurations separately
     all_function_configs = []
@@ -1157,7 +1165,7 @@ def process_args():
                         
                         all_input_configs[func_config] = fn_inputs
 
-    return all_function_configs, all_input_configs, output_type
+    return all_function_configs, all_input_configs, output_type, output_format
 
 def check_environment_variables():
     for key in ENV_FLAGS:
@@ -1210,6 +1218,18 @@ def add_tflops_columns(df: pd.DataFrame, func_cfg: FunctionConfig) -> pd.DataFra
     df[tf_col] = flops / df[ms_col] * 1e-9
     return df
 
+def generate_output_filename(function_configs, output_type, output_format):
+    # create a timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # simple filename format
+    base_filename = f"benchmark_{timestamp}"
+    
+    if output_format == "csv":
+        return base_filename + ".csv"
+    else:  # markdown
+        return base_filename + ".md"
+
 def main():
     """
     Main function to run benchmarks.
@@ -1221,7 +1241,7 @@ def main():
     total_start_time = time.time()
 
     # process args to get function configs and input configs
-    function_configs, all_input_configs, output_type = process_args()
+    function_configs, all_input_configs, output_type, output_format = process_args()
     
     # run benchmarks for each function configuration
     combined_ms_df  = None
@@ -1230,10 +1250,11 @@ def main():
     for func_config in function_configs:
         # run benchmark with the input configs for this function config
         input_configs = all_input_configs[func_config]
-        df = run_benchmark(func_config, input_configs)
-        df = add_tflops_columns(df, func_config)
+        df, elapsed_time = run_benchmark(func_config, input_configs)
+        print(f"Total time for benchmarking {func_config.fn_name} in {func_config.mode} mode with {func_config.dtype}: {elapsed_time:.2f} seconds")
         
         # add to combined table
+        df = add_tflops_columns(df, func_config)
         ms_cols = [c for c in df.columns if c.endswith('_ms')]
         tf_cols = [c for c in df.columns if c.endswith('_tflops')]
 
@@ -1293,18 +1314,30 @@ def main():
     # output based on selected metric
     if output_type == "ms":
         if combined_ms_df is not None:
-            print("\nCombined wall-time (ms) table:")
+            filename = generate_output_filename(function_configs, "ms", output_format)
+            print(f"\nCombined wall-time (ms) table:")
             print(combined_ms_df)
-            combined_ms_df.to_csv("benchmark_ms.csv", index=False)
-            with open("benchmark_ms.md", 'w') as f:
-                f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
+            
+            if output_format == "csv":
+                combined_ms_df.to_csv(filename, index=False)
+                print(f"Results saved to: {filename}")
+            else:  # markdown
+                with open(filename, 'w') as f:
+                    f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
+                print(f"Results saved to: {filename}")
     else:  # output_type == "tflops"
         if combined_tf_df is not None:
-            print("\nCombined throughput (TFLOPs) table:")
+            filename = generate_output_filename(function_configs, "tflops", output_format)
+            print(f"\nCombined throughput (TFLOPs) table:")
             print(combined_tf_df)
-            combined_tf_df.to_csv("benchmark_tflops.csv", index=False)
-            with open("benchmark_tflops.md", 'w') as f:
-                f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
+            
+            if output_format == "csv":
+                combined_tf_df.to_csv(filename, index=False)
+                print(f"Results saved to: {filename}")
+            else:  # markdown
+                with open(filename, 'w') as f:
+                    f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
+                print(f"Results saved to: {filename}")
 
 if __name__ == "__main__":
     main()
