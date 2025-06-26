@@ -667,9 +667,6 @@ def attention_prefill_forward_triton_impl(
     else:
         grid = lambda META: (triton.cdiv(max_seqlens_q, META['BLOCK_M']), nheads_q, batch)
 
-    print("dropout_p:", dropout_p)
-    print("return_softmax:", return_softmax)
-
     # sd_mask is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
     # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
     # to the dropout mask. The resulting return allows this mask to be fed into the reference implementation for testing
@@ -689,8 +686,6 @@ def attention_prefill_forward_triton_impl(
         dropout_mask = None
         stride_sz, stride_sh, stride_sm, stride_sn = (0, 0, 0, 0)
 
-
-    print("sd_mask:", sd_mask.shape if sd_mask is not None else None)
 
     if bias is not None:
         stride_bz, stride_bh, stride_bm, stride_bn = (bias.stride(0), bias.stride(1),bias.stride(2),
