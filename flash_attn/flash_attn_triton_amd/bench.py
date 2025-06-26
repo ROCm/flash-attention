@@ -966,7 +966,7 @@ def run_benchmark(func_config: FunctionConfig, input_configs):
         ms = triton.testing.do_bench(benchmark_fn, warmup=25, rep=100)
         return ms
 
-    df = bench_function.run(save_path=".", print_data=True, return_df=True)[0]
+    df = bench_function.run(return_df=True)[0]
     
     # set the column name to reflect the function configuration
     df = df.rename(columns={"Time (ms)": func_config.column_name()})
@@ -1064,7 +1064,7 @@ def process_args():
         type=str,
         nargs='*',
         choices=VALID_MODES,
-        default=None,
+        default=["fwd", "bwd"],
         help=f"Benchmarking mode(s) to run. If omitted, runs all supported modes for each function.",
     )
     parser.add_argument(
@@ -1072,8 +1072,15 @@ def process_args():
         type=str,
         nargs='*',
         choices=["triton", "ck"],
-        default=None,
+        default=["triton"],
         help="Back-end(s) to run (triton, ck). Omit to run every back-end that is both available and supported by the function.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        choices=["ms", "tflops"],
+        default="tflops",
+        help="Output metric type: ms (milliseconds) or tflops (TFLOPS). Default: tflops",
     )
     # config
     parser.add_argument("-b", type=int, default=None, help="Batch size")
@@ -1092,6 +1099,7 @@ def process_args():
     benchmark_fns = args.benchmark_fn
     requested_modes = args.mode
     requested_backends = args.backend
+    output_type: Literal["ms", "tflops"] = args.output
 
     # fenerate function configurations and input configurations separately
     all_function_configs = []
@@ -1149,7 +1157,7 @@ def process_args():
                         
                         all_input_configs[func_config] = fn_inputs
 
-    return all_function_configs, all_input_configs
+    return all_function_configs, all_input_configs, output_type
 
 def check_environment_variables():
     for key in ENV_FLAGS:
@@ -1213,7 +1221,7 @@ def main():
     total_start_time = time.time()
 
     # process args to get function configs and input configs
-    function_configs, all_input_configs = process_args()
+    function_configs, all_input_configs, output_type = process_args()
     
     # run benchmarks for each function configuration
     combined_ms_df  = None
@@ -1282,19 +1290,21 @@ def main():
                 print(f"Comparison Results (triton vs ck):")
                 print(f"Ratio values: values > 1 mean triton is faster (by that factor), values < 1 mean ck is faster")
 
-    if combined_ms_df is not None:
-        print("\nCombined wall‑time (ms) table:")
-        print(combined_ms_df)
-        combined_ms_df.to_csv("benchmark_ms.csv", index=False)
-        with open("benchmark_ms.md", 'w') as f:
-            f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
-
-    if combined_tf_df is not None:
-        print("\nCombined throughput (TFLOPs) table:")
-        print(combined_tf_df)
-        combined_tf_df.to_csv("benchmark_tflops.csv", index=False)
-        with open("benchmark_tflops.md", 'w') as f:
-            f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
+    # output based on selected metric
+    if output_type == "ms":
+        if combined_ms_df is not None:
+            print("\nCombined wall-time (ms) table:")
+            print(combined_ms_df)
+            combined_ms_df.to_csv("benchmark_ms.csv", index=False)
+            with open("benchmark_ms.md", 'w') as f:
+                f.write(combined_ms_df.to_markdown(index=False, floatfmt=".2f"))
+    else:  # output_type == "tflops"
+        if combined_tf_df is not None:
+            print("\nCombined throughput (TFLOPs) table:")
+            print(combined_tf_df)
+            combined_tf_df.to_csv("benchmark_tflops.csv", index=False)
+            with open("benchmark_tflops.md", 'w') as f:
+                f.write(combined_tf_df.to_markdown(index=False, floatfmt=".2f"))
 
 if __name__ == "__main__":
     main()
