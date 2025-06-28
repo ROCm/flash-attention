@@ -14,6 +14,11 @@ fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                                        bool enable_alibi,
                                        bool deterministic)
 {
+    bool flash_attn_uses_bwd_v3 = false;
+    if (const char* env_p = std::getenv("FLASH_ATTN_USES_BWD_V3") ) {
+        if (env_p != nullptr && std::string(env_p) == "1")
+            flash_attn_uses_bwd_v3 = true;
+    }
     return fmha_bwd_traits{head_size,
                            head_size,
                            dtype,
@@ -24,7 +29,7 @@ fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                            has_dropout,
                            false, // s_randval
                            deterministic,
-                           true, // uses_ext_asm
+                           flash_attn_uses_bwd_v3, // uses_ext_asm
                            true, // is_v3_atomic_fp32
                            1}; // how_v3_bf16_cvt 0:RTNE; 1:RTNA; 2:RTZ
 }
@@ -197,6 +202,108 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                          std::make_pair(drop_seed, drop_offset)};
 }
 
+// print the fmha_traits and args passed into ck apis
+void log_bwd_config(const char* func_name, const fmha_bwd_traits& fmha_traits, const fmha_bwd_args& fmha_args){
+
+  bool flash_attn_log_config = false;
+  if (const char* env_p = std::getenv("FLASH_ATTN_LOG_CONFIG") ) {
+    if (env_p != nullptr && std::string(env_p) == "1")
+      flash_attn_log_config = true;
+  }
+  if (flash_attn_log_config) {
+    std::cout<<std::endl<<"run "<<func_name<<std::endl;
+    // fmha_traits debug
+    std::cout<<"fmha_traits: "<<std::endl;
+    std::cout<<"hdim_q: "<<fmha_traits.hdim_q<<std::endl;
+    std::cout<<"hdim_v: "<<fmha_traits.hdim_v<<std::endl;
+    std::cout<<"data_type: "<<fmha_traits.data_type<<std::endl;
+    std::cout<<"is_group_mode: "<<fmha_traits.is_group_mode<<std::endl;
+    std::cout<<"mask_type: "<<static_cast<std::underlying_type<mask_enum>::type>(fmha_traits.mask_type)<<std::endl;
+    std::cout<<"bias_type: "<<static_cast<std::underlying_type<bias_enum>::type>(fmha_traits.bias_type)<<std::endl;
+    std::cout<<"has_dbias: "<<fmha_traits.has_dbias<<std::endl;
+    std::cout<<"has_dropout: "<<fmha_traits.has_dropout<<std::endl;
+    std::cout<<"is_store_randval: "<<fmha_traits.is_store_randval<<std::endl;
+    std::cout<<"is_deterministic: "<<fmha_traits.is_deterministic<<std::endl;
+    std::cout<<"uses_bwd_v3: "<<fmha_traits.uses_bwd_v3<<std::endl;
+    std::cout<<"is_v3_atomic_fp32: "<<fmha_traits.is_v3_atomic_fp32<<std::endl;
+    std::cout<<"how_v3_bf16_cvt: "<<fmha_traits.how_v3_bf16_cvt<<std::endl;
+
+    // fmha_args debug
+    std::cout<<"fmha_args: "<<std::endl;
+    std::cout<<"q_ptr: "<<fmha_args.q_ptr<<std::endl;
+    std::cout<<"k_ptr: "<<fmha_args.k_ptr<<std::endl;
+    std::cout<<"v_ptr: "<<fmha_args.v_ptr<<std::endl;
+    std::cout<<"bias_ptr: "<<fmha_args.bias_ptr<<std::endl;
+    std::cout<<"o_ptr: "<<fmha_args.o_ptr<<std::endl;
+    std::cout<<"lse_ptr: "<<fmha_args.lse_ptr<<std::endl;
+    std::cout<<"do_ptr: "<<fmha_args.do_ptr<<std::endl;
+    std::cout<<"d_ptr: "<<fmha_args.d_ptr<<std::endl;
+    std::cout<<"rand_val_ptr: "<<fmha_args.rand_val_ptr<<std::endl;
+    std::cout<<"dq_ptr: "<<fmha_args.dq_ptr<<std::endl;
+    std::cout<<"dk_ptr: "<<fmha_args.dk_ptr<<std::endl;
+    std::cout<<"dv_ptr: "<<fmha_args.dv_ptr<<std::endl;
+    std::cout<<"dq_acc_ptr: "<<fmha_args.dq_acc_ptr<<std::endl;
+    std::cout<<"dbias_ptr: "<<fmha_args.dbias_ptr<<std::endl;
+    std::cout<<"seqstart_q_ptr: "<<fmha_args.seqstart_q_ptr<<std::endl;
+    std::cout<<"seqstart_k_ptr: "<<fmha_args.seqstart_k_ptr<<std::endl;
+    std::cout<<"seqlen_k_ptr: "<<fmha_args.seqlen_k_ptr<<std::endl;
+    std::cout<<"seqlen_q: "<<fmha_args.seqlen_q<<std::endl;
+    std::cout<<"seqlen_k: "<<fmha_args.seqlen_k<<std::endl;
+    std::cout<<"batch: "<<fmha_args.batch<<std::endl;
+    std::cout<<"max_seqlen_q: "<<fmha_args.max_seqlen_q<<std::endl;
+    std::cout<<"max_seqlen_k: "<<fmha_args.max_seqlen_k<<std::endl;
+    std::cout<<"hdim_q: "<<fmha_args.hdim_q<<std::endl;
+    std::cout<<"hdim_v: "<<fmha_args.hdim_v<<std::endl;
+    std::cout<<"nhead_q: "<<fmha_args.nhead_q<<std::endl;
+    std::cout<<"nhead_k: "<<fmha_args.nhead_k<<std::endl;
+    std::cout<<"scale: "<<fmha_args.scale<<std::endl;
+    std::cout<<"stride_q: "<<fmha_args.stride_q<<std::endl;
+    std::cout<<"stride_k: "<<fmha_args.stride_k<<std::endl;
+    std::cout<<"stride_v: "<<fmha_args.stride_v<<std::endl;
+    std::cout<<"stride_bias: "<<fmha_args.stride_bias<<std::endl;
+    std::cout<<"stride_o: "<<fmha_args.stride_o<<std::endl;
+    std::cout<<"stride_randval: "<<fmha_args.stride_randval<<std::endl;
+    std::cout<<"stride_do: "<<fmha_args.stride_do<<std::endl;
+    std::cout<<"stride_dq_acc: "<<fmha_args.stride_dq_acc<<std::endl;
+    std::cout<<"stride_dq: "<<fmha_args.stride_dq<<std::endl;
+    std::cout<<"stride_dk: "<<fmha_args.stride_dk<<std::endl;
+    std::cout<<"stride_dv: "<<fmha_args.stride_dv<<std::endl;
+    std::cout<<"stride_dbias: "<<fmha_args.stride_dbias<<std::endl;
+    std::cout<<"nhead_stride_q: "<<fmha_args.nhead_stride_q<<std::endl;
+    std::cout<<"nhead_stride_k: "<<fmha_args.nhead_stride_k<<std::endl;
+    std::cout<<"nhead_stride_v: "<<fmha_args.nhead_stride_v<<std::endl;
+    std::cout<<"nhead_stride_bias: "<<fmha_args.nhead_stride_bias<<std::endl;
+    std::cout<<"nhead_stride_o: "<<fmha_args.nhead_stride_o<<std::endl;
+    std::cout<<"nhead_stride_randval: "<<fmha_args.nhead_stride_randval<<std::endl;
+    std::cout<<"nhead_stride_do: "<<fmha_args.nhead_stride_do<<std::endl;
+    std::cout<<"nhead_stride_lsed: "<<fmha_args.nhead_stride_lsed<<std::endl;
+    std::cout<<"nhead_stride_dq_acc: "<<fmha_args.nhead_stride_dq_acc<<std::endl;
+    std::cout<<"nhead_stride_dq: "<<fmha_args.nhead_stride_dq<<std::endl;
+    std::cout<<"nhead_stride_dk: "<<fmha_args.nhead_stride_dk<<std::endl;
+    std::cout<<"nhead_stride_dv: "<<fmha_args.nhead_stride_dv<<std::endl;
+    std::cout<<"nhead_stride_dbias: "<<fmha_args.nhead_stride_dbias<<std::endl;
+    std::cout<<"batch_stride_q: "<<fmha_args.batch_stride_q<<std::endl;
+    std::cout<<"batch_stride_k: "<<fmha_args.batch_stride_k<<std::endl;
+    std::cout<<"batch_stride_v: "<<fmha_args.batch_stride_v<<std::endl;
+    std::cout<<"batch_stride_bias: "<<fmha_args.batch_stride_bias<<std::endl;
+    std::cout<<"batch_stride_o: "<<fmha_args.batch_stride_o<<std::endl;
+    std::cout<<"batch_stride_randval: "<<fmha_args.batch_stride_randval<<std::endl;
+    std::cout<<"batch_stride_do: "<<fmha_args.batch_stride_do<<std::endl;
+    std::cout<<"batch_stride_lsed: "<<fmha_args.batch_stride_lsed<<std::endl;
+    std::cout<<"batch_stride_dq_acc: "<<fmha_args.batch_stride_dq_acc<<std::endl;
+    std::cout<<"batch_stride_dq: "<<fmha_args.batch_stride_dq<<std::endl;
+    std::cout<<"batch_stride_dk: "<<fmha_args.batch_stride_dk<<std::endl;
+    std::cout<<"batch_stride_dv: "<<fmha_args.batch_stride_dv<<std::endl;
+    std::cout<<"batch_stride_dbias: "<<fmha_args.batch_stride_dbias<<std::endl;
+    std::cout<<"window_size_left: "<<fmha_args.window_size_left<<std::endl;
+    std::cout<<"window_size_right: "<<fmha_args.window_size_right<<std::endl;
+    std::cout<<"mask_type: "<<fmha_args.mask_type<<std::endl;
+    std::cout<<"p_drop: "<<fmha_args.p_drop<<std::endl;
+    std::cout<<"p_undrop: "<<fmha_args.p_undrop<<std::endl;
+    //std::cout<<"dropout_seed: "<<std::get<0>(std::get<std::pair<const void*, const void*>>(fmha_args.drop_seed_offset))<<std::endl;
+    //std::cout<<"dropout_offset: "<<std::get<1>(std::get<std::pair<const void*, const void*>>(fmha_args.drop_seed_offset))<<std::endl;Add commentMore actions
+  }
+}
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num_heads, x multiple_of(head_size, 8)
         const at::Tensor &q,                      // batch_size x seqlen_q x num_heads x head_size
@@ -354,8 +461,14 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         std::tie(drop_seed, drop_offset) = flash::unpack(philox_args);
     }
 
+    bool flash_attn_log_config = false;
+    if (const char* env_p = std::getenv("FLASH_ATTN_LOG_CONFIG") ) {
+        if (env_p != nullptr && std::string(env_p) == "1")
+            flash_attn_log_config = true;
+    }
+
     if (seqlen_q > 0) {
-        ck_tile::stream_config stream_config{stream};
+        ck_tile::stream_config stream_config{stream, false, flash_attn_log_config };
 
         auto traits =
             get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic);
@@ -386,6 +499,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
                 drop_seed,
                 drop_offset);
 
+        log_bwd_config(__FUNCTION__, traits, args);
         float t = fmha_bwd(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {

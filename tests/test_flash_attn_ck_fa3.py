@@ -268,3 +268,86 @@ def test_flash_attn_output(
         assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item()
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("d", [128])
+def test_flash_attn_bwd_varlen_v3_midjourney(d, causal, dtype):
+    """
+    mininum reproducer for nan in midjourney testcase
+    """
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(0)
+    H = int(544 / 4)
+    W = int(960 / 4)
+    T = 9
+    Hp = H // 16
+    Wp = W // 16
+    Tp = (T - 1) // 4 + 1
+    text_tokens = 256
+    L = Hp * Wp * Tp + text_tokens
+    head_dim = 128
+    n_heads = 24
+    num_padding_tokens = 256 - 11
+    # print("L: ", L) #L=616
+    q_cuseqlen = torch.tensor([0, L - num_padding_tokens], device=device, dtype=torch.int32)
+    k_cuseqlen = torch.tensor([0, L - num_padding_tokens], device=device, dtype=torch.int32)
+
+    q = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.1
+    k = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.1
+    v = torch.randn((1, L, n_heads, head_dim), device="cuda", dtype=torch.bfloat16, requires_grad=True) * 0.1
+    g = 0.001 * torch.randint(0, 200, (1, L, n_heads, head_dim), dtype=dtype, device="cuda")
+    
+    q_ref = q.detach().clone().requires_grad_()
+    k_ref = k.detach().clone().requires_grad_()
+    v_ref = v.detach().clone().requires_grad_()
+    g_ref = g.detach().clone()
+    q_ref.retain_grad()
+    k_ref.retain_grad()
+    v_ref.retain_grad()
+
+    q = q.view(-1, n_heads, head_dim)
+    k = k.view(-1, n_heads, head_dim)
+    v = v.view(-1, n_heads, head_dim)
+    g = g.view(-1, n_heads, head_dim)
+    q.retain_grad()
+    k.retain_grad()
+    v.retain_grad()
+
+    out = flash_attn_varlen_func(q, k, v, q_cuseqlen, k_cuseqlen, L, L, causal=causal)
+
+    (
+        dq,
+        dk,
+        dv,
+    ) = torch.autograd.grad(out, (q, k, v), g)
+
+    lengths = torch.full((1, 1), L - num_padding_tokens, device = "cuda", dtype=torch.int32)
+    padding_mask = repeat(torch.arange(L, device=device), "s -> b s", b=1) < lengths
+    window_size = (-1, -1)
+    out_ref, attn_ref = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        padding_mask,
+        padding_mask,
+        None, #attn_bias,
+        0, #dropout_p,
+        None, #dropout_mask,
+        causal=causal,
+        window_size=window_size,
+    )
+    (
+        dq_ref,
+        dk_ref,
+        dv_ref,
+    ) = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g_ref)
+
+    with torch.no_grad():
+        print(f"dQ max diff: {(dq - dq_ref.view_as(dq)).abs().max().item()}")
+        print(f"dQ mean diff: {(dq - dq_ref.view_as(dq)).abs().mean().item()}")
+        print(f"dK max diff: {(dk - dk_ref.view_as(dk)).abs().max().item()}")
+        print(f"dK mean diff: {(dk - dk_ref.view_as(dk)).abs().mean().item()}")
+        print(f"dV max diff: {(dv - dv_ref.view_as(dv)).abs().max().item()}")
+        print(f"dV mean diff: {(dv - dv_ref.view_as(dv)).abs().mean().item()}")
