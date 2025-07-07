@@ -99,8 +99,7 @@ def get_autotune_configs():
 # Here is the I/O shape:
 # Out: (batch, nhead_q, max_seqlens_q, headDim)
 # DO: (batch, nhead_q, max_seqlens_q, headDim)
-# Delta: (batch, nheads_q, max_seqlens_q), same as softmax_lse defined at
-#   fwd_prefill.py line 607
+# Delta: (batch, nheads_q, max_seqlens_q)
 @triton.autotune(
     configs=preprocess_autotune_configs,
     key=preprocess_autotune_keys,
@@ -108,9 +107,11 @@ def get_autotune_configs():
 )
 @triton.jit
 def _bwd_preprocess(
-    O, DO,  # noqa: E741
+    O,
+    DO,  # noqa: E741
     Delta,
     stride_ob, stride_oh, stride_om, stride_od,
+    stride_dob, stride_doh, stride_dom, stride_dod,
     stride_delta_b, stride_delta_h, stride_delta_m,
     stride_descale_do_z,
     cu_seqlens_q, max_seqlen_q,
@@ -125,8 +126,6 @@ def _bwd_preprocess(
     bid = tl.program_id(1)
     hid = tl.program_id(2)
     # Handle varlen
-    q_start = 0
-    seqlen_q = max_seqlen_q
     if IS_VARLEN:
         q_start = tl.load(cu_seqlens_q + bid)
         q_end = tl.load(cu_seqlens_q + bid + 1)
@@ -138,32 +137,41 @@ def _bwd_preprocess(
     # Compute offsets
     offs_m = pid_m * PRE_BLOCK + tl.arange(0, PRE_BLOCK)
     offs_d = tl.arange(0, HEAD_DIM)
-    # Offset O/DO by batch, head and q_start
-    O += bid * stride_ob + hid * stride_oh + q_start * stride_om  # noqa: E741
-    DO += bid * stride_ob + hid * stride_oh + q_start * stride_om
+    # pointer offsets for O & DO
+    off_o = ( bid * stride_ob 
+            + hid * stride_oh 
+            + q_start * stride_om 
+            + offs_m[:, None] * stride_om 
+            + offs_d[None, :] * stride_od) # noqa: E741
+    off_do = (bid * stride_dob 
+              + hid * stride_doh 
+              + q_start * stride_dom 
+              + offs_m[:, None] * stride_dom 
+              + offs_d[None, :] * stride_dod)
+
     # create masks
     mask_m = offs_m < seqlen_q
     mask_md = mask_m[:, None]
     PADDED_HEAD: tl.constexpr = (ACTUAL_HEAD_DIM != HEAD_DIM)
     if PADDED_HEAD:
         mask_md &= offs_d[None, :] < ACTUAL_HEAD_DIM
-    # compute pointers
-    offs_do = offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-    out_ptrs = O + offs_do
-    do_ptrs = DO + offs_do
     # load
-    o = tl.load(out_ptrs, mask=mask_md, other=0.0)
-    do = tl.load(do_ptrs, mask=mask_md, other=0.0)
+    o = tl.load(O + off_o, mask=mask_md, other=0.0)
+    do = tl.load(DO + off_do, mask=mask_md, other=0.0)
     # compute and write-back to delta
     if IS_FP8:
-        descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hid)
+        off_descale_do = bid * stride_descale_do_z + hid
+        descale_do = tl.load(Descale_do + off_descale_do)
 
         # NOTE: do is in the fp8 range and o is not in fp8
         delta = tl.sum(o.to(tl.float32) * (do.to(tl.float32) * descale_do), axis=1)
     else:
         delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
-    delta_offset = Delta + bid * stride_delta_b + hid * stride_delta_h + q_start * stride_delta_m
-    tl.store(delta_offset + offs_m * stride_delta_m, delta, mask=mask_m)
+    off_delta = (bid * stride_delta_b 
+                 + hid * stride_delta_h 
+                 + q_start * stride_delta_m
+                 + offs_m * stride_delta_m)
+    tl.store(Delta + off_delta , delta, mask=mask_m)
 
 
 # The main inner-loop logic for computing dK and dV.
@@ -1144,36 +1152,41 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     # get shapes and strides        
     if IS_VARLEN:
         # shape
-        _, nheads_q, head_size = q.shape
+        total_seqlen_q, nheads_q, head_size = q.shape
         _, nheads_k, _ = k.shape
+        assert cu_seqlens_q is not None
         batch = len(cu_seqlens_q) - 1
         max_seqlen_q_final = max_seqlen_q
         max_seqlen_k_final = max_seqlen_k
 
+        assert softmax_lse.shape[-1] == total_seqlen_q
+
         # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = 0, q.stride(1), q.stride(0), q.stride(2)
-        stride_kb, stride_kh, stride_kn, stride_kd = 0, k.stride(1), k.stride(0), k.stride(2)
-        stride_vb, stride_vh, stride_vn, stride_vd = 0, v.stride(1), v.stride(0), v.stride(2)
-        stride_ob, stride_oh, stride_om, stride_od = 0, o.stride(1), o.stride(0), o.stride(2)
-        stride_dqb, stride_dqh, stride_dqm, stride_dqd = 0, dq.stride(1), dq.stride(0), dq.stride(2)
-        stride_dkb, stride_dkh, stride_dkn, stride_dkd = 0, dk.stride(1), dk.stride(0), dk.stride(2)
-        stride_dvb, stride_dvh, stride_dvn, stride_dvd = 0, dv.stride(1), dv.stride(0), dv.stride(2)
-        stride_dob, stride_doh, stride_dom, stride_dod = 0, do.stride(1), do.stride(0), do.stride(2)
+        stride_qb, stride_qm, stride_qh, stride_qd = 0, q.stride(0), q.stride(1), q.stride(2)
+        stride_kb, stride_kn, stride_kh, stride_kd = 0, k.stride(0), k.stride(1), k.stride(2)
+        stride_vb, stride_vn, stride_vh, stride_vd = 0, v.stride(0), v.stride(1), v.stride(2)
+        stride_ob, stride_om, stride_oh, stride_od = 0, o.stride(0), o.stride(1), o.stride(2)
+        stride_dqb, stride_dqm, stride_dqh, stride_dqd = 0, dq.stride(0), dq.stride(1), dq.stride(2)
+        stride_dkb, stride_dkn, stride_dkh, stride_dkd = 0, dk.stride(0), dk.stride(1), dk.stride(2)
+        stride_dvb, stride_dvn, stride_dvh, stride_dvd = 0, dv.stride(0), dv.stride(1), dv.stride(2)
+        stride_dob, stride_dom, stride_doh, stride_dod = 0, do.stride(0), do.stride(1), do.stride(2)
         stride_lse_b, stride_lse_h, stride_lse_m = (0, softmax_lse.stride(0), softmax_lse.stride(1))
     else:
         # shapes
         batch, max_seqlen_q_final, nheads_q, head_size = q.shape
         _, max_seqlen_k_final, nheads_k, _ = k.shape
 
+        assert softmax_lse.shape[-1] == max_seqlen_q_final
+
         # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = q.stride(0), q.stride(2), q.stride(1), q.stride(3)
-        stride_kb, stride_kh, stride_kn, stride_kd = k.stride(0), k.stride(2), k.stride(1), k.stride(3)
-        stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
-        stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
-        stride_dqb, stride_dqh, stride_dqm, stride_dqd = dq.stride(0), dq.stride(2), dq.stride(1), dq.stride(3)
-        stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk.stride(0), dk.stride(2), dk.stride(1), dk.stride(3)
-        stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv.stride(0), dv.stride(2), dv.stride(1), dv.stride(3)
-        stride_dob, stride_doh, stride_dom, stride_dod = do.stride(0), do.stride(2), do.stride(1), do.stride(3)
+        stride_qb, stride_qm, stride_qh, stride_qd = q.stride()
+        stride_kb, stride_kn, stride_kh, stride_kd = k.stride()
+        stride_vb, stride_vn, stride_vh, stride_vd = v.stride()
+        stride_ob, stride_om, stride_oh, stride_od = o.stride()
+        stride_dqb, stride_dqm, stride_dqh, stride_dqd = dq.stride()
+        stride_dkb, stride_dkn, stride_dkh, stride_dkd = dk.stride()
+        stride_dvb, stride_dvn, stride_dvh, stride_dvd = dv.stride()
+        stride_dob, stride_dom, stride_doh, stride_dod = do.stride()
         stride_lse_b, stride_lse_h, stride_lse_m = softmax_lse.stride()
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
 
@@ -1193,9 +1206,8 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     else:
         if IS_VARLEN:
             # interface expects the varlen sequence dims to rounded like this. Not sure why.
-            batch_size = cu_seqlens_q.numel() - 1
             total_q, num_heads, _ = q.shape
-            total_q_rounded = total_q + 128 * batch_size
+            total_q_rounded = total_q + 128 * batch
             delta_padded = torch.zeros((nheads_q, total_q_rounded), device=q.device, dtype=torch.float32)
             delta = delta_padded[:, :total_q]
             stride_delta_b, stride_delta_h, stride_delta_m = 0, delta.stride(0), delta.stride(1)
@@ -1207,11 +1219,28 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             delta = delta_padded[:, :, :max_seqlen_q_final]
             stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
 
+    if False:
+        print("o:", o, o.shape)
+        print("do:", do, do.shape)
+        print("delta:", delta, delta.shape)
+        print("cu_seqlens_q:", cu_seqlens_q)
+        print("max_seqlen_q_final:", max_seqlen_q_final)
+        print("descale_do:", descale_do, descale_do.shape if descale_do is not None else 'None')
+        # strides are scalars, so just print the values
+        print("stride_ob:", stride_ob, "stride_oh:", stride_oh, "stride_om:", stride_om, "stride_od:", stride_od)
+        print("stride_dob:", stride_dob, "stride_doh:", stride_doh, "stride_dom:", stride_dom, "stride_dod:", stride_dod)
+        print("stride_delta_b:", stride_delta_b, "stride_delta_h:", stride_delta_h, "stride_delta_m:", stride_delta_m)
+        print("stride_descale_do_z:", stride_descale_do_z)
+        # compile-time constants
+        print("HEAD_DIM:", HEAD_DIM, "ACTUAL_HEAD_DIM:", ACTUAL_HEAD_DIM)
+        print("IS_VARLEN:", IS_VARLEN, "IS_FP8:", IS_FP8)
+
     pre_grid = lambda META:  (triton.cdiv(max_seqlen_q_final, META['PRE_BLOCK']), batch, nheads_q)
     _bwd_preprocess[pre_grid](
         o, do,
         delta,
         stride_ob, stride_oh, stride_om, stride_od,
+        stride_dob, stride_doh, stride_dom, stride_dod,
         stride_delta_b, stride_delta_h, stride_delta_m,
         stride_descale_do_z,
         cu_seqlens_q, max_seqlen_q_final,
