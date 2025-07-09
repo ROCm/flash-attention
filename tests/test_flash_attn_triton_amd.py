@@ -874,9 +874,9 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize("deterministic", [True])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
-@pytest.mark.parametrize("local", [True])
+@pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -914,9 +914,6 @@ def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     DEBUG = False
-    BATCH_AND_HEAD_ONE = False
-    SAVE_TO_CSV = False
-    TEST_BACKWARD = False
     if DEBUG:
         print()
         print("Debugging")
@@ -935,7 +932,7 @@ def test_flash_attn_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    if BATCH_AND_HEAD_ONE:
+    if DEBUG:
         batch_size = 1
         nheads = 1
         nheads_k = 1
@@ -1166,20 +1163,21 @@ def test_flash_attn_output(
         print("window_size:", window_size)
         print("out:", out, out.shape)
         print("out_ref:", out_ref, out_ref.shape)
-    if SAVE_TO_CSV:
-        for batch_idx in range(batch_size):
-            for head_idx in range(nheads):
-                save_tensor_to_csv(out[batch_idx, :, head_idx, :], 
-                                f"out_b{batch_idx}_h{head_idx}.csv")
-                save_tensor_to_csv(out_ref[batch_idx, :, head_idx, :], 
-                                f"out_ref_b{batch_idx}_h{head_idx}.csv")
+    # if True:
+    #     for batch_idx in range(batch_size):
+    #         for head_idx in range(nheads):
+    #             save_tensor_to_csv(out[batch_idx, :, head_idx, :], 
+    #                             f"out_b{batch_idx}_h{head_idx}.csv")
+    #             save_tensor_to_csv(out_ref[batch_idx, :, head_idx, :], 
+    #                             f"out_ref_b{batch_idx}_h{head_idx}.csv")
+
+    if local == True and causal == True:
+        pytest.skip("Sliding Window and Causal not supported")
         
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-    if not TEST_BACKWARD:
-        return
 
     if dropout_p > 0.0:
         # assert (attn - attn_ref).abs().max().item() <= 2 * (attn_pt - attn_ref).abs().max().item()
@@ -1187,6 +1185,9 @@ def test_flash_attn_output(
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
 
     if DEBUG:
         print("dq:", dq)
@@ -2002,7 +2003,6 @@ def test_flash_attn_kvcache(
     num_splits,
     dtype,
 ):
-    DEBUG = False
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -2014,40 +2014,24 @@ def test_flash_attn_kvcache(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    if DEBUG:
-        batch_size = 1
-        batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-        nheads = 1
-    else:
-        batch_size = 2
-        batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-        nheads = 6
+    batch_size = 2
+    batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
+    nheads = 6
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    if DEBUG:
-        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
-    else:
-        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
     if new_kv:
-        if DEBUG:
-            k =  torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-            v =  torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-        else:
-            k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-            v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
+        k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
+        v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
     else:
         k, v = None, None
     if paged_kv_block_size is None:
-        if DEBUG:
-            k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-            v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-        else:
-            k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-            v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
         block_table = None
     else:
         (
@@ -2234,11 +2218,6 @@ def test_flash_attn_kvcache(
         assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
         assert torch.equal(v_cache_select, v_cache_ref)
     mult = 3 if not alibi else 5
-    if DEBUG:
-        print("out:", out, out.shape)
-        print("out_ref:", out_ref, out_ref.shape)
-        # save_tensor_to_csv(out, "out.csv")
-        # save_tensor_to_csv(out_ref, "out_ref.csv")
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
