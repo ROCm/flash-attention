@@ -325,7 +325,8 @@ def attention_varlen_backward_pytorch_ref_impl(
         if group_size != 1:
             # Reshape dq_i and delta_i back to original shape
             dq_i = dq_i.view(dq_i.shape[0], nheads_k, group_size, head_dim)
-            delta_i = delta_i.view(delta_i.shape[0], nheads_k, group_size)
+            L_q_i = delta_i.shape[1]
+            delta_i = delta_i.view(nheads_k, group_size, L_q_i)
             # Sum dk_i and dv_i over group dimension
             dk_i = dk_i.view(dk_i.shape[0], nheads_k, group_size, head_dim)
             dv_i = dv_i.view(dv_i.shape[0], nheads_k, group_size, head_dim)
@@ -333,7 +334,7 @@ def attention_varlen_backward_pytorch_ref_impl(
             dv_i = dv_i.sum(dim=2)
             # Reshape dq_i back to [L_q_i, nheads_q, head_dim]
             dq_i = dq_i.reshape(dq_i.shape[0], nheads_q, head_dim)
-            delta_i = delta_i.reshape(delta_i.shape[0], nheads_q)
+            delta_i = delta_i.reshape(nheads_q, L_q_i)
         else:
             # No need to reshape
             pass
