@@ -218,7 +218,41 @@ def _attn_fwd_mask(acc, l_i, m_i,
 
         if USE_SLIDING_WINDOW:
             if IS_CAUSAL:
-                pass
+                # ========== CAUSAL SLIDING WINDOW MASKING ==========
+                # For causal sliding window, we need to apply both constraints:
+                # 1. Causal: col_idx <= row_idx + (seqlen_k - seqlen_q)
+                # 2. Sliding window: row_idx - window_left <= col_idx <= row_idx + window_right
+                
+                # Get positions
+                row_idx = offs_m  # Query positions
+                col_idx = kv_offs_n  # Key positions
+                
+                # Expand for broadcasting
+                row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
+                col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
+                
+                # Apply causal constraint: can only attend to positions before or at the diagonal
+                causal_offset = seqlen_k - seqlen_q
+                causal_mask = col_idx_expanded > (row_idx_expanded + causal_offset)
+                
+                # Apply sliding window constraint
+                if WINDOW_SIZE_LEFT < 0:
+                    # Only right window constraint
+                    window_mask = col_idx_expanded > (row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT)
+                else:
+                    # Both left and right window constraints
+                    # Adjust window bounds by causal offset
+                    left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
+                    right_bound = row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
+                    
+                    # Can't attend to positions outside the window
+                    window_mask = (col_idx_expanded < left_bound) | (col_idx_expanded > right_bound)
+                
+                # Final mask is the union of both constraints (True = cannot attend)
+                mask = causal_mask | window_mask
+                
+                # Apply mask
+                qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
             else:
                 # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
                 # Exactly matching reference construct_local_mask:
@@ -387,17 +421,12 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
     else:
         n_extra_tokens = 0 
     
-    if USE_SLIDING_WINDOW: # TODO: impl sliding window
+    if USE_SLIDING_WINDOW:
+        # TODO: Optimize by computing which blocks can be fully skipped
+        # For now, process all blocks with the mask function
         if IS_CAUSAL:
-            return 0, 0, 0, 0, 0
+            return 0, 0, 0, total_k_blocks, n_extra_tokens
         else:
-            # ========== NON-CAUSAL SLIDING WINDOW ==========
-            # For now, we'll use a simple approach: 
-            # Process all blocks with masking since we have a sliding window
-            # This is less efficient than skipping blocks, but ensures correctness
-            
-            # TODO: Optimize by computing which blocks can be fully skipped
-            # For now, process all blocks with the mask function
             return 0, 0, 0, total_k_blocks, n_extra_tokens
     else:
         if IS_CAUSAL:
@@ -1023,4 +1052,4 @@ def attention_prefill_forward_triton_impl(
                         USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, 
                         IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, FLIP_GRID=FLIP_GRID)
 
-    return softmax_lse, sd_mask if return_softmax else None 
+    return softmax_lse, sd_mask if return_softmax else None

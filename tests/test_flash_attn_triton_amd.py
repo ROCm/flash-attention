@@ -887,13 +887,6 @@ def test_flash_attn_varlen_qkvpacked(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # debug
-        # (32, 32),
-        # (32, 64),
-        # (64, 32),
-        # (64, 64),
-        # (128, 128),
-        # og
         (113, 203),
         (128, 217),
         (113, 211),
@@ -914,10 +907,6 @@ def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
     DEBUG = False
-    if DEBUG:
-        print()
-        print("Debugging")
-
     if USE_TRITON_ROCM:
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:
@@ -972,12 +961,6 @@ def test_flash_attn_output(
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
     else:
         alibi_slopes, attn_bias = None, None
-
-    if DEBUG:
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("window_size:", window_size)
 
     if kvpacked:
         out, lse, S_dmask = flash_attn_kvpacked_func(
@@ -1159,22 +1142,6 @@ def test_flash_attn_output(
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-    if DEBUG:
-        print("window_size:", window_size)
-        print("out:", out, out.shape)
-        print("out_ref:", out_ref, out_ref.shape)
-    # if True:
-    #     for batch_idx in range(batch_size):
-    #         for head_idx in range(nheads):
-    #             save_tensor_to_csv(out[batch_idx, :, head_idx, :], 
-    #                             f"out_b{batch_idx}_h{head_idx}.csv")
-    #             save_tensor_to_csv(out_ref[batch_idx, :, head_idx, :], 
-    #                             f"out_ref_b{batch_idx}_h{head_idx}.csv")
-
-    if local == True and causal == True:
-        pytest.skip("Sliding Window and Causal not supported")
-        
-
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
@@ -1189,13 +1156,6 @@ def test_flash_attn_output(
         print("Sliding Window not supported in backward yet")
         return
 
-    if DEBUG:
-        print("dq:", dq)
-        print("dq_ref:", dq_ref)
-        print("dk:", dk)
-        print("dk_ref:", dk_ref)
-        print("dv:", dv)
-        print("dv_ref:", dv_ref)
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
