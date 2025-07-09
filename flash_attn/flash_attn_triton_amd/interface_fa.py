@@ -819,6 +819,16 @@ def fwd_kvcache(
     else:
         metadata.cache_seqlens = cache_seqlens
 
+    # window_size can be a tensor sometimes
+    if isinstance(window_size_left, torch.Tensor):
+        metadata.window_size_left = int(window_size_left.item())
+    else:
+        metadata.window_size_left = window_size_left
+    if isinstance(window_size_right, torch.Tensor):
+        metadata.window_size_right = int(window_size_right.item())
+    else:
+        metadata.window_size_right = window_size_right
+
     k_new = k
     v_new = v
 
@@ -887,8 +897,8 @@ def fwd_kvcache(
                 out,
                 metadata.sm_scale,
                 metadata.causal,
-                window_size_left, 
-                window_size_right,
+                metadata.window_size_left, 
+                metadata.window_size_right,
                 metadata.alibi_slopes,
                 metadata.layout,
                 metadata.cache_seqlens,
@@ -907,8 +917,8 @@ def fwd_kvcache(
             out,
             metadata.sm_scale,
             metadata.causal,
-            window_size_left, 
-            window_size_right,
+            metadata.window_size_left, 
+            metadata.window_size_right,
             metadata.alibi_slopes,
             metadata.layout,
             metadata.cache_seqlens,

@@ -55,6 +55,8 @@ class MetaData():
     rotary_cos: Optional[torch.Tensor] = None
     rotary_interleaved: bool = False
     rotary_conjunction: bool = False
+    window_size_left: int = -1
+    window_size_right: int = -1
     
 
     def __repr__(self) -> str:
@@ -74,6 +76,8 @@ class MetaData():
                 f"  cache_batch_idx={self.cache_batch_idx},\n"
                 f"  dropout_p={self.dropout_p},\n"
                 f"  return_softmax={self.return_softmax}\n"
+                f"  window_size_left={self.window_size_left},\n"
+                f"  window_size_right={self.window_size_right},\n"
                 f")")
 
     def __init__(self, sm_scale=1.0):

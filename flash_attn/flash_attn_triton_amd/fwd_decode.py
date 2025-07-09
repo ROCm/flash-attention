@@ -133,6 +133,9 @@ def _fwd_kernel_splitK(
     USE_ALIBI: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
 ):
     # get program ids
     pid_m = tl.program_id(0)
@@ -387,7 +390,6 @@ def _splitK_reduce(
     split_k: tl.constexpr,
     splitK_pow2: tl.constexpr,
     MASK_SPLITK: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
 ):
     # get pids
@@ -426,23 +428,15 @@ def _splitK_reduce(
 
     g_m = tl.max(l_m, axis=0)
     
-    if IS_CAUSAL:
-        l_m_offset = l_m - g_m
-        alpha = tl.where(l_m_offset > float("-inf"), tl.math.exp2(l_m_offset), 0.0)
-    else:
-        alpha = tl.math.exp2(l_m - g_m)
+    alpha = tl.where(l_m > float("-inf"), tl.math.exp2(l_m - g_m), 0.0)
 
     # read sum
     l_sum *= alpha
     g_sum = tl.sum(l_sum, axis=0)
     acc = acc * alpha[:, None]
 
-    if IS_CAUSAL:
-        # Avoid division by zero
-        g_sum_safe = tl.where(g_sum > 0, g_sum, 1.0)
-        acc_out = tl.sum(acc, axis=0) / g_sum_safe
-    else:
-        acc_out = tl.sum(acc, axis=0) / g_sum
+    g_sum_safe = tl.where(g_sum > 0, g_sum, 1.0)
+    acc_out    = tl.sum(acc, axis=0) / g_sum_safe
 
     # Store output
     z_id = pid_zhg // (H * G)
@@ -454,11 +448,10 @@ def _splitK_reduce(
 
     # Store lse
     l_ptrs = LSE + pid_zhg * stride_lse_zhg + pid_m
-    if IS_CAUSAL:
-        lse = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
-        tl.store(l_ptrs, lse)
-    else:
-        tl.store(l_ptrs, (g_m + tl.math.log2(g_sum)) / 1.44269504)
+    lse_val = tl.where(g_sum > 0,
+                       (g_m + tl.math.log2(g_sum)) / 1.44269504,
+                       g_m)
+    tl.store(l_ptrs, lse_val)
 
 
 @triton.jit
@@ -590,6 +583,7 @@ def attention_decode_forward_triton_impl(
     is_new_kv = True if k_new is not None and v_new is not None else False
     use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False,  alibi_slopes.stride() if alibi_slopes is not None else (None, None)
     use_cache_seqlens = cache_seqlens is not None
+    use_sliding_window = window_size_left != -1 or window_size_right != -1
     SPLIT_K = None
     NUM_QUANT_GROUPS = 1
 
@@ -653,7 +647,7 @@ def attention_decode_forward_triton_impl(
     stride_mzhg, stride_m2, stride_ms, stride_mm = metadata.stride()
     stride_lse_zhg, stride_lse_m = lse.stride()
 
-    if False:
+    if DEBUG:
         print("batch_size, seqlen_q, nheads_q, dim_q", (batch_size, seqlen_q, nheads_q, dim_q))
         print("_, seqlen_kc, nheads_kc, dim_kc", (_, seqlen_kc, nheads_kc, dim_kc))
         print("dim_padded:", dim_padded)
@@ -745,6 +739,9 @@ def attention_decode_forward_triton_impl(
         USE_ALIBI=use_alibi,
         PADDED_HEAD=is_padded_head,
         GROUP_SIZE=group_size,
+        USE_SLIDING_WINDOW=use_sliding_window,
+        WINDOW_SIZE_LEFT=window_size_left,
+        WINDOW_SIZE_RIGHT=window_size_right,
         num_warps=num_warps_fwd,
         num_stages=num_stages,
     )
@@ -806,7 +803,6 @@ def attention_decode_forward_triton_impl(
         split_k=split_k, 
         splitK_pow2=splitK_pow2, 
         MASK_SPLITK=mask_split_k,
-        IS_CAUSAL=causal,
         PADDED_HEAD=is_padded_head,
         num_warps=num_warps_reduce)
 
