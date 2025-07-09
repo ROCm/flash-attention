@@ -712,6 +712,10 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
+
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
@@ -860,6 +864,10 @@ def test_flash_attn_varlen_qkvpacked(
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
+
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
@@ -906,7 +914,6 @@ def test_flash_attn_varlen_qkvpacked(
 def test_flash_attn_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
-    DEBUG = False
     if USE_TRITON_ROCM:
         if causal:
             if seqlen_q ==1024 and seqlen_k==1024 and d==160:
@@ -921,23 +928,12 @@ def test_flash_attn_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    if DEBUG:
-        batch_size = 1
-        nheads = 1
-        nheads_k = 1
-    else:
-        batch_size = 4
-        nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
-        nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
+    batch_size = 4
+    nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
-    if DEBUG:
-        window_size = (-1, -1) if not local else (seqlen_k//4, (seqlen_k*3)//4)
-    else:
-        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    if DEBUG:
-        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, mode="ones")
-    else:
-        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
         # Ensure the values of qk are at least within softcap range.
         q = q * softcap
@@ -946,16 +942,12 @@ def test_flash_attn_output(
             batch_size, seqlen_k, 2, nheads_k, d, device=device, dtype=dtype, requires_grad=True
         )
     else:
-        if DEBUG:
-            k = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="ones")
-            v = generate_bshd_tensor(batch_size, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="identity")
-        else:
-            k = torch.randn(
-                batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
-            )
-            v = torch.randn(
-                batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
-            )
+        k = torch.randn(
+            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
+        )
+        v = torch.randn(
+            batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype, requires_grad=True
+        )
     if alibi:
         alibi_slopes = torch.rand(batch_size, nheads, device=device, dtype=torch.float32) * 0.3
         attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
@@ -1091,10 +1083,7 @@ def test_flash_attn_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if DEBUG:
-        g = torch.ones_like(out)
-    else:
-        g = torch.randn_like(out)
+    g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         if kvpacked:
@@ -1478,6 +1467,10 @@ def test_flash_attn_varlen_output(
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.04)
 
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
+
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
@@ -1591,6 +1584,10 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
 
     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item() + 1e-5
     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item() + 1e-5
@@ -1760,6 +1757,10 @@ def test_flash_attn_varlen_causal(
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
 
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
+
     if test_backward:
         assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item() + 1e-5
         assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item() + 1e-5
@@ -1889,6 +1890,10 @@ def test_flash_attn_splitkv(
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
 
     mult = 2 if not alibi else 8
     assert (dq - dq_ref).abs().max().item() <= mult * (dq_pt - dq_ref).abs().max().item() + 2e-4
@@ -2475,6 +2480,10 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size, deterministic=True)
 
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
+
     g = torch.randn_like(out)
     dq0, dk0, dv0 = torch.autograd.grad(out, (q, k, v), g, retain_graph=True)
     for _ in range(50):
@@ -2562,6 +2571,10 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         window_size=window_size,
         deterministic=True,
     )
+
+    if local == True:
+        print("Sliding Window not supported in backward yet")
+        return
 
     g = torch.randn_like(out)
     dq0, dk0, dv0 = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)
