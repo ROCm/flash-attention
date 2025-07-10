@@ -170,7 +170,7 @@ def generate_varlen_tensor(
     batch_size: Optional[int] = None,
     equal_seqlens: bool = False,
     device: str = "cuda",
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.float16,
     mode: Literal["random", "ones", "incremental", "identity"] = "random"
 ):
     if DEBUG:
@@ -245,7 +245,7 @@ def generate_varlen_tensor(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
-def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental", "identity"] = "random"):
+def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", mode: Literal["random", "ones", "incremental", "identity"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -277,7 +277,7 @@ def generate_bshd_tensor(BATCH, SEQ_LEN, NUM_HEADS, D_HEAD, dtype, device="cuda"
         x.requires_grad_()
         return x
 
-def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype, device="cuda", mode: Literal["random", "ones", "incremental", "identity"] = "random"):
+def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype: torch.dtype = torch.float16, device="cuda", mode: Literal["random", "ones", "incremental", "identity"] = "random"):
     # save fp8 type
     is_fp8_dtype = is_dtype_fp8(dtype)
     if is_fp8_dtype:
@@ -582,7 +582,7 @@ def input_helper(
             else:
                 q, cu_seqlens_q, max_seqlen_q = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
                 kv, cu_seqlens_k, max_seqlen_k = generate_varlen_kv_packed(TOTAL_SEQLENS_K, HK, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
-                do = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+                do, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
         elif packing == "qkv":
             # qkv packing - requires same sequence length for q and k
             assert N_CTX_Q == N_CTX_K, "For QKV packing, Q and K must have same sequence length"
@@ -594,8 +594,7 @@ def input_helper(
                 qkv, cu_seqlens_q, max_seqlen_q = generate_varlen_qkv_packed(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
                 cu_seqlens_k = cu_seqlens_q
                 max_seqlen_k = max_seqlen_q
-                # create dummy do for qkv case
-                do = generate_varlen_qkv_packed(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
+                do, _, _ = generate_varlen_tensor(TOTAL_SEQLENS_Q, HQ, D_HEAD, batch_size=BATCH, dtype=dtype, device=device, equal_seqlens=equal_seqlens)
         
         # setup metadata
         sm_scale = D_HEAD**-0.5
@@ -652,10 +651,10 @@ def input_helper(
             else:
                 if layout == "bshd":
                     qkv = generate_bshd_qkv_packed(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
-                    do = generate_bshd_qkv_packed(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
+                    do = generate_bshd_tensor(BATCH, N_CTX_Q, HQ, D_HEAD, dtype=dtype, device=device)
                 elif layout == "bhsd":
                     qkv = generate_bhsd_qkv_packed(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
-                    do = generate_bhsd_qkv_packed(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
+                    do = generate_bhsd_tensor(BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device)
 
         # setup metadata
         sm_scale = D_HEAD**-0.5
