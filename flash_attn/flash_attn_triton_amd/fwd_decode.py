@@ -346,18 +346,16 @@ def _fwd_kernel_splitK(
         if BOUNDS_CHECKS_N:
             qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
 
-        # -- compute scaling constant ---
-        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-        if IS_CAUSAL:
-            alpha = tl.math.exp2(tl.where(m_i > float("-inf"), m_i - m_i_new, float("-inf")))
-        else:
-            alpha = tl.math.exp2(m_i - m_i_new)
-        # cause of nan because subtracting infs
-        if IS_CAUSAL:
-            qk = tl.where(qk > float("-inf"), qk - m_i_new[:, None], float("-inf"))
-        else:
-            qk = qk - m_i_new[:, None] 
-        
+        m_i_new = tl.maximum(m_i, tl.max(qk, 1))           # per-row max so far
+
+        # rows that are *all* -inf after masking
+        valid   = m_i_new > float("-inf")
+
+        # scale previous partial sums safely
+        alpha   = tl.where(valid, tl.math.exp2(m_i - m_i_new), 0.0)
+
+        # subtract the row max only on valid rows
+        qk      = tl.where(valid[:, None], qk - m_i_new[:, None], float("-inf"))
         p = tl.math.exp2(qk)
 
         # -- update m_i and l_i --
