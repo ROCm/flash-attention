@@ -301,11 +301,7 @@ def generate_bhsd_tensor(BATCH, NUM_HEADS, SEQ_LEN, D_HEAD, dtype: torch.dtype =
         raise ValueError(f"Unkown mode {mode}")
     
     if is_fp8_dtype:
-        # cast to fp8
         raise ValueError("fp8 not supported for bhsd yet")
-        # x, descale_x = cast_to_fp8(x, og_fp8_dtype, "bhsd") # FIXME: I don't the casting fn supports this atm
-        # x.requires_grad_()
-        # return x, descale_x
     else:
         x.requires_grad_()
         return x

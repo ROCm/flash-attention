@@ -5,11 +5,7 @@ import triton.language as tl
 from typing import Literal, Optional, Union
 from .utils import DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_arch, is_cdna, is_fp8, is_rdna, create_dropout_mask, get_fwd_prefill_autotune_configs
 
-
-from flash_attn.flash_attn_triton_amd.fwd_prefill_old import attn_fwd_old
-
 DEBUG = False
-
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -1010,11 +1006,9 @@ def attention_prefill_forward_triton_impl(
     else:
         stride_bz, stride_bh, stride_bm, stride_bn = (0, 0, 0, 0)
 
-    USE_OLD = os.environ.get('USE_OLD', '0').lower() in ('1', 'true', 'yes')
-    if USE_OLD:
-        attn_fwd_old[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
+    attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
                     descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
-                    sm_scale, softmax_lse, o, 
+                    sm_scale, softmax_lse, o,
                     stride_qb, stride_qh, stride_qm, stride_qd, 
                     stride_kb, stride_kh, stride_kn, stride_kd,
                     stride_vb, stride_vh, stride_vn, stride_vd,
@@ -1022,34 +1016,15 @@ def attention_prefill_forward_triton_impl(
                     stride_bz, stride_bh, stride_bm, stride_bn, 
                     stride_az, stride_ah, 
                     stride_sz, stride_sh, stride_sm, stride_sn, 
-                    stride_lse_z, stride_lse_h, stride_lse_m, 
+                    stride_lse_z, stride_lse_h, stride_lse_m,
                     cu_seqlens_q, cu_seqlens_k,
                     dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 
                     HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size, MAX_SEQLENS_Q=max_seqlens_q,
-                    MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, IS_VARLEN=IS_VARLEN, IS_INFERENCE=is_inference,
+                    MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, 
+                    USE_SLIDING_WINDOW=use_sliding_window, WINDOW_SIZE_LEFT=window_size_left, WINDOW_SIZE_RIGHT=window_size_right, 
+                    IS_VARLEN=IS_VARLEN,
                     BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
                     USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, 
                     IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, FLIP_GRID=FLIP_GRID)
-    else:
-        attn_fwd[grid](q, k, v, bias, cache_seqlens, cache_batch_idx,
-                        descale_q, descale_k, descale_v, descale_o, stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_o_z,
-                        sm_scale, softmax_lse, o,
-                        stride_qb, stride_qh, stride_qm, stride_qd, 
-                        stride_kb, stride_kh, stride_kn, stride_kd,
-                        stride_vb, stride_vh, stride_vn, stride_vd,
-                        stride_ob, stride_oh, stride_om, stride_od,
-                        stride_bz, stride_bh, stride_bm, stride_bn, 
-                        stride_az, stride_ah, 
-                        stride_sz, stride_sh, stride_sm, stride_sn, 
-                        stride_lse_z, stride_lse_h, stride_lse_m,  
-                        cu_seqlens_q, cu_seqlens_k,
-                        dropout_p=dropout_p, philox_seed=philox_seed, philox_offset_base=philox_offset, sd_mask=sd_mask, dropout_mask=dropout_mask, alibi_slopes=alibi_slopes, 
-                        HQ=nheads_q, HK=nheads_k, ACTUAL_BLOCK_DMODEL=head_size, MAX_SEQLENS_Q=max_seqlens_q,
-                        MAX_SEQLENS_K=max_seqlens_k, IS_CAUSAL=causal, 
-                        USE_SLIDING_WINDOW=use_sliding_window, WINDOW_SIZE_LEFT=window_size_left, WINDOW_SIZE_RIGHT=window_size_right, 
-                        IS_VARLEN=IS_VARLEN,
-                        BLOCK_DMODEL=padded_d_model, USE_BIAS=False if bias is None else True,
-                        USE_ALIBI=use_alibi, ENABLE_DROPOUT=dropout_p > 0.0, USE_EXP2=use_exp2, RETURN_SCORES=return_softmax, 
-                        IS_FP8=IS_FP8, FP8_MAX=FP8_MAX, FP8_OUTPUT=FP8_OUTPUT, FLIP_GRID=FLIP_GRID)
 
     return softmax_lse, sd_mask if return_softmax else None

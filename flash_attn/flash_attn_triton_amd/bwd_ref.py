@@ -58,7 +58,7 @@ def attention_backward_core_ref_impl(
         if DEBUG_CORE:
             print("attention_scaled_scores after alibi:", attention_scaled_scores, attention_scaled_scores.shape)
 
-    # Apply masks (causal and/or sliding window)
+    # Apply masks
     L_q, L_k = q.shape[1], k.shape[1]
     row_idx = torch.arange(L_q, device=q.device).unsqueeze(1)
     col_idx = torch.arange(L_k, device=q.device).unsqueeze(0)
