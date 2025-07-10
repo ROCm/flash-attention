@@ -300,17 +300,46 @@ def _fwd_kernel_splitK(
             alibi_bias = -1 * alibi_slope * relative_pos
             qk += (alibi_bias * 1.44269504)
 
-        # Apply causal mask if IS_CAUSAL is True
-        if IS_CAUSAL:
-            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            col_idx = start_n + tl.arange(0, BLOCK_N)
-            
-            # create a N_CTX_Q x kv_len causal mask
-            col_offset = N_CTX_Q - N_CTX_K_FINAL
-            causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
+        # ------------------------------------------------------------------
+        # masking
+        # ------------------------------------------------------------------
+        if USE_SLIDING_WINDOW:
+            row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # q positions
+            col_idx = start_n + tl.arange(0, BLOCK_N)                # k positions
+            row = row_idx[:, None]                                   # [M,1]
+            col = col_idx[None, :]                                   # [1,N]
+    
+            if IS_CAUSAL:
+                # -------- causal + window --------
+                diag      = N_CTX_K_FINAL - N_CTX_Q                  # sk-sq
+                causal_ok = col <= row + diag
+                if WINDOW_SIZE_LEFT < 0:                             # only right window
+                    win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
+                else:                                                # both sides
+                    win_ok = ((col >= row + diag - WINDOW_SIZE_LEFT) &
+                                (col <= row + diag + WINDOW_SIZE_RIGHT))
+                mask = ~(causal_ok & win_ok)                         # True ⇒ -inf
+            else:
+                # -------- non-causal window --------
+                sk, sq = N_CTX_K_FINAL, N_CTX_Q
+                if WINDOW_SIZE_LEFT < 0:
+                    mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
+                else:
+                    right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
+                    left  = row + (sk - sq) - WINDOW_SIZE_LEFT
+                    mask  = (col > right) | (col < left)
+            qk = tl.where(mask, float("-inf"), qk)
+        else:
+            if IS_CAUSAL:
+                row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                col_idx = start_n + tl.arange(0, BLOCK_N)
 
-            # Apply the mask
-            qk = tl.where(causal_mask, qk, float("-inf"))
+                # create a N_CTX_Q x kv_len causal mask
+                col_offset = N_CTX_Q - N_CTX_K_FINAL
+                causal_mask = row_idx[:, None] >= (col_offset + col_idx[None, :])
+
+                # Apply the mask
+                qk = tl.where(causal_mask, qk, float("-inf"))
 
         # TODO: This is slow, and only needed at the last iteration.
         # Maybe we can unroll the last iteration instead?
