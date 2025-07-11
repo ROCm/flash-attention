@@ -1110,16 +1110,6 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     DEBUG_TRITON: bool = False
     DEBUG_TRITON_DETAIL: bool = False
 
-    # do = is_contiguous(do, "do")
-    # q = is_contiguous(q, "q")
-    # k = is_contiguous(k, "k")
-    # v = is_contiguous(v, "v")
-    # o = is_contiguous(o, "o")
-    # softmax_lse = is_contiguous(softmax_lse, "softmax_lse")
-    # dq = is_contiguous(dq, "dq")
-    # dk = is_contiguous(dk, "dk")
-    # dv = is_contiguous(dv, "dv")
-
     IS_FP8 = is_fp8(q)
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
@@ -1148,18 +1138,55 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
     use_dropout = (dropout_p > 0.0)
-    
+
+    # common assertions
+    assert 0.0 <= dropout_p <= 1.0, f"dropout_p must be between 0 and 1, got {dropout_p}"
+    assert q.device == k.device == v.device == o.device == do.device == softmax_lse.device, \
+        f"All tensors must be on the same device. Got: q={q.device}, k={k.device}, v={v.device}, o={o.device}, do={do.device}, softmax_lse={softmax_lse.device}"
+    assert q.dtype == k.dtype == v.dtype, "q, k, v must have the same dtype"
+    assert do.dtype == o.dtype, "do and o must have the same dtype"
+    current_device = torch.cuda.current_device()
+    assert q.is_cuda and q.device.index == current_device, f"Device mismatch: Kernel will launch on cuda:{current_device}, but tensors are on {q.device}"
+
     # get shapes and strides        
     if IS_VARLEN:
         # shape
-        total_seqlen_q, nheads_q, head_size = q.shape
-        _, nheads_k, _ = k.shape
-        assert cu_seqlens_q is not None
-        batch = len(cu_seqlens_q) - 1
-        max_seqlen_q_final = max_seqlen_q
-        max_seqlen_k_final = max_seqlen_k
+        total_seqlen_q, nheads_q, head_size_q = q.shape
+        total_seqlen_k, nheads_k, head_size_k = k.shape
+        total_seqlen_v, nheads_v, head_size_v = v.shape
+        nheads_lse, total_seqlen_lse = softmax_lse.shape
 
-        assert softmax_lse.shape[-1] == total_seqlen_q
+        # assert shapes
+        assert total_seqlen_lse == total_seqlen_q, f"softmax_lse seqlen {total_seqlen_lse} != q seqlen {total_seqlen_q}"
+        assert cu_seqlens_q is not None, "cu_seqlens_q must be provided for varlen layout"
+        assert cu_seqlens_k is not None, "cu_seqlens_k must be provided for varlen layout"
+        assert max_seqlen_q is not None, "max_seqlen_q must be provided for varlen layout"
+        assert max_seqlen_k is not None, "max_seqlen_k must be provided for varlen layout"
+        
+        # assert head dimensions
+        assert head_size_q == head_size_k == head_size_v, f"head sizes must match: q={head_size_q}, k={head_size_k}, v={head_size_v}"
+        assert nheads_k == nheads_v, f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
+        assert nheads_q % nheads_k == 0, f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
+        assert nheads_lse == nheads_q, f"softmax_lse heads {nheads_lse} != q heads {nheads_q}"
+        
+        # assert output shapes
+        assert o.shape == (total_seqlen_q, nheads_q, head_size_q), f"o shape {o.shape} != expected {(total_seqlen_q, nheads_q, head_size_q)}"
+        assert do.shape == o.shape, f"do shape {do.shape} != o shape {o.shape}"
+        assert dq.shape == q.shape, f"dq shape {dq.shape} != q shape {q.shape}"
+        assert dk.shape == k.shape, f"dk shape {dk.shape} != k shape {k.shape}"
+        assert dv.shape == v.shape, f"dv shape {dv.shape} != v shape {v.shape}"
+        
+        # assert cu_seqlens
+        assert cu_seqlens_q.dtype == torch.int32, f"cu_seqlens_q must be int32, got {cu_seqlens_q.dtype}"
+        assert cu_seqlens_k.dtype == torch.int32, f"cu_seqlens_k must be int32, got {cu_seqlens_k.dtype}"
+        assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
+        assert cu_seqlens_k[0] == 0, "cu_seqlens_k must start with 0"
+        assert cu_seqlens_q[-1] == total_seqlen_q, f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} != total_seqlen_q {total_seqlen_q}"
+        assert cu_seqlens_k[-1] == total_seqlen_k, f"cu_seqlens_k[-1] {cu_seqlens_k[-1]} != total_seqlen_k {total_seqlen_k}"
+        
+        # set vars
+        batch = len(cu_seqlens_q) - 1
+        head_size = head_size_q
 
         # strides
         stride_qb, stride_qm, stride_qh, stride_qd = 0, q.stride(0), q.stride(1), q.stride(2)
@@ -1173,10 +1200,37 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         stride_lse_b, stride_lse_h, stride_lse_m = (0, softmax_lse.stride(0), softmax_lse.stride(1))
     else:
         # shapes
-        batch, max_seqlen_q_final, nheads_q, head_size = q.shape
-        _, max_seqlen_k_final, nheads_k, _ = k.shape
+        batch_q, seqlen_q, nheads_q, head_size_q = q.shape
+        batch_k, seqlen_k, nheads_k, head_size_k = k.shape
+        batch_v, seqlen_v, nheads_v, head_size_v = v.shape
+        batch_lse, nheads_lse, seqlen_lse = softmax_lse.shape
+        
+        # assert batch dimensions
+        assert batch_q == batch_k == batch_v, f"batch sizes must match: q={batch_q}, k={batch_k}, v={batch_v}"
+        
+        # assert head dimensions
+        assert head_size_q == head_size_k == head_size_v, f"head sizes must match: q={head_size_q}, k={head_size_k}, v={head_size_v}"
+        assert nheads_k == nheads_v, f"k and v must have same number of heads: k={nheads_k}, v={nheads_v}"
+        assert nheads_q % nheads_k == 0, f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
+        
+        # assert sequence lengths
+        assert seqlen_k == seqlen_v, f"k and v sequence lengths must match: k={seqlen_k}, v={seqlen_v}"
+        
+        # assert output shapes
+        assert o.shape == (batch_q, seqlen_q, nheads_q, head_size_q), f"o shape {o.shape} != expected"
+        assert do.shape == o.shape, f"do shape {do.shape} != o shape {o.shape}"
+        assert dq.shape == q.shape, f"dq shape {dq.shape} != q shape {q.shape}"
+        assert dk.shape == k.shape, f"dk shape {dk.shape} != k shape {k.shape}"
+        assert dv.shape == v.shape, f"dv shape {dv.shape} != v shape {v.shape}"
+        
+        # assert softmax_lse shape
+        assert softmax_lse.shape == (batch_q, nheads_q, seqlen_q), f"softmax_lse shape {softmax_lse.shape} != expected"
 
-        assert softmax_lse.shape[-1] == max_seqlen_q_final
+        # set vars
+        batch = batch_q
+        head_size = head_size_q
+        max_seqlen_q = seqlen_q
+        max_seqlen_k = seqlen_k
 
         # strides
         stride_qb, stride_qm, stride_qh, stride_qd = q.stride()
@@ -1213,29 +1267,13 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             stride_delta_b, stride_delta_h, stride_delta_m = 0, delta.stride(0), delta.stride(1)
         else:
             # the interface expects the sequence dimension to be rounded to 128
-            max_seqlen_q_rounded = round_multiple(max_seqlen_q_final, 128)
+            max_seqlen_q_rounded = round_multiple(max_seqlen_q, 128)
             delta_padded = torch.zeros((batch, nheads_q, max_seqlen_q_rounded), 
-                            device=softmax_lse.device, dtype=torch.float32)
-            delta = delta_padded[:, :, :max_seqlen_q_final]
+                            device=q.device, dtype=torch.float32)
+            delta = delta_padded[:, :, :max_seqlen_q]
             stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
 
-    if False:
-        print("o:", o, o.shape)
-        print("do:", do, do.shape)
-        print("delta:", delta, delta.shape)
-        print("cu_seqlens_q:", cu_seqlens_q)
-        print("max_seqlen_q_final:", max_seqlen_q_final)
-        print("descale_do:", descale_do, descale_do.shape if descale_do is not None else 'None')
-        # strides are scalars, so just print the values
-        print("stride_ob:", stride_ob, "stride_oh:", stride_oh, "stride_om:", stride_om, "stride_od:", stride_od)
-        print("stride_dob:", stride_dob, "stride_doh:", stride_doh, "stride_dom:", stride_dom, "stride_dod:", stride_dod)
-        print("stride_delta_b:", stride_delta_b, "stride_delta_h:", stride_delta_h, "stride_delta_m:", stride_delta_m)
-        print("stride_descale_do_z:", stride_descale_do_z)
-        # compile-time constants
-        print("HEAD_DIM:", HEAD_DIM, "ACTUAL_HEAD_DIM:", ACTUAL_HEAD_DIM)
-        print("IS_VARLEN:", IS_VARLEN, "IS_FP8:", IS_FP8)
-
-    pre_grid = lambda META:  (triton.cdiv(max_seqlen_q_final, META['PRE_BLOCK']), batch, nheads_q)
+    pre_grid = lambda META:  (triton.cdiv(max_seqlen_q, META['PRE_BLOCK']), batch, nheads_q)
     _bwd_preprocess[pre_grid](
         o, do,
         delta,
@@ -1243,7 +1281,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         stride_dob, stride_doh, stride_dom, stride_dod,
         stride_delta_b, stride_delta_h, stride_delta_m,
         stride_descale_do_z,
-        cu_seqlens_q, max_seqlen_q_final,
+        cu_seqlens_q, max_seqlen_q,
         descale_do,
         HEAD_DIM=HEAD_DIM,
         ACTUAL_HEAD_DIM=ACTUAL_HEAD_DIM,
@@ -1261,7 +1299,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         (0, 0 , 0 , 0)
     if use_dropout:
         dropout_mask = torch.zeros(
-            (batch, nheads_q, max_seqlen_q_final, max_seqlen_k_final),
+            (batch, nheads_q, max_seqlen_q, max_seqlen_k),
             device=q.device,
             dtype=torch.float32
         )
@@ -1270,7 +1308,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             if not IS_VARLEN:
                 dropout_mask = create_dropout_mask(
                     dropout_p,
-                    (batch, nheads_q, max_seqlen_q_final, max_seqlen_k_final),
+                    (batch, nheads_q, max_seqlen_q, max_seqlen_k),
                     seed = philox_seed
                 )
             else:
@@ -1281,7 +1319,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = \
             dropout_mask.stride()
 
-    seqlen = max(max_seqlen_q_final, max_seqlen_k_final)
+    seqlen = max(max_seqlen_q, max_seqlen_k)
     grid = lambda META: (nheads_k, (seqlen + META['BLOCK_N1'] - 1) // META['BLOCK_N1'], batch, )
     if causal:
         if DEBUG_TRITON: print(f"bwd_kernel: grid = {grid}" )  # noqa: E701
@@ -1302,7 +1340,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             stride_az, stride_ah,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q_final, max_seqlen_k_final,
+            max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             alibi_slopes,
             descale_q, descale_k, descale_v, descale_do,
@@ -1336,7 +1374,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             stride_az, stride_ah,
             nheads_q, nheads_k,
             cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q_final, max_seqlen_k_final,
+            max_seqlen_q, max_seqlen_k,
             dropout_mask, dropout_p, philox_seed, philox_offset,
             alibi_slopes,
             descale_q, descale_k, descale_v, descale_do,
