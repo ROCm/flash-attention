@@ -1071,8 +1071,9 @@ def is_contiguous(x, name):
         print(f"{name} is not contiguous")
         return x.contiguous() 
     
-
-OLD_LSE = os.environ.get('OLD_LSE', '0').lower() in ('1', 'true', 'yes')
+OLD_LSE: bool = False
+DEBUG_TRITON: bool = False
+DEBUG_TRITON_DETAIL: bool = False
 
 def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     do: torch.Tensor,
@@ -1106,35 +1107,6 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     descale_dk: Optional[torch.Tensor],
     descale_dv: Optional[torch.Tensor],
 ):
-    # debug
-    DEBUG_TRITON: bool = False
-    DEBUG_TRITON_DETAIL: bool = False
-
-    IS_FP8 = is_fp8(q)
-    if IS_FP8:
-        FP8_MAX = torch.finfo(q.dtype).max
-        # assert that the main inputs are fp8
-        assert is_fp8(do) and is_fp8(q) and is_fp8(k) and is_fp8(v), f"Non fp8 type found: do.dtype={do.dtype}, q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}. All tensors must be fp8."
-        if is_fp8(o):
-            FP8_OUTPUT = True
-            assert descale_o is not None, f"descale_o is None. In fp8, you need to pass a tensor for descale_o along with a tensor o."
-            assert descale_dq is not None, f"descale_dq is None. In fp8, you need to pass a tensor for descale_dq along with a tensor dq."
-            assert descale_dk is not None, f"descale_dk is None. In fp8, you need to pass a tensor for descale_dk along with a tensor dk."
-            assert descale_dv is not None, f"descale_dv is None. In fp8, you need to pass a tensor for descale_dv along with a tensor dv."
-        else:
-            FP8_OUTPUT = False
-
-        stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
-        stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
-        stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
-        stride_descale_o_z = descale_o.stride(0) if descale_o is not None else None
-        stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
-    else:
-        FP8_MAX = None
-        FP8_OUTPUT = False
-        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_o_z = stride_descale_do_z = None
-
-
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
     use_dropout = (dropout_p > 0.0)
@@ -1143,8 +1115,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     assert 0.0 <= dropout_p <= 1.0, f"dropout_p must be between 0 and 1, got {dropout_p}"
     assert q.device == k.device == v.device == o.device == do.device == softmax_lse.device, \
         f"All tensors must be on the same device. Got: q={q.device}, k={k.device}, v={v.device}, o={o.device}, do={do.device}, softmax_lse={softmax_lse.device}"
-    assert q.dtype == k.dtype == v.dtype, "q, k, v must have the same dtype"
-    assert do.dtype == o.dtype, "do and o must have the same dtype"
+    assert q.dtype == k.dtype == v.dtype == do.dtype, "q, k, v, do must have the same dtype"
     current_device = torch.cuda.current_device()
     assert q.is_cuda and q.device.index == current_device, f"Device mismatch: Kernel will launch on cuda:{current_device}, but tensors are on {q.device}"
 
@@ -1242,6 +1213,32 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
         stride_dvb, stride_dvn, stride_dvh, stride_dvd = dv.stride()
         stride_dob, stride_dom, stride_doh, stride_dod = do.stride()
         stride_lse_b, stride_lse_h, stride_lse_m = softmax_lse.stride()
+
+    # fp8 setup - moved after all assertions
+    IS_FP8 = is_fp8(q)
+    if IS_FP8:
+        FP8_MAX = torch.finfo(q.dtype).max
+        # we already asserted that do, q, k, v all have the same dtype, so no need to check each one
+        if is_fp8(o):
+            FP8_OUTPUT = True
+            assert descale_o is not None, f"descale_o is None. In fp8, you need to pass a tensor for descale_o along with a tensor o."
+            assert descale_dq is not None, f"descale_dq is None. In fp8, you need to pass a tensor for descale_dq along with a tensor dq."
+            assert descale_dk is not None, f"descale_dk is None. In fp8, you need to pass a tensor for descale_dk along with a tensor dk."
+            assert descale_dv is not None, f"descale_dv is None. In fp8, you need to pass a tensor for descale_dv along with a tensor dv."
+        else:
+            FP8_OUTPUT = False
+
+        stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
+        stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
+        stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
+        stride_descale_o_z = descale_o.stride(0) if descale_o is not None else None
+        stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
+    else:
+        FP8_MAX = None
+        FP8_OUTPUT = False
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = stride_descale_o_z = stride_descale_do_z = None
+
+    # alibi setup
     use_alibi, (stride_az, stride_ah) = (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
 
     # get closest power of 2 over or equal to 32.
