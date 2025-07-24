@@ -382,6 +382,100 @@ def _attn_fwd_mask(acc, l_i, m_i,
 
 
 @triton.jit
+def compute_window_bounds(q_start, q_end, diag, seqlen_k,
+                         WINDOW_SIZE_LEFT: tl.constexpr, 
+                         WINDOW_SIZE_RIGHT: tl.constexpr,
+                         IS_CAUSAL: tl.constexpr):
+    """Calculate the window boundaries for a query block."""
+    # Left boundary
+    if WINDOW_SIZE_LEFT < 0:
+        left_min = 0
+        left_max = 0
+    else:
+        left_min = tl.maximum(0, q_start + diag - WINDOW_SIZE_LEFT)
+        left_max = tl.maximum(0, q_end + diag - WINDOW_SIZE_LEFT)
+    
+    # Right boundary  
+    if IS_CAUSAL:
+        # Causal cap: col ≤ row + diag
+        right_min = tl.minimum(seqlen_k - 1, q_start + diag)
+        right_max = tl.minimum(seqlen_k - 1, q_end + diag)
+    else:
+        if WINDOW_SIZE_RIGHT < 0:
+            right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
+            right_max = tl.minimum(seqlen_k - 1, q_end + diag + WINDOW_SIZE_RIGHT)
+        else:
+            # Non-causal doesn't have the diagonal constraint
+            right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
+            right_max = tl.minimum(seqlen_k - 1, q_end + diag + WINDOW_SIZE_RIGHT)
+    
+    return left_min, left_max, right_min, right_max
+
+@triton.jit
+def classify_window_blocks(left_min, left_max, right_min, right_max,
+                          BLOCK_N: tl.constexpr):
+    """Classify blocks based on window boundaries."""
+    # First and last blocks that have ANY overlap with window
+    first_block = left_min // BLOCK_N
+    last_block = right_max // BLOCK_N
+    
+    # First block that is FULLY visible for all rows in Q block
+    full_left_block = left_max // BLOCK_N + (left_max % BLOCK_N != 0)
+    clipped_left = tl.minimum(full_left_block, last_block + 1)
+    
+    # Last block that is FULLY visible for all rows in Q block
+    last_full_block_candidate = right_min // BLOCK_N
+    if (last_full_block_candidate + 1) * BLOCK_N - 1 > right_min:
+        last_full_block_candidate -= 1
+    full_right_block = tl.maximum(last_full_block_candidate, clipped_left - 1)
+    
+    # Calculate counts
+    n_front_skip_blocks = first_block
+    n_front_masked_blocks = tl.maximum(0, clipped_left - first_block)
+    n_full_blocks = tl.maximum(0, full_right_block - clipped_left + 1)
+    n_back_masked_blocks = tl.maximum(0, last_block - full_right_block)
+    
+    return (n_front_skip_blocks, n_front_masked_blocks, 
+            n_full_blocks, n_back_masked_blocks,
+            clipped_left)  # Return clipped_left for padded block handling
+
+@triton.jit
+def handle_padded_last_block(n_extra_tokens, last_block, total_k_blocks,
+                           clipped_left, n_front_masked_blocks,
+                           n_full_blocks, n_back_masked_blocks):
+    """Adjust block counts when last K block has padding."""
+    padded_last_k = (n_extra_tokens != 0) & (last_block == total_k_blocks - 1)
+    
+    if padded_last_k & (n_back_masked_blocks == 0):
+        last_block_in_front = clipped_left > last_block
+        if last_block_in_front:
+            n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
+        else:
+            n_full_blocks = tl.maximum(0, n_full_blocks - 1)
+        n_back_masked_blocks = 1
+    
+    return n_front_masked_blocks, n_full_blocks, n_back_masked_blocks
+
+@triton.jit
+def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
+    """Calculate padding information for the last K block."""
+    # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
+    # n_extra_tokens = 10 % 4 = 2
+    # This means the last K block has 2 valid tokens and 2 padding positions
+    # K blocks visualization:
+    #         Block 0         Block 1         Block 2 (last)
+    #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
+    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
+    #         full block     full block      valid  pad
+    if seqlen_k < BLOCK_N:
+        n_extra_tokens = BLOCK_N - seqlen_k
+    elif seqlen_k % BLOCK_N:
+        n_extra_tokens = seqlen_k % BLOCK_N
+    else:
+        n_extra_tokens = 0
+    return n_extra_tokens
+
+@triton.jit
 def compute_block_masking(seqlen_k, seqlen_q, start_m,
                       IS_CAUSAL: tl.constexpr, USE_SLIDING_WINDOW: tl.constexpr,
                       WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr,
@@ -396,172 +490,42 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
         - n_back_masked_blocks: Blocks partially overlapping window back
         - n_extra_tokens: Padding tokens in last K block
     """
-    # Example case
-    # BLOCK_M = 4, BLOCK_N = 4, seqlen_q = 8, seqlen_k = 10
-
-    # Total K blocks in the key sequence
-    total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
-
-    # check if we will need to do masking due either BLOCK_N being bigger than seqlen_k or seqlen_k not being a factor of BLOCK_N
-    # n_extra_tokens = 10 % 4 = 2
-    # This means the last K block has 2 valid tokens and 2 padding positions
-    # K blocks visualization:
-    #         Block 0         Block 1         Block 2 (last)
-    #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
-    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
-    #         full block     full block      valid  pad
-    if seqlen_k < BLOCK_N:
-        n_extra_tokens = BLOCK_N - seqlen_k
-    elif seqlen_k % BLOCK_N:
-        n_extra_tokens = seqlen_k % BLOCK_N
-    else:
-        n_extra_tokens = 0 
 
     # common
     q_start = start_m * BLOCK_M
     q_end   = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
     diag    = seqlen_k - seqlen_q
+    total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
+    n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
     
     if USE_SLIDING_WINDOW:
-        if IS_CAUSAL:
-            # ------------------------------------------------------------------
-            #  causal + sliding‑window block classification
-            # ------------------------------------------------------------------
-            # window per row i:
-            #   left_i  = max(0,  i + diag − W_left)          (if W_left >= 0)
-            #   right_i = min(sk‑1, i + diag)                 (causal cap)
-            #            (if  W_right < 0 then i+diag+W_right)
-            #
-            # to be “full” a K‑block has to lie inside the *intersection*
-            # of every row’s window ⇒ use
-            #     left_max  = max_i left_i     (earliest col seen by all rows)
-            #     right_min = min_i right_i    (latest   col seen by all rows)
-            # any block wholly inside [left_max , right_min] is un‑masked.
-            # ------------------------------------------------------------------
+        # get window bounds
+        left_min, left_max, right_min, right_max = compute_window_bounds(
+            q_start, q_end, diag, seqlen_k,
+            WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT, IS_CAUSAL
+        )
 
-            # ------------------ left edge ------------------
-            if WINDOW_SIZE_LEFT < 0:
-                left_min = 0
-                left_max = 0
-            else:
-                left_min = tl.maximum(0, q_start + diag - WINDOW_SIZE_LEFT)
-                left_max = tl.maximum(0, q_end   + diag - WINDOW_SIZE_LEFT)
-
-            # ------------------ right edge -----------------
-            if WINDOW_SIZE_RIGHT < 0:
-                right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
-                right_max = tl.minimum(seqlen_k - 1, q_end   + diag + WINDOW_SIZE_RIGHT)
-            else:
-                # causal cap: col ≤ row + diag
-                right_min = tl.minimum(seqlen_k - 1, q_start + diag)
-                right_max = tl.minimum(seqlen_k - 1, q_end   + diag)
-
-            # no overlap → nothing visible
-            if right_max < left_min:
-                return 0, 0, 0, 0, n_extra_tokens
-
-            # ---------------- block geometry ---------------
-            first_block  = left_min  // BLOCK_N
-            last_block   = right_max // BLOCK_N
-
-            full_left_block = left_max // BLOCK_N + (left_max % BLOCK_N != 0)
-            clipped_left    = tl.minimum(full_left_block, last_block + 1)
-
-            n_front_skip_blocks   = first_block
-            n_front_masked_blocks = tl.maximum(0, clipped_left - first_block)
-
-            tmp = right_min // BLOCK_N
-            if (tmp + 1) * BLOCK_N - 1 > right_min:   # ensure block fits earliest row
-                tmp -= 1
-            full_right_block = tl.maximum(tmp, clipped_left - 1)
-
-            n_full_blocks        = tl.maximum(0, full_right_block - clipped_left + 1)
-            n_back_masked_blocks = tl.maximum(0, last_block - full_right_block)
-
-            # ------------- padded last‑K block -------------
-            padded_last_k      = (n_extra_tokens != 0) & (last_block == total_k_blocks - 1)
-            last_block_in_front = clipped_left > last_block
-            if padded_last_k & (n_back_masked_blocks == 0):
-                if last_block_in_front:
-                    n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
-                else:
-                    n_full_blocks = tl.maximum(0, n_full_blocks - 1)
-                n_back_masked_blocks = 1
-
-            return (n_front_skip_blocks,
-                    n_front_masked_blocks,
-                    n_full_blocks,
-                    n_back_masked_blocks,
-                    n_extra_tokens)
-        else:
-            # ------------------------------------------------------------------
-            # token bounds seen by FIRST and LAST rows in this Q‑block
-            # ------------------------------------------------------------------
-            # left‑hand side
-            if WINDOW_SIZE_LEFT < 0:                       # un‑bounded
-                left_min = 0                               # earliest row
-                left_max = 0                               # latest  row
-            else:
-                left_min = tl.maximum(0, q_start + diag - WINDOW_SIZE_LEFT)
-                left_max = tl.maximum(0, q_end   + diag - WINDOW_SIZE_LEFT)
-
-            # right‑hand side
-            right_min = tl.minimum(seqlen_k - 1,
-                                   q_start + diag + WINDOW_SIZE_RIGHT)
-            right_max = tl.minimum(seqlen_k - 1,
-                                   q_end   + diag + WINDOW_SIZE_RIGHT)
-
-            # window vanishes → early exit
-            if right_max < left_min:
-                return 0, 0, 0, 0, n_extra_tokens
-
-            # ------------------------------------------------------------------
-            # make sure full_left_block never outruns the visible range
-            # ------------------------------------------------------------------
-            first_block = left_min // BLOCK_N
-            last_block  = right_max // BLOCK_N          # right‑most block that *any* row touches
-
-            # “first block that is fully visible for all rows”
-            full_left_block = left_max // BLOCK_N + (left_max % BLOCK_N != 0)
-
-            # clip to avoid front‑mask length > total_visible
-            clipped_left = tl.minimum(full_left_block, last_block + 1)
-
-            # ------------------------------------------------------------------
-            # block counts
-            # ------------------------------------------------------------------
-            n_front_skip_blocks   = first_block
-            n_front_masked_blocks = tl.maximum(0, clipped_left - first_block)
-
-            tmp = right_min // BLOCK_N
-            if (tmp + 1) * BLOCK_N - 1 > right_min:      # ensure block fits earliest row
-                tmp -= 1
-            full_right_block = tl.maximum(tmp, clipped_left - 1)
-
-            n_full_blocks        = tl.maximum(0, full_right_block - clipped_left + 1)
-            n_back_masked_blocks = tl.maximum(0, last_block - full_right_block)
-
-            # ------------------------------------------------------------
-            # padded last‑K block
-            # ------------------------------------------------------------
-            padded_last_k = (n_extra_tokens != 0) & (last_block == total_k_blocks - 1)
-            last_block_in_front = clipped_left > last_block   # ← last block ended up on the left side
-
-            if padded_last_k & (n_back_masked_blocks == 0):
-                if last_block_in_front:
-                    # move the last block from front‑masked → back‑masked
-                    n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
-                else:
-                    # move the last block from full → back‑masked
-                    n_full_blocks        = tl.maximum(0, n_full_blocks - 1)
-
-                n_back_masked_blocks = 1     # ensure it is handled with padding info
-
-            return (n_front_skip_blocks,
-                    n_front_masked_blocks,
-                    n_full_blocks,
-                    n_back_masked_blocks,
-                    n_extra_tokens)
+        # window vanishes → early exit
+        if right_max < left_min:
+            return 0, 0, 0, 0, n_extra_tokens
+        
+        # classify blocks
+        (n_front_skip_blocks, n_front_masked_blocks, 
+        n_full_blocks, n_back_masked_blocks, 
+        clipped_left) = classify_window_blocks(
+            left_min, left_max, right_min, right_max, BLOCK_N
+        )
+        
+        # handle padded last block if needed
+        if n_extra_tokens != 0:
+            last_block = right_max // BLOCK_N
+            n_front_masked_blocks, n_full_blocks, n_back_masked_blocks = handle_padded_last_block(
+                n_extra_tokens, last_block, total_k_blocks,
+                clipped_left, n_front_masked_blocks,
+                n_full_blocks, n_back_masked_blocks
+            )
+        return (n_front_skip_blocks, n_front_masked_blocks,
+                n_full_blocks, n_back_masked_blocks, n_extra_tokens)
     else:
         if IS_CAUSAL:
             # ========== CAUSAL MODE: Classify K Blocks ==========
