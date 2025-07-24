@@ -428,9 +428,9 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
             #  causal + sliding‑window block classification
             # ------------------------------------------------------------------
             # window per row i:
-            #   left_i  = max(0,  i + base − W_left)          (if W_left >= 0)
-            #   right_i = min(sk‑1, i + base)                 (causal cap)
-            #            (if  W_right < 0 then i+base+W_right)
+            #   left_i  = max(0,  i + diag − W_left)          (if W_left >= 0)
+            #   right_i = min(sk‑1, i + diag)                 (causal cap)
+            #            (if  W_right < 0 then i+diag+W_right)
             #
             # to be “full” a K‑block has to lie inside the *intersection*
             # of every row’s window ⇒ use
@@ -452,7 +452,7 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
                 right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
                 right_max = tl.minimum(seqlen_k - 1, q_end   + diag + WINDOW_SIZE_RIGHT)
             else:
-                # causal cap: col ≤ row + base
+                # causal cap: col ≤ row + diag
                 right_min = tl.minimum(seqlen_k - 1, q_start + diag)
                 right_max = tl.minimum(seqlen_k - 1, q_end   + diag)
 
