@@ -418,10 +418,80 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
         n_extra_tokens = 0 
     
     if USE_SLIDING_WINDOW:
-        # TODO: Optimize by computing which blocks can be fully skipped
-        # For now, process all blocks with the mask function
         if IS_CAUSAL:
-            return 0, 0, 0, total_k_blocks, n_extra_tokens
+            # ------------------------------------------------------------------
+            #  causal + sliding‑window block classification
+            # ------------------------------------------------------------------
+            # window per row i:
+            #   left_i  = max(0,  i + base − W_left)          (if W_left >= 0)
+            #   right_i = min(sk‑1, i + base)                 (causal cap)
+            #            (if  W_right < 0 then i+base+W_right)
+            #
+            # to be “full” a K‑block has to lie inside the *intersection*
+            # of every row’s window ⇒ use
+            #     left_max  = max_i left_i     (earliest col seen by all rows)
+            #     right_min = min_i right_i    (latest   col seen by all rows)
+            # any block wholly inside [left_max , right_min] is un‑masked.
+            # ------------------------------------------------------------------
+
+            q_start = start_m * BLOCK_M
+            q_end   = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+            base    = seqlen_k - seqlen_q
+
+            # ------------------ left edge ------------------
+            if WINDOW_SIZE_LEFT < 0:
+                left_min = 0
+                left_max = 0
+            else:
+                left_min = tl.maximum(0, q_start + base - WINDOW_SIZE_LEFT)
+                left_max = tl.maximum(0, q_end   + base - WINDOW_SIZE_LEFT)
+
+            # ------------------ right edge -----------------
+            if WINDOW_SIZE_RIGHT < 0:
+                right_min = tl.minimum(seqlen_k - 1, q_start + base + WINDOW_SIZE_RIGHT)
+                right_max = tl.minimum(seqlen_k - 1, q_end   + base + WINDOW_SIZE_RIGHT)
+            else:
+                # causal cap: col ≤ row + base
+                right_min = tl.minimum(seqlen_k - 1, q_start + base)
+                right_max = tl.minimum(seqlen_k - 1, q_end   + base)
+
+            # no overlap → nothing visible
+            if right_max < left_min:
+                return 0, 0, 0, 0, n_extra_tokens
+
+            # ---------------- block geometry ---------------
+            first_block  = left_min  // BLOCK_N
+            last_block   = right_max // BLOCK_N
+
+            full_left_block = left_max // BLOCK_N + (left_max % BLOCK_N != 0)
+            clipped_left    = tl.minimum(full_left_block, last_block + 1)
+
+            n_front_skip_blocks   = first_block
+            n_front_masked_blocks = tl.maximum(0, clipped_left - first_block)
+
+            tmp = right_min // BLOCK_N
+            if (tmp + 1) * BLOCK_N - 1 > right_min:   # ensure block fits earliest row
+                tmp -= 1
+            full_right_block = tl.maximum(tmp, clipped_left - 1)
+
+            n_full_blocks        = tl.maximum(0, full_right_block - clipped_left + 1)
+            n_back_masked_blocks = tl.maximum(0, last_block - full_right_block)
+
+            # ------------- padded last‑K block -------------
+            padded_last_k      = (n_extra_tokens != 0) & (last_block == total_k_blocks - 1)
+            last_block_in_front = clipped_left > last_block
+            if padded_last_k & (n_back_masked_blocks == 0):
+                if last_block_in_front:
+                    n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
+                else:
+                    n_full_blocks = tl.maximum(0, n_full_blocks - 1)
+                n_back_masked_blocks = 1
+
+            return (n_front_skip_blocks,
+                    n_front_masked_blocks,
+                    n_full_blocks,
+                    n_back_masked_blocks,
+                    n_extra_tokens)
         else:
             # ------------------------------------------------------------------
             # token bounds seen by FIRST and LAST rows in this Q‑block
