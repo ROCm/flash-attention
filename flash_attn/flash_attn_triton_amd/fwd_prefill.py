@@ -382,7 +382,7 @@ def _attn_fwd_mask(acc, l_i, m_i,
 
 
 @triton.jit
-def compute_masking(seqlen_k, seqlen_q, start_m,
+def compute_block_masking(seqlen_k, seqlen_q, start_m,
                       IS_CAUSAL: tl.constexpr, USE_SLIDING_WINDOW: tl.constexpr,
                       WINDOW_SIZE_LEFT: tl.constexpr, WINDOW_SIZE_RIGHT: tl.constexpr,
                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
@@ -423,7 +423,78 @@ def compute_masking(seqlen_k, seqlen_q, start_m,
         if IS_CAUSAL:
             return 0, 0, 0, total_k_blocks, n_extra_tokens
         else:
-            return 0, 0, 0, total_k_blocks, n_extra_tokens
+            # ------------------------------------------------------------------
+            # token bounds seen by FIRST and LAST rows in this Q‑block
+            # ------------------------------------------------------------------
+            q_start = start_m * BLOCK_M
+            q_end   = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+            base    = seqlen_k - seqlen_q     
+
+            # left‑hand side
+            if WINDOW_SIZE_LEFT < 0:                       # un‑bounded
+                left_min = 0                               # earliest row
+                left_max = 0                               # latest  row
+            else:
+                left_min = tl.maximum(0, q_start + base - WINDOW_SIZE_LEFT)
+                left_max = tl.maximum(0, q_end   + base - WINDOW_SIZE_LEFT)
+
+            # right‑hand side
+            right_min = tl.minimum(seqlen_k - 1,
+                                   q_start + base + WINDOW_SIZE_RIGHT)
+            right_max = tl.minimum(seqlen_k - 1,
+                                   q_end   + base + WINDOW_SIZE_RIGHT)
+
+            # window vanishes → early exit
+            if right_max < left_min:
+                return 0, 0, 0, 0, n_extra_tokens
+
+            # ------------------------------------------------------------------
+            # make sure full_left_block never outruns the visible range
+            # ------------------------------------------------------------------
+            first_block = left_min // BLOCK_N
+            last_block  = right_max // BLOCK_N          # right‑most block that *any* row touches
+
+            # “first block that is fully visible for all rows”
+            full_left_block = left_max // BLOCK_N + (left_max % BLOCK_N != 0)
+
+            # clip to avoid front‑mask length > total_visible
+            clipped_left = tl.minimum(full_left_block, last_block + 1)
+
+            # ------------------------------------------------------------------
+            # block counts
+            # ------------------------------------------------------------------
+            n_front_skip_blocks   = first_block
+            n_front_masked_blocks = tl.maximum(0, clipped_left - first_block)
+
+            tmp = right_min // BLOCK_N
+            if (tmp + 1) * BLOCK_N - 1 > right_min:      # ensure block fits earliest row
+                tmp -= 1
+            full_right_block = tl.maximum(tmp, clipped_left - 1)
+
+            n_full_blocks        = tl.maximum(0, full_right_block - clipped_left + 1)
+            n_back_masked_blocks = tl.maximum(0, last_block - full_right_block)
+
+            # ------------------------------------------------------------
+            # padded last‑K block
+            # ------------------------------------------------------------
+            padded_last_k = (n_extra_tokens != 0) & (last_block == total_k_blocks - 1)
+            last_block_in_front = clipped_left > last_block   # ← last block ended up on the left side
+
+            if padded_last_k & (n_back_masked_blocks == 0):
+                if last_block_in_front:
+                    # move the last block from front‑masked → back‑masked
+                    n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
+                else:
+                    # move the last block from full → back‑masked
+                    n_full_blocks        = tl.maximum(0, n_full_blocks - 1)
+
+                n_back_masked_blocks = 1     # ensure it is handled with padding info
+
+            return (n_front_skip_blocks,
+                    n_front_masked_blocks,
+                    n_full_blocks,
+                    n_back_masked_blocks,
+                    n_extra_tokens)
     else:
         if IS_CAUSAL:
             # ========== CAUSAL MODE: Classify K Blocks ==========
@@ -575,7 +646,7 @@ def attn_fwd(Q, K, V, bias,
     
 
     # figure out masking pattern
-    n_front_skip_blocks, n_front_masked_blocks, n_full_blocks, n_back_masked_blocks, n_extra_tokens = compute_masking(
+    n_front_skip_blocks, n_front_masked_blocks, n_full_blocks, n_back_masked_blocks, n_extra_tokens = compute_block_masking(
         seqlen_k, seqlen_q, start_m, IS_CAUSAL, USE_SLIDING_WINDOW, 
         WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT, BLOCK_M, BLOCK_N
     )
