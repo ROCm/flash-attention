@@ -416,6 +416,11 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
         n_extra_tokens = seqlen_k % BLOCK_N
     else:
         n_extra_tokens = 0 
+
+    # common
+    q_start = start_m * BLOCK_M
+    q_end   = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
+    diag    = seqlen_k - seqlen_q
     
     if USE_SLIDING_WINDOW:
         if IS_CAUSAL:
@@ -434,26 +439,22 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
             # any block wholly inside [left_max , right_min] is un‑masked.
             # ------------------------------------------------------------------
 
-            q_start = start_m * BLOCK_M
-            q_end   = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-            base    = seqlen_k - seqlen_q
-
             # ------------------ left edge ------------------
             if WINDOW_SIZE_LEFT < 0:
                 left_min = 0
                 left_max = 0
             else:
-                left_min = tl.maximum(0, q_start + base - WINDOW_SIZE_LEFT)
-                left_max = tl.maximum(0, q_end   + base - WINDOW_SIZE_LEFT)
+                left_min = tl.maximum(0, q_start + diag - WINDOW_SIZE_LEFT)
+                left_max = tl.maximum(0, q_end   + diag - WINDOW_SIZE_LEFT)
 
             # ------------------ right edge -----------------
             if WINDOW_SIZE_RIGHT < 0:
-                right_min = tl.minimum(seqlen_k - 1, q_start + base + WINDOW_SIZE_RIGHT)
-                right_max = tl.minimum(seqlen_k - 1, q_end   + base + WINDOW_SIZE_RIGHT)
+                right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
+                right_max = tl.minimum(seqlen_k - 1, q_end   + diag + WINDOW_SIZE_RIGHT)
             else:
                 # causal cap: col ≤ row + base
-                right_min = tl.minimum(seqlen_k - 1, q_start + base)
-                right_max = tl.minimum(seqlen_k - 1, q_end   + base)
+                right_min = tl.minimum(seqlen_k - 1, q_start + diag)
+                right_max = tl.minimum(seqlen_k - 1, q_end   + diag)
 
             # no overlap → nothing visible
             if right_max < left_min:
@@ -496,23 +497,19 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
             # ------------------------------------------------------------------
             # token bounds seen by FIRST and LAST rows in this Q‑block
             # ------------------------------------------------------------------
-            q_start = start_m * BLOCK_M
-            q_end   = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-            base    = seqlen_k - seqlen_q     
-
             # left‑hand side
             if WINDOW_SIZE_LEFT < 0:                       # un‑bounded
                 left_min = 0                               # earliest row
                 left_max = 0                               # latest  row
             else:
-                left_min = tl.maximum(0, q_start + base - WINDOW_SIZE_LEFT)
-                left_max = tl.maximum(0, q_end   + base - WINDOW_SIZE_LEFT)
+                left_min = tl.maximum(0, q_start + diag - WINDOW_SIZE_LEFT)
+                left_max = tl.maximum(0, q_end   + diag - WINDOW_SIZE_LEFT)
 
             # right‑hand side
             right_min = tl.minimum(seqlen_k - 1,
-                                   q_start + base + WINDOW_SIZE_RIGHT)
+                                   q_start + diag + WINDOW_SIZE_RIGHT)
             right_max = tl.minimum(seqlen_k - 1,
-                                   q_end   + base + WINDOW_SIZE_RIGHT)
+                                   q_end   + diag + WINDOW_SIZE_RIGHT)
 
             # window vanishes → early exit
             if right_max < left_min:
@@ -585,11 +582,6 @@ def compute_block_masking(seqlen_k, seqlen_q, start_m,
             # 1. figure out, in tokens, the right-most K position
             #    this Q-block may attend to
             # ------------------------------------------------------------
-            q_start      = start_m * BLOCK_M
-            q_end        = tl.minimum((start_m + 1) * BLOCK_M - 1, seqlen_q - 1)
-
-            # causal diagonal offset between the two streams
-            diag         = seqlen_k - seqlen_q          # 0 when |Q| == |K|
             k_max_token  = q_end + diag                 # last visible K index
 
             # this Q-block is entirely above the diagonal ⇒ nothing to do
