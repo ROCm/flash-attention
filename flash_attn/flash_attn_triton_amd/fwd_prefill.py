@@ -441,19 +441,33 @@ def classify_window_blocks(left_min, left_max, right_min, right_max,
 
 @triton.jit
 def handle_padded_last_block(n_extra_tokens, last_block, total_k_blocks,
-                           clipped_left, n_front_masked_blocks,
-                           n_full_blocks, n_back_masked_blocks):
-    """Adjust block counts when last K block has padding."""
+                             clipped_left, n_front_masked_blocks,
+                             n_full_blocks, n_back_masked_blocks):
+    """Ensure a padded last K-block is never classified as 'full'.
+
+    We move the padded last block (if visible) into the back-masked bucket.
+    If it's already back-masked, we do nothing.  If it was counted in the
+    front-masked range, we decrement front-masked; if it was counted as full,
+    we decrement full.  Then we increment back-masked.
+    """
     padded_last_k = (n_extra_tokens != 0) & (last_block == total_k_blocks - 1)
-    
-    if padded_last_k & (n_back_masked_blocks == 0):
-        last_block_in_front = clipped_left > last_block
-        if last_block_in_front:
-            n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
-        else:
-            n_full_blocks = tl.maximum(0, n_full_blocks - 1)
-        n_back_masked_blocks = 1
-    
+
+    if padded_last_k:
+        # current 'full' range right edge
+        full_right_block = clipped_left + n_full_blocks - 1
+
+        # If last_block is already beyond full_right_block, it's already in back-masked → nothing to do
+        last_already_back_masked = last_block > full_right_block
+        if not last_already_back_masked:
+            # If the window starts past last_block, it was counted in front-masked
+            if clipped_left > last_block:
+                n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
+            else:
+                # Otherwise it was counted 'full' → move it out of full
+                n_full_blocks = tl.maximum(0, n_full_blocks - 1)
+            # In both cases we need one more back-masked block
+            n_back_masked_blocks = n_back_masked_blocks + 1
+
     return n_front_masked_blocks, n_full_blocks, n_back_masked_blocks
 
 @triton.jit
