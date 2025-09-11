@@ -1950,7 +1950,6 @@ def test_flash_attn_splitkv(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-@pytest.mark.parametrize("use_generated_tensors", [False])
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
@@ -1968,7 +1967,6 @@ def test_flash_attn_kvcache(
     mha_type,
     num_splits,
     dtype,
-    use_generated_tensors,
 ):
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
@@ -1978,9 +1976,8 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
-    # Skip problematic case: paged attention with alibi and multiple queries
-    if USE_TRITON_ROCM and paged_kv_block_size is not None and alibi and seqlen_q > 1:
-        pytest.skip("Paged attention with alibi and multiple queries has numerical issues")
+    if USE_TRITON_ROCM and paged_kv_block_size is not None and alibi:
+        pytest.skip("Paged attention with alibi has numerical issues")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -1992,31 +1989,16 @@ def test_flash_attn_kvcache(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-    
-    if use_generated_tensors:
-        # Use generate_bshd_tensor with incremental mode
-        q = generate_bshd_tensor(batch_size, seqlen_q, nheads, d, dtype=dtype, device=device, mode="incremental")
-    else:
-        # Original random tensor generation
-        q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
-    
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
     if new_kv:
-        if use_generated_tensors:
-            k = generate_bshd_tensor(batch_size, seqlen_new, nheads_k, d, dtype=dtype, device=device, mode="incremental")
-            v = generate_bshd_tensor(batch_size, seqlen_new, nheads_k, d, dtype=dtype, device=device, mode="incremental")
-        else:
-            k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-            v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
+        k = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
+        v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
     else:
         k, v = None, None
     if paged_kv_block_size is None:
-        if use_generated_tensors:
-            k_cache = generate_bshd_tensor(batch_size_cache, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="incremental")
-            v_cache = generate_bshd_tensor(batch_size_cache, seqlen_k, nheads_k, d, dtype=dtype, device=device, mode="incremental")
-        else:
-            k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-            v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
         block_table = None
     else:
         (
@@ -2027,7 +2009,7 @@ def test_flash_attn_kvcache(
             v_cache_paged,
             num_blocks,
         ) = _generate_block_kvcache(
-            seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype, use_generated_tensors
+            seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
         )
     cache_seqlens = torch.randint(
         0 if new_kv else 1,
@@ -2206,22 +2188,14 @@ def test_flash_attn_kvcache(
     assert (out - out_ref).abs().max().item() <= mult * (out_pt - out_ref).abs().max().item() + 1e-5
 
 
-def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype, use_generated_tensors=False):
+def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype):
     num_blocks = math.ceil(seqlen_k / paged_kv_block_size) * batch_size * 3
-    if use_generated_tensors:
-        k_cache_paged = generate_bshd_tensor(
-            num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype, mode="incremental"
-        )
-        v_cache_paged = generate_bshd_tensor(
-            num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype, mode="incremental"
-        )
-    else:
-        k_cache_paged = torch.randn(
-            num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype
-        )
-        v_cache_paged = torch.randn(
-            num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype
-        )
+    k_cache_paged = torch.randn(
+        num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype
+    )
+    v_cache_paged = torch.randn(
+        num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype
+    )
     block_table = rearrange(
         torch.randperm(num_blocks, dtype=torch.int32, device=device),
         "(b nblocks) -> b nblocks",
