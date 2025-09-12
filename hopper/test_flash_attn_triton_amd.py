@@ -1039,6 +1039,7 @@ def test_flash_attn_cluster(seqlen_q, seqlen_k, d, causal, dtype):
         (2048, 2048),
     ],
 )
+@pytest.mark.skip(reason="Cannot be run in parallel with other tests due to memory usage")
 def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
     device = "cuda"
     # set seed
