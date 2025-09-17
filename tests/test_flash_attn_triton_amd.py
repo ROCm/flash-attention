@@ -1976,8 +1976,6 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
-    if USE_TRITON_ROCM and paged_kv_block_size is not None and alibi:
-        pytest.skip("Paged attention with alibi has numerical issues")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)

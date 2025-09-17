@@ -484,51 +484,65 @@ def _fwd_kernel_splitK(
                 process_end = tl.minimum(hi - block_start, BLOCK_SIZE_K)
                 process_end = tl.minimum(process_end, block_end - block_start)
                 
-                # Align to BLOCK_N boundaries
-                process_start = (process_start // BLOCK_N) * BLOCK_N
+                # Instead of forcing a floor alignment to BLOCK_N (which can still skip
+                # part of the intended range if start falls mid-tile for small splits),
+                # start from the raw (possibly unaligned) process_start rounded *down* but
+                # allow the loop to begin earlier (at most BLOCK_N before) so that any
+                # partial tile overlapping [lo, hi) is covered. Masking below will remove
+                # columns < lo or >= hi ensuring numerically identical coverage without
+                # duplication.
+                aligned_start = (process_start // BLOCK_N) * BLOCK_N
+                if aligned_start > 0 and aligned_start + BLOCK_N > process_start:
+                    # ensure we include the tile that contains process_start
+                    process_start = aligned_start
+                else:
+                    process_start = aligned_start
                 
                 for offset in range(process_start, process_end, BLOCK_N):
-                    # Current position in the sequence
+                    # Current position (may begin slightly before logical split range; masking fixes it)
                     seq_pos = block_start + offset
+                    # Proceed unconditionally; masking below enforces [lo, hi)
+                    # Calculate base addresses for K and V in this physical block
+                    k_base = K + physical_block * BLOCK_SIZE_K * stride_kn + hk_id * stride_kh + g_id * stride_kg
+                    v_base = V + physical_block * BLOCK_SIZE_K * stride_vn + hv_id * stride_vh + g_id * stride_vg
                     
-                    # Only process if in range
-                    if seq_pos < hi and seq_pos >= lo:
-                        # Calculate base addresses for K and V in this physical block
-                        k_base = K + physical_block * BLOCK_SIZE_K * stride_kn + hk_id * stride_kh + g_id * stride_kg
-                        v_base = V + physical_block * BLOCK_SIZE_K * stride_vn + hv_id * stride_vh + g_id * stride_vg
-                        
-                        # Offsets within the current block
-                        block_offs = offset + offs_n
-                        
-                        # Masks for valid data
-                        seq_mask = ((seq_pos + offs_n) < N_CTX_K_FINAL)
-                        block_mask = (block_offs < BLOCK_SIZE_K)
-                        valid_mask = seq_mask & block_mask
-                        
-                        # Apply masks
-                        kT_mask_final = kT_mask & valid_mask[None, :]
-                        v_mask_final = v_mask & valid_mask[:, None]
-                        
-                        # Load K and V
-                        kT_ptrs = k_base + offs_d[:, None] * stride_kd + block_offs[None, :] * stride_kn
-                        v_ptrs = v_base + block_offs[:, None] * stride_vn + offs_d[None, :] * stride_vd
-                        
-                        kT = tl.load(kT_ptrs, mask=kT_mask_final, other=0.0)
-                        v = tl.load(v_ptrs, mask=v_mask_final, other=0.0)
-                        
-                        # Use the specialized paged attention inner function
-                        m_i, l_i, acc = _attn_fwd_inner_paged(
-                            q, kT, v, seq_pos, valid_mask,
-                            m_i, l_i, acc,
-                            pid_m,
-                            q_descale, k_descale, v_descale,  # FP8 scaling
-                            IS_FP8,  # FP8 flag
-                            BLOCK_M, BLOCK_N,
-                            N_CTX_Q, N_CTX_K_FINAL,
-                            USE_ALIBI, alibi_slope,
-                            USE_SLIDING_WINDOW, IS_CAUSAL,
-                            WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT,
-                        )
+                    # Offsets within the current block
+                    block_offs = offset + offs_n
+                    
+                    # Masks for valid data respecting:
+                    #   (1) global key length (seq_mask)
+                    #   (2) block bounds (block_mask)
+                    #   (3) current split range [lo, hi)
+                    seq_mask = ((seq_pos + offs_n) < N_CTX_K_FINAL)
+                    block_mask = (block_offs < BLOCK_SIZE_K)
+                    end_mask = (block_offs < process_end)
+                    split_mask = ((seq_pos + offs_n) >= lo) & ((seq_pos + offs_n) < hi)
+                    valid_mask = seq_mask & block_mask & end_mask & split_mask
+                    
+                    # Apply masks
+                    kT_mask_final = kT_mask & valid_mask[None, :]
+                    v_mask_final = v_mask & valid_mask[:, None]
+                    
+                    # Load K and V
+                    kT_ptrs = k_base + offs_d[:, None] * stride_kd + block_offs[None, :] * stride_kn
+                    v_ptrs = v_base + block_offs[:, None] * stride_vn + offs_d[None, :] * stride_vd
+                    
+                    kT = tl.load(kT_ptrs, mask=kT_mask_final, other=0.0)
+                    v = tl.load(v_ptrs, mask=v_mask_final, other=0.0)
+                    
+                    # Use the specialized paged attention inner function
+                    m_i, l_i, acc = _attn_fwd_inner_paged(
+                        q, kT, v, seq_pos, valid_mask,
+                        m_i, l_i, acc,
+                        pid_m,
+                        q_descale, k_descale, v_descale,  # FP8 scaling
+                        IS_FP8,  # FP8 flag
+                        BLOCK_M, BLOCK_N,
+                        N_CTX_Q, N_CTX_K_FINAL,
+                        USE_ALIBI, alibi_slope,
+                        USE_SLIDING_WINDOW, IS_CAUSAL,
+                        WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT,
+                    )
     else:
         # Non-paged attention: process KV from cache
         # Note: Cache should be updated externally before calling this kernel
@@ -792,15 +806,7 @@ def attention_decode_forward_triton_impl(
         k_descale: Optional[torch.Tensor] = None,
         v_descale: Optional[torch.Tensor] = None,
 ):
-    # Check for unsupported configuration
-    seqlen_q = q.shape[1]
-    if block_table is not None and alibi_slopes is not None and seqlen_q > 1:
-        raise NotImplementedError(
-            "Paged attention with ALiBi and multiple queries (seqlen_q > 1) is not supported "
-            "due to numerical precision issues. Please use non-paged attention or single query decode."
-        )
-    
-    # Handle cache updates externally before calling the kernel
+    # handle cache updates
     if k_new is not None and v_new is not None:
         # Update cache with new KV values
         if block_table is None:
