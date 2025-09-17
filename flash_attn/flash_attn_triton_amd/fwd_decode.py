@@ -61,9 +61,9 @@ def get_autotune_configs():
 
 @triton.jit
 def _attn_fwd_inner(
-    q, kT, v, start_n, 
+    q, kT, v, pos, col_mask,
     m_i, l_i, acc,
-    pid_m, hi,
+    pid_m,
     q_descale, k_descale, v_descale,  # FP8 scaling factors
     IS_FP8: tl.constexpr,  # FP8 flag
     BLOCK_M: tl.constexpr,
@@ -76,7 +76,7 @@ def _attn_fwd_inner(
     IS_CAUSAL: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
-    BOUNDS_CHECKS_N: tl.constexpr,
+    APPLY_COL_MASK: tl.constexpr,  # apply provided col_mask when True
 ):
     # -- compute qk ---
     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -87,7 +87,7 @@ def _attn_fwd_inner(
 
     if USE_ALIBI:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        col_idx = start_n + tl.arange(0, BLOCK_N)
+        col_idx = pos + tl.arange(0, BLOCK_N)
         
         # Compute relative positions
         relative_pos = row_idx[:, None] + N_CTX_K_FINAL - (N_CTX_Q + col_idx[None, :])
@@ -102,7 +102,7 @@ def _attn_fwd_inner(
     # ------------------------------------------------------------------
     if USE_SLIDING_WINDOW:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # q positions
-        col_idx = start_n + tl.arange(0, BLOCK_N)                # k positions
+        col_idx = pos + tl.arange(0, BLOCK_N)                    # k positions
         row = row_idx[:, None]                                   # [M,1]
         col = col_idx[None, :]                                   # [1,N]
 
@@ -129,7 +129,7 @@ def _attn_fwd_inner(
     else:
         if IS_CAUSAL:
             row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            col_idx = start_n + tl.arange(0, BLOCK_N)
+            col_idx = pos + tl.arange(0, BLOCK_N)
 
             # create a N_CTX_Q x kv_len causal mask
             col_offset = N_CTX_K_FINAL - N_CTX_Q
@@ -138,10 +138,11 @@ def _attn_fwd_inner(
             # Apply the mask
             qk = tl.where(causal_mask, qk, float("-inf"))
 
-    # TODO: This is slow, and only needed at the last iteration.
-    # Maybe we can unroll the last iteration instead?
-    if BOUNDS_CHECKS_N:
-        qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
+    # Column mask (tail / variable-length). Instead of recomputing an arange each time,
+    # we accept a precomputed mask from the caller (col_valid_mask).
+    if APPLY_COL_MASK:
+        # Expect col_mask shape: [BLOCK_N]. True where column is within sequence.
+        qk = tl.where(col_mask[None, :], qk, float("-inf"))
 
     m_i_new = tl.maximum(m_i, tl.max(qk, 1))           # per-row max so far
 
@@ -171,11 +172,11 @@ def _attn_fwd_inner(
 
 @triton.jit
 def _attn_fwd_inner_paged(
-    q, kT, v, seq_pos, valid_mask,
+    q, kT, v, pos, col_mask,
     m_i, l_i, acc,
     pid_m,
-    q_descale, k_descale, v_descale,  # FP8 scaling factors
-    IS_FP8: tl.constexpr,  # FP8 flag
+    q_descale, k_descale, v_descale,
+    IS_FP8: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     N_CTX_Q: tl.constexpr,
@@ -186,14 +187,14 @@ def _attn_fwd_inner_paged(
     IS_CAUSAL: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
+    APPLY_COL_MASK: tl.constexpr,
 ):
     """
     Specialized attention computation for paged KV cache.
     
-    Key differences from _attn_fwd_inner:
-    - Takes a valid_mask parameter to handle block boundaries
-    - No BOUNDS_CHECKS_N needed as masking is handled via valid_mask
-    - seq_pos represents the absolute position in the sequence
+    Key differences from _attn_fwd_inner (pre-unification):
+    - Takes a col_mask parameter to handle block boundaries / padding
+    - pos represents the absolute starting column position in the sequence
     """
     # -- compute qk ---
     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -205,7 +206,7 @@ def _attn_fwd_inner_paged(
     # Apply ALiBi if needed
     if USE_ALIBI:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        col_idx = seq_pos + tl.arange(0, BLOCK_N)
+        col_idx = pos + tl.arange(0, BLOCK_N)
         
         # Compute relative positions
         relative_pos = row_idx[:, None] + N_CTX_K_FINAL - (N_CTX_Q + col_idx[None, :])
@@ -218,7 +219,7 @@ def _attn_fwd_inner_paged(
     # Apply sliding window if needed
     if USE_SLIDING_WINDOW:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        col_idx = seq_pos + tl.arange(0, BLOCK_N)
+        col_idx = pos + tl.arange(0, BLOCK_N)
         row = row_idx[:, None]
         col = col_idx[None, :]
         
@@ -244,13 +245,14 @@ def _attn_fwd_inner_paged(
         qk = tl.where(mask, float("-inf"), qk)
     elif IS_CAUSAL:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        col_idx = seq_pos + tl.arange(0, BLOCK_N)
+        col_idx = pos + tl.arange(0, BLOCK_N)
         col_offset = N_CTX_K_FINAL - N_CTX_Q
         causal_mask = row_idx[:, None] >= (col_idx[None, :] - col_offset)
         qk = tl.where(causal_mask, qk, float("-inf"))
     
-    # Mask out invalid positions (from block boundaries)
-    qk = tl.where(valid_mask[None, :], qk, float("-inf"))
+    # Mask out invalid positions (from block / range boundaries) if enabled
+    if APPLY_COL_MASK:
+        qk = tl.where(col_mask[None, :], qk, float("-inf"))
     
     # Compute new m and do softmax
     m_i_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -535,13 +537,14 @@ def _fwd_kernel_splitK(
                         q, kT, v, seq_pos, valid_mask,
                         m_i, l_i, acc,
                         pid_m,
-                        q_descale, k_descale, v_descale,  # FP8 scaling
-                        IS_FP8,  # FP8 flag
+                        q_descale, k_descale, v_descale,
+                        IS_FP8,
                         BLOCK_M, BLOCK_N,
                         N_CTX_Q, N_CTX_K_FINAL,
                         USE_ALIBI, alibi_slope,
                         USE_SLIDING_WINDOW, IS_CAUSAL,
                         WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT,
+                        True,
                     )
     else:
         # Non-paged attention: process KV from cache
@@ -556,12 +559,16 @@ def _fwd_kernel_splitK(
             v = tl.load(V_ptrs, mask=v_mask, other=0.0)
 
             # Use the same inner loop logic
+            # Precompute column validity mask for this tile (all True for full tiles).
+            # hi is the upper bound of the overall split range; start_n marks this tile's base.
+            col_valid_mask = offs_n < (hi - start_n)
+
             m_i, l_i, acc = _attn_fwd_inner(
-                q, kT, v, start_n,
+                q, kT, v, start_n, col_valid_mask,
                 m_i, l_i, acc,
-                pid_m, hi,
-                q_descale, k_descale, v_descale,  # FP8 scaling
-                IS_FP8,  # FP8 flag
+                pid_m,
+                q_descale, k_descale, v_descale,
+                IS_FP8,
                 BLOCK_M, BLOCK_N,
                 N_CTX_Q, N_CTX_K_FINAL,
                 USE_ALIBI, alibi_slope,
