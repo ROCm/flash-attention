@@ -170,110 +170,6 @@ def _attn_fwd_inner(
     
     return m_i, l_i, acc
 
-@triton.jit
-def _attn_fwd_inner_paged(
-    q, kT, v, pos, col_mask,
-    m_i, l_i, acc,
-    pid_m,
-    q_descale, k_descale, v_descale,
-    IS_FP8: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    N_CTX_Q: tl.constexpr,
-    N_CTX_K_FINAL: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
-    alibi_slope,
-    USE_SLIDING_WINDOW: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    WINDOW_SIZE_LEFT: tl.constexpr,
-    WINDOW_SIZE_RIGHT: tl.constexpr,
-    APPLY_COL_MASK: tl.constexpr,
-):
-    """
-    Specialized attention computation for paged KV cache.
-    
-    Key differences from _attn_fwd_inner (pre-unification):
-    - Takes a col_mask parameter to handle block boundaries / padding
-    - pos represents the absolute starting column position in the sequence
-    """
-    # -- compute qk ---
-    qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    if IS_FP8:
-        qk += (tl.dot(q, kT) * q_descale * k_descale)  # Apply FP8 scaling
-    else:
-        qk += tl.dot(q, kT)
-    
-    # Apply ALiBi if needed
-    if USE_ALIBI:
-        row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        col_idx = pos + tl.arange(0, BLOCK_N)
-        
-        # Compute relative positions
-        relative_pos = row_idx[:, None] + N_CTX_K_FINAL - (N_CTX_Q + col_idx[None, :])
-        relative_pos = tl.abs(relative_pos)
-        
-        # Compute ALiBi bias
-        alibi_bias = -1 * alibi_slope * relative_pos
-        qk += (alibi_bias * 1.44269504)
-    
-    # Apply sliding window if needed
-    if USE_SLIDING_WINDOW:
-        row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        col_idx = pos + tl.arange(0, BLOCK_N)
-        row = row_idx[:, None]
-        col = col_idx[None, :]
-        
-        if IS_CAUSAL:
-            # -------- causal + window --------
-            diag = N_CTX_K_FINAL - N_CTX_Q                  # sk-sq
-            causal_ok = col <= row + diag
-            if WINDOW_SIZE_LEFT < 0:                        # only right window
-                win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
-            else:                                            # both sides
-                win_ok = ((col >= row + diag - WINDOW_SIZE_LEFT) &
-                         (col <= row + diag + WINDOW_SIZE_RIGHT))
-            mask = ~(causal_ok & win_ok)                    # True ⇒ -inf
-        else:
-            # -------- non-causal window --------
-            sk, sq = N_CTX_K_FINAL, N_CTX_Q
-            if WINDOW_SIZE_LEFT < 0:
-                mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
-            else:
-                right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
-                left = row + (sk - sq) - WINDOW_SIZE_LEFT
-                mask = (col > right) | (col < left)
-        qk = tl.where(mask, float("-inf"), qk)
-    elif IS_CAUSAL:
-        row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        col_idx = pos + tl.arange(0, BLOCK_N)
-        col_offset = N_CTX_K_FINAL - N_CTX_Q
-        causal_mask = row_idx[:, None] >= (col_idx[None, :] - col_offset)
-        qk = tl.where(causal_mask, qk, float("-inf"))
-    
-    # Mask out invalid positions (from block / range boundaries) if enabled
-    if APPLY_COL_MASK:
-        qk = tl.where(col_mask[None, :], qk, float("-inf"))
-    
-    # Compute new m and do softmax
-    m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-    valid = m_i_new > float("-inf")
-    alpha = tl.where(valid, tl.math.exp2(m_i - m_i_new), 0.0)
-    qk = tl.where(valid[:, None], qk - m_i_new[:, None], float("-inf"))
-    p = tl.math.exp2(qk)
-    
-    # Update m_i and l_i
-    l_i = l_i * alpha + tl.sum(p, 1)
-    m_i = m_i_new
-    p = p.to(q.dtype)
-    
-    # Scale and update acc
-    acc *= alpha[:, None]
-    if IS_FP8:
-        acc += tl.dot(p.to(v.dtype), v) * v_descale  # Apply FP8 scaling for V
-    else:
-        acc += tl.dot(p.to(v.dtype), v)
-    
-    return m_i, l_i, acc
 
 # @triton.autotune(
 #     configs=fwd_auto_tune_configs,
@@ -502,7 +398,7 @@ def _fwd_kernel_splitK(
                 
                 for offset in range(process_start, process_end, BLOCK_N):
                     # Current position (may begin slightly before logical split range; masking fixes it)
-                    seq_pos = block_start + offset
+                    pos = block_start + offset
                     # Proceed unconditionally; masking below enforces [lo, hi)
                     # Calculate base addresses for K and V in this physical block
                     k_base = K + physical_block * BLOCK_SIZE_K * stride_kn + hk_id * stride_kh + g_id * stride_kg
@@ -515,15 +411,15 @@ def _fwd_kernel_splitK(
                     #   (1) global key length (seq_mask)
                     #   (2) block bounds (block_mask)
                     #   (3) current split range [lo, hi)
-                    seq_mask = ((seq_pos + offs_n) < N_CTX_K_FINAL)
+                    seq_mask = ((pos + offs_n) < N_CTX_K_FINAL)
                     block_mask = (block_offs < BLOCK_SIZE_K)
                     end_mask = (block_offs < process_end)
-                    split_mask = ((seq_pos + offs_n) >= lo) & ((seq_pos + offs_n) < hi)
-                    valid_mask = seq_mask & block_mask & end_mask & split_mask
+                    split_mask = ((pos + offs_n) >= lo) & ((pos + offs_n) < hi)
+                    col_mask = seq_mask & block_mask & end_mask & split_mask
                     
                     # Apply masks
-                    kT_mask_final = kT_mask & valid_mask[None, :]
-                    v_mask_final = v_mask & valid_mask[:, None]
+                    kT_mask_final = kT_mask & col_mask[None, :]
+                    v_mask_final = v_mask & col_mask[:, None]
                     
                     # Load K and V
                     kT_ptrs = k_base + offs_d[:, None] * stride_kd + block_offs[None, :] * stride_kn
@@ -532,9 +428,9 @@ def _fwd_kernel_splitK(
                     kT = tl.load(kT_ptrs, mask=kT_mask_final, other=0.0)
                     v = tl.load(v_ptrs, mask=v_mask_final, other=0.0)
                     
-                    # Use the specialized paged attention inner function
-                    m_i, l_i, acc = _attn_fwd_inner_paged(
-                        q, kT, v, seq_pos, valid_mask,
+                    # Unified inner function handles both paged and contiguous
+                    m_i, l_i, acc = _attn_fwd_inner(
+                        q, kT, v, pos, col_mask,
                         m_i, l_i, acc,
                         pid_m,
                         q_descale, k_descale, v_descale,
