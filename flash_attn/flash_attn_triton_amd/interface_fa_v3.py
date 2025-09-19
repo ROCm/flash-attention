@@ -214,6 +214,23 @@ def fwd(
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
             import warnings
             warnings.warn("FP8 tensors detected but descale factors not provided. Using default scale of 1.0", UserWarning)
+        else:
+            # Enforce exact expected shapes; no reshaping or normalization.
+            if metadata.layout == "bshd":
+                expected_batch = q.shape[0]
+                expected_q_heads = q.shape[2]
+                expected_kv_heads = k.shape[2]
+            else:  # thd layout
+                expected_batch = (len(cu_seqlens_q) - 1) if cu_seqlens_q is not None else 1
+                expected_q_heads = q.shape[1]
+                expected_kv_heads = k.shape[1]
+
+            assert q_descale.dim() == 2 and q_descale.shape[0] == expected_batch and q_descale.shape[1] == expected_kv_heads, \
+                f"q_descale expected shape ({expected_batch}, {expected_q_heads}) got {tuple(q_descale.shape)}"
+            assert k_descale.dim() == 2 and k_descale.shape[0] == expected_batch and k_descale.shape[1] == expected_kv_heads, \
+                f"k_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(k_descale.shape)}"
+            assert v_descale.dim() == 2 and v_descale.shape[0] == expected_batch and v_descale.shape[1] == expected_kv_heads, \
+                f"v_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(v_descale.shape)}"
     
     # Get shape
     if metadata.layout == "bshd":
@@ -242,7 +259,7 @@ def fwd(
     return_softmax = False
     metadata.need_dropout(dropout_p, return_softmax)
     
-    # Handle rotary embeddings
+    # handle rotary embeddings
     if rotary_cos is not None and rotary_sin is not None:
         metadata.need_rotary(rotary_sin, rotary_cos, rotary_interleaved)
         
