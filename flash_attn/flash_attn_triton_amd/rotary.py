@@ -18,13 +18,14 @@ Limitations / Notes:
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from einops import rearrange
 
-__all__ = ["apply_rotary_emb"]
+__all__ = ["apply_rotary"]
 
 
 @triton.jit
@@ -298,3 +299,67 @@ def apply_rotary_emb(
     return _ApplyRotary.apply(
         x, cos, sin, interleaved, inplace, seqlen_offsets, cu_seqlens, max_seqlen
     )
+
+
+def apply_rotary(
+    q: torch.Tensor,
+    k_new: Optional[torch.Tensor],
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    causal: bool,
+    local: bool,
+    interleaved: bool = False,
+    seqlen_offsets: Union[int, torch.Tensor] = 0,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """High-level rotary application used by AMD prefill & decode paths.
+
+    Policy (matches test reference & legacy semantics):
+      - If causal OR local attention ⇒ apply rotary directly on (B, S, H, D).
+      - Else (non-causal global) ⇒ flatten heads into sequence: (B, 1, S*H, D),
+        apply rotary once, then unflatten back.
+      - k_new (incremental KV slice) is always rotated directly when provided.
+
+    Args:
+        q: (B, S, H, D)
+        k_new: Optional (B, S_k, H_k, D)
+        cos, sin: rotary caches (S_rotary, rotary_dim/2)
+        causal: causal attention flag
+        local: sliding-window / local attention flag (pre-computed outside)
+        interleaved: GPT-J style rotary layout
+        seqlen_offsets: int or (B,) tensor of per-sequence start offsets
+    Returns:
+        (q_rot, k_new_rot)
+    """
+    assert q.ndim == 4, f"Expected q shape (B,S,H,D), got {q.shape}"
+    B, S, H, D = q.shape
+    use_flatten = (not causal) and (not local)
+
+    if use_flatten:
+        q_flat = rearrange(q, 'b s h d -> b 1 (s h) d')
+        q_flat = apply_rotary_emb(
+            q_flat,
+            cos,
+            sin,
+            interleaved=interleaved,
+            seqlen_offsets=seqlen_offsets,
+        )
+        q = rearrange(q_flat, 'b 1 (s h) d -> b s h d', s=S, h=H)
+    else:
+        q = apply_rotary_emb(
+            q,
+            cos,
+            sin,
+            interleaved=interleaved,
+            seqlen_offsets=seqlen_offsets,
+        )
+
+    if k_new is not None:
+        k_new = apply_rotary_emb(
+            k_new,
+            cos,
+            sin,
+            interleaved=interleaved,
+            seqlen_offsets=seqlen_offsets,
+        )
+    return q, k_new

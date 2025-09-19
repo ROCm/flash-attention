@@ -1,6 +1,5 @@
 import torch
 import os
-from einops import rearrange, repeat
 from typing import Optional, Union, Tuple
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
@@ -10,7 +9,6 @@ from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData, is_fp8
-from .rotary import apply_rotary_emb
 
 USE_EXP2 = True
 BWD_MODE = os.environ.get('BWD_MODE', 'fused_no_atomics').lower()
@@ -259,30 +257,9 @@ def fwd(
     return_softmax = False
     metadata.need_dropout(dropout_p, return_softmax)
     
-    # handle rotary embeddings
+    # rotary embeddings
     if rotary_cos is not None and rotary_sin is not None:
         metadata.need_rotary(rotary_sin, rotary_cos, rotary_interleaved)
-        
-        # Apply rotary embeddings if provided
-        if metadata.causal or window_size_left != -1 or window_size_right != -1:
-            q_rot = apply_rotary_emb(
-                q,
-                rotary_cos,
-                rotary_sin,
-                seqlen_offsets=seqlens_rotary,
-                interleaved=rotary_interleaved,
-            )
-            q = q_rot.to(q.dtype)
-            
-            if k_new is not None:
-                k_rot = apply_rotary_emb(
-                    k_new,
-                    rotary_cos,
-                    rotary_sin,
-                    seqlen_offsets=seqlens_rotary,
-                    interleaved=rotary_interleaved,
-                )
-                k_new = k_rot.to(k.dtype)
     
     # Store RNG state
     rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset])
@@ -315,6 +292,9 @@ def fwd(
                 q_descale,
                 k_descale,
                 v_descale,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
             )
         else:
             if DEBUG:
@@ -335,7 +315,11 @@ def fwd(
                 metadata.dropout_p,
                 metadata.philox_seed,
                 metadata.philox_offset,
-                USE_EXP2
+                USE_EXP2,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
+                rotary_seqlen_offsets=seqlens_rotary,
             )
             softmax_lse = softmax_lse_ref
     else:
@@ -367,6 +351,9 @@ def fwd(
                 q_descale,
                 k_descale,
                 v_descale,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
             )
             # Decode kernel returns only softmax_lse, not sd_mask
             sd_mask_triton = None
@@ -397,6 +384,10 @@ def fwd(
                 v_descale,
                 seqused_q,
                 seqused_k,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
+                rotary_interleaved=rotary_interleaved,
+                seqlens_rotary=seqlens_rotary,
             )
             softmax_lse = softmax_lse_triton
     
