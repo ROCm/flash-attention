@@ -1,5 +1,7 @@
 import torch
 import os
+from einops import rearrange
+from typing import Literal, Optional, Union
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .bwd_prefill_split import attention_prefill_backward_triton_split_impl
 from .bwd_prefill_fused_atomics import attention_prefill_backward_triton_fused_atomics_impl
@@ -7,11 +9,8 @@ from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_spli
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import attention_prefill_forward_ref_impl, attention_decode_forward_ref_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
+from .rotary import apply_rotary_emb
 from .utils import DEBUG, USE_REF, MetaData
-from einops import rearrange, repeat
-from flash_attn.layers.rotary import apply_rotary_emb
-from typing import Literal, Optional, Union
-
 
 USE_EXP2 = True
 BWD_MODE = os.environ.get('BWD_MODE', 'fused_no_atomics').lower()
