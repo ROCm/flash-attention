@@ -1,21 +1,3 @@
-"""Self-contained rotary embedding implementation (Triton kernel + autograd) for AMD path.
-
-This mirrors the upstream logic in `flash_attn.layers.rotary` and
-`flash_attn.ops.triton.rotary` but is embedded locally to avoid importing
-the top-level FlashAttention python packages from the AMD Triton interface.
-
-Provided public API (subset):
-    - apply_rotary_emb(x, cos, sin, interleaved=False, inplace=False,
-        seqlen_offsets=0, cu_seqlens=None, max_seqlen=None)
-
-Limitations / Notes:
-    - Exposes only the single-tensor rotary (Q or K) path actually needed by
-      the AMD interfaces. QKV fused helpers can be added later if required.
-    - Supports variable length mode via `cu_seqlens` + `max_seqlen`.
-    - Supports per-sequence offset(s) via `seqlen_offsets` (int or tensor (B,)).
-    - Autograd backward re-applies the same kernel with `conjugate=True`.
-"""
-
 from __future__ import annotations
 
 from typing import Optional, Union, Tuple
@@ -23,7 +5,6 @@ from typing import Optional, Union, Tuple
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
 
 __all__ = ["apply_rotary"]
 
@@ -336,7 +317,8 @@ def apply_rotary(
     use_flatten = (not causal) and (not local)
 
     if use_flatten:
-        q_flat = rearrange(q, 'b s h d -> b 1 (s h) d')
+        # Flatten (S,H) -> (S*H) with an added singleton dim to preserve expected 4D shape.
+        q_flat = q.reshape(B, S * H, D).unsqueeze(1)  # (B, 1, S*H, D)
         q_flat = apply_rotary_emb(
             q_flat,
             cos,
@@ -344,7 +326,8 @@ def apply_rotary(
             interleaved=interleaved,
             seqlen_offsets=seqlen_offsets,
         )
-        q = rearrange(q_flat, 'b 1 (s h) d -> b s h d', s=S, h=H)
+        # Restore shape back to (B, S, H, D)
+        q = q_flat.view(B, 1, S * H, D).reshape(B, S, H, D)
     else:
         q = apply_rotary_emb(
             q,
