@@ -354,6 +354,7 @@ def fwd(
                 rotary_cos=rotary_cos,
                 rotary_sin=rotary_sin,
                 rotary_interleaved=rotary_interleaved,
+                seqlens_rotary=seqlens_rotary,
             )
             # Decode kernel returns only softmax_lse, not sd_mask
             sd_mask_triton = None

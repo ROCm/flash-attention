@@ -691,32 +691,34 @@ def get_split_k(B: int, G: int, H: int, Mk: int) -> int:
     return split_k
 
 def attention_decode_forward_triton_impl(
-        q: torch.Tensor, 
-        k_cache: torch.Tensor, 
-        v_cache: torch.Tensor,
-        k_new: Optional[torch.Tensor],
-        v_new: Optional[torch.Tensor],
-        out: torch.Tensor,
-        sm_scale: float, 
-        causal: bool,
-        window_size_left: int, 
-        window_size_right: int,
-        alibi_slopes: Optional[torch.Tensor], 
-        layout: Literal["bshd"], 
-        cache_seqlens: Optional[torch.Tensor], 
-        cache_batch_idx: Optional[torch.Tensor],
-        block_table: Optional[torch.Tensor] = None,
-        q_descale: Optional[torch.Tensor] = None,
-        k_descale: Optional[torch.Tensor] = None,
-        v_descale: Optional[torch.Tensor] = None,
-        # rotary (optional)
-        rotary_cos: Optional[torch.Tensor] = None,
-        rotary_sin: Optional[torch.Tensor] = None,
-        rotary_interleaved: bool = False,
+    q: torch.Tensor, 
+    k_cache: torch.Tensor, 
+    v_cache: torch.Tensor,
+    k_new: Optional[torch.Tensor],
+    v_new: Optional[torch.Tensor],
+    out: torch.Tensor,
+    sm_scale: float, 
+    causal: bool,
+    window_size_left: int, 
+    window_size_right: int,
+    alibi_slopes: Optional[torch.Tensor], 
+    layout: Literal["bshd"], 
+    cache_seqlens: Optional[torch.Tensor], 
+    cache_batch_idx: Optional[torch.Tensor],
+    block_table: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    # rotary (optional)
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
+    seqlens_rotary: Optional[torch.Tensor] = None,
 ):
     # apply rotary embedding
     if rotary_cos is not None and rotary_sin is not None:
-        seqlen_offsets = cache_seqlens if cache_seqlens is not None else 0
+        # Prefer explicitly provided rotary sequence start offsets if given; fall back to cache_seqlens.
+        seqlen_offsets = seqlens_rotary if seqlens_rotary is not None else (cache_seqlens if cache_seqlens is not None else 0)
         local = (window_size_left != -1) or (window_size_right != -1)
         q, k_new = apply_rotary(
             q,
