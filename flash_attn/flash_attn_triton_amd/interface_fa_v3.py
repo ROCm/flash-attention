@@ -3,13 +3,8 @@ import os
 from typing import Optional, Union, Tuple
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .fwd_decode import attention_decode_forward_triton_impl
-from .fwd_ref import (
-    attention_prefill_forward_ref_impl,
-    attention_decode_forward_ref_impl,
-)
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_impl
-from .bwd_ref import attention_backward_pytorch_ref_impl
-from .utils import DEBUG, USE_REF, MetaData, is_fp8
+from .utils import DEBUG, MetaData, is_fp8
 
 USE_EXP2 = True
 BWD_MODE = os.environ.get("BWD_MODE", "fused_no_atomics").lower()
@@ -364,142 +359,73 @@ def fwd(
     rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset])
 
     # Call implementation
-    if USE_REF:
-        if DEBUG:
-            print("Using reference implementation")
+    if DEBUG:
+        print("Using Triton implementation")
 
-        if use_decode:
-            if DEBUG:
-                print(
-                    f"Using decode reference implementation ( layout={metadata.layout}, cache_seqlens={seqused_k is not None}, k_new={k_new is not None}, v_new={v_new is not None}, kv_batch_idx={kv_batch_idx is not None})"
-                )
-            # Use decode reference implementation
-            softmax_lse = attention_decode_forward_ref_impl(
-                q,
-                k,  # k_cache
-                v,  # v_cache
-                k_new,
-                v_new,
-                out,
-                metadata.sm_scale,
-                metadata.causal,
-                window_size_left,
-                window_size_right,
-                metadata.alibi_slopes,
-                metadata.layout,
-                seqused_k,  # cache_seqlens
-                kv_batch_idx,  # cache_batch_idx
-                page_table,  # block_table
-                q_descale,
-                k_descale,
-                v_descale,
-                rotary_cos=rotary_cos,
-                rotary_sin=rotary_sin,
-                rotary_interleaved=rotary_interleaved,
+    if use_decode:
+        if DEBUG:
+            print(
+                f"Using Decode Triton implementation (cache_seqlens={seqused_k is not None}, k_new={k_new is not None}, v_new={v_new is not None}, kv_batch_idx={kv_batch_idx is not None})"
             )
-        else:
-            if DEBUG:
-                print("Using prefill reference implementation")
-            # Use prefill reference implementation
-            softmax_lse_ref, sd_mask_ref = attention_prefill_forward_ref_impl(
-                q,
-                k,
-                v,
-                out,
-                metadata.sm_scale,
-                metadata.alibi_slopes,
-                metadata.causal,
-                window_size_left,
-                window_size_right,
-                metadata.layout,
-                metadata.cu_seqlens_q,
-                metadata.cu_seqlens_k,
-                metadata.max_seqlens_q,
-                metadata.max_seqlens_k,
-                metadata.dropout_p,
-                metadata.philox_seed,
-                metadata.philox_offset,
-                USE_EXP2,
-                rotary_cos=rotary_cos,
-                rotary_sin=rotary_sin,
-                rotary_interleaved=rotary_interleaved,
-                rotary_seqlen_offsets=seqlens_rotary,
-            )
-            softmax_lse = softmax_lse_ref
+
+        softmax_lse = attention_decode_forward_triton_impl(
+            q,
+            k,
+            v,
+            k_new,
+            v_new,
+            out,
+            metadata.sm_scale,
+            metadata.causal,
+            window_size_left,
+            window_size_right,
+            metadata.alibi_slopes,
+            metadata.layout,
+            seqused_k,
+            kv_batch_idx,
+            page_table,
+            q_descale,
+            k_descale,
+            v_descale,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            rotary_interleaved=rotary_interleaved,
+            seqlens_rotary=seqlens_rotary,
+        )
     else:
         if DEBUG:
-            print("Using Triton implementation")
-
-        if use_decode:
-            if DEBUG:
-                print(
-                    f"Using Decode Triton implementation (cache_seqlens={seqused_k is not None}, k_new={k_new is not None}, v_new={v_new is not None}, kv_batch_idx={kv_batch_idx is not None})"
-                )
-
-            # Use decode kernel for KV cache scenarios
-            # Note: seqused_k can serve as cache_seqlens in v3
-            softmax_lse = attention_decode_forward_triton_impl(
-                q,
-                k,  # k_cache in v2 terminology
-                v,  # v_cache in v2 terminology
-                k_new,  # New KV values to append to cache
-                v_new,  # New KV values to append to cache
-                out,
-                metadata.sm_scale,
-                metadata.causal,
-                window_size_left,
-                window_size_right,
-                metadata.alibi_slopes,
-                metadata.layout,
-                seqused_k,  # cache_seqlens
-                kv_batch_idx,  # cache_batch_idx
-                page_table,  # block_table for paged attention
-                q_descale,
-                k_descale,
-                v_descale,
-                rotary_cos=rotary_cos,
-                rotary_sin=rotary_sin,
-                rotary_interleaved=rotary_interleaved,
-                seqlens_rotary=seqlens_rotary,
-            )
-            # Decode kernel returns only softmax_lse, not sd_mask
-            sd_mask_triton = None
-        else:
-            if DEBUG:
-                print("Using prefill Triton implementation")
-            # Use prefill kernel
-            softmax_lse_triton, sd_mask_triton = attention_prefill_forward_triton_impl(
-                q,
-                k,
-                v,
-                out,
-                metadata.sm_scale,
-                metadata.alibi_slopes,
-                metadata.causal,
-                window_size_left,
-                window_size_right,
-                None,  # block_table
-                metadata.layout,
-                metadata.cu_seqlens_q,
-                metadata.cu_seqlens_k,
-                metadata.max_seqlens_q,
-                metadata.max_seqlens_k,
-                metadata.dropout_p,
-                metadata.philox_seed,
-                metadata.philox_offset,
-                metadata.return_softmax,
-                USE_EXP2,
-                q_descale,
-                k_descale,
-                v_descale,
-                seqused_q,
-                seqused_k,
-                rotary_cos=rotary_cos,
-                rotary_sin=rotary_sin,
-                rotary_interleaved=rotary_interleaved,
-                seqlens_rotary=seqlens_rotary,
-            )
-            softmax_lse = softmax_lse_triton
+            print("Using Prefill Triton implementation")
+        softmax_lse, _ = attention_prefill_forward_triton_impl(
+            q,
+            k,
+            v,
+            out,
+            metadata.sm_scale,
+            metadata.alibi_slopes,
+            metadata.causal,
+            window_size_left,
+            window_size_right,
+            None,
+            metadata.layout,
+            metadata.cu_seqlens_q,
+            metadata.cu_seqlens_k,
+            metadata.max_seqlens_q,
+            metadata.max_seqlens_k,
+            metadata.dropout_p,
+            metadata.philox_seed,
+            metadata.philox_offset,
+            metadata.return_softmax,
+            USE_EXP2,
+            q_descale,
+            k_descale,
+            v_descale,
+            seqused_q,
+            seqused_k,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            rotary_interleaved=rotary_interleaved,
+            seqlens_rotary=seqlens_rotary,
+        )
 
     if DEBUG:
         print("interface_fa_v3.py::fwd outputs")
@@ -617,65 +543,34 @@ def bwd(
     alibi_slopes = None
 
     # Call implementation
-    if USE_REF:
-        if DEBUG:
-            print("Using reference implementation")
-        delta_ref = attention_backward_pytorch_ref_impl(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            softmax_scale,
-            alibi_slopes,
-            causal,
-            window_size_left,
-            window_size_right,
-            layout,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            USE_EXP2,
-        )
-        delta = delta_ref
-    else:
-        if DEBUG:
-            print("Using Triton implementation (unified backward dispatcher)")
-        # Call unified backward implementation; it internally dispatches on mode.
-        delta = attention_prefill_backward_triton_impl(
-            do=dout,
-            q=q,
-            k=k,
-            v=v,
-            o=out,
-            softmax_lse=softmax_lse,
-            dq=dq,
-            dk=dk,
-            dv=dv,
-            sm_scale=softmax_scale,
-            alibi_slopes=alibi_slopes,
-            causal=causal,
-            layout=layout,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            dropout_p=dropout_p,
-            philox_seed=philox_seed,
-            philox_offset=philox_offset,
-            use_exp2=USE_EXP2,
-            mode=BWD_MODE,
-        )
+    if DEBUG:
+        print("Using Triton implementation (unified backward dispatcher)")
+    delta = attention_prefill_backward_triton_impl(
+        do=dout,
+        q=q,
+        k=k,
+        v=v,
+        o=out,
+        softmax_lse=softmax_lse,
+        dq=dq,
+        dk=dk,
+        dv=dv,
+        sm_scale=softmax_scale,
+        alibi_slopes=alibi_slopes,
+        causal=causal,
+        layout=layout,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        dropout_p=dropout_p,
+        philox_seed=philox_seed,
+        philox_offset=philox_offset,
+        use_exp2=USE_EXP2,
+        mode=BWD_MODE,
+    )
 
     if DEBUG:
         print("interface_fa_v3.py::bwd outputs")

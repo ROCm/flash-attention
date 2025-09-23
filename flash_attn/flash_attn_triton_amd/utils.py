@@ -24,11 +24,6 @@ DEBUG = os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0").lower() in (
     "true",
     "yes",
 )
-USE_REF = os.environ.get("FLASH_ATTENTION_TRITON_AMD_REF", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-)
 PERF = os.environ.get("FLASH_ATTENTION_TRITON_AMD_PERF", "0").lower() in (
     "1",
     "true",
