@@ -4,7 +4,13 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from typing import Literal, Optional
 from .bwd_prefill_fused_atomics import (
-    attention_prefill_backward_triton_fused_atomics_impl,
+    _bwd_fused_atomics_preprocess,
+    _bwd_kernel_fused_atomics_dkdvdq_causal,
+    _bwd_kernel_fused_atomics_dkdvdq_noncausal,
+    _bwd_kernel_fused_atomics_dkdv_causal,
+    _bwd_kernel_fused_atomics_dkdv_noncausal,
+    _bwd_kernel_fused_atomics_dq_causal,
+    _bwd_kernel_fused_atomics_dq_noncausal
 )
 from .utils import (
     DROPOUT_USE_PYTORCH,
@@ -2306,6 +2312,452 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             ),  # Add flag for seqused
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+        )
+
+    return delta
+
+
+def attention_prefill_backward_triton_fused_atomics_impl(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    sm_scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+    causal: bool,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    philox_seed: Optional[int] = 0,
+    philox_offset: Optional[int] = 0,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
+    descale_v: Optional[torch.Tensor] = None,
+    descale_do: Optional[torch.Tensor] = None,
+    fused: bool = False,
+    # seqused for FA v3 (currently ignored in this implementation)
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+):
+    IS_FP8 = is_fp8(q)
+    if IS_FP8:
+        FP8_MAX = torch.finfo(q.dtype).max
+        descale_strides = (
+            descale_q.stride(0),
+            descale_k.stride(0),
+            descale_v.stride(0),
+            descale_do.stride(0),
+        )
+
+        if DEBUG:
+            print(f"FP8 path triggered in bwd_prefill_fused_atomics.py")
+    else:
+        FP8_MAX = None
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
+            stride_descale_do_z
+        ) = None
+        descale_strides = (
+            stride_descale_q_z,
+            stride_descale_k_z,
+            stride_descale_v_z,
+            stride_descale_do_z,
+        )
+
+    IS_VARLEN = True if cu_seqlens_q is not None else False
+
+    # get strides and shape
+    if IS_VARLEN:
+        # Layout for q,k,v is thd ie [total tokens, num_head, head_dim]
+        batch, seqlen_q, num_q_heads, head_sz = (
+            len(cu_seqlens_q) - 1,
+            max_seqlen_q,
+            q.shape[1],
+            q.shape[2],
+        )
+        seqlen_k, num_k_heads = max_seqlen_k, k.shape[1]
+        q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
+        q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
+        k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
+        v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
+        o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
+        dq_strides = (0, dq.stride(1), dq.stride(0), dq.stride(2))
+        dk_strides = (0, dk.stride(1), dk.stride(0), dk.stride(2))
+        dv_strides = (0, dv.stride(1), dv.stride(0), dv.stride(2))
+        do_strides = (0, do.stride(1), do.stride(0), do.stride(2))
+    else:
+        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
+        batch, seqlen_q, num_q_heads, head_sz = q.shape
+        seqlen_k, num_k_heads = k.shape[1], k.shape[2]
+        q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
+        k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
+        v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
+        o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
+        dq_strides = (dq.stride(0), dq.stride(2), dq.stride(1), dq.stride(3))
+        dk_strides = (dk.stride(0), dk.stride(2), dk.stride(1), dk.stride(3))
+        dv_strides = (dv.stride(0), dv.stride(2), dv.stride(1), dv.stride(3))
+        do_strides = (do.stride(0), do.stride(2), do.stride(1), do.stride(3))
+
+    # BLOCK_D_MODEL, BLOCK_D_MODEL_POW2
+    # padding for head_dim. Power of 2 or 16
+    BLOCK_D_MODEL_POW2 = triton.next_power_of_2(head_sz)
+    BLOCK_D_MODEL_POW2 = max(BLOCK_D_MODEL_POW2, 16)
+
+    # Configs
+    # PRE_BLOCK, BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2
+    # BLK_SLICE_FACTOR
+    NUM_WARPS, NUM_STAGES = 4, 1
+    WAVES_PER_EU = 1
+    PRE_BLOCK = 128
+    # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 16
+    BLK_SLICE_FACTOR = 2
+
+    # init delta
+    delta = torch.zeros_like(softmax_lse)
+    if IS_VARLEN:
+        # [total_tokens, num_q_heads, seqlen_q]
+        delta_strides = (0, delta.stride(1), delta.stride(0))
+    else:
+        # [batch, num_q_heads, seqlen_q]
+        delta_strides = delta.stride()
+
+    # preprocess
+    # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
+    pre_grid = (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, num_q_heads)
+    _bwd_fused_atomics_preprocess[pre_grid](
+        o,
+        do,
+        delta,
+        *o_strides,
+        *delta_strides,
+        descale_strides[3],
+        cu_seqlens_q,
+        max_seqlen_q,
+        descale_do,
+        BLOCK_M=PRE_BLOCK,
+        BLOCK_D_MODEL=head_sz,
+        BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+        IS_VARLEN=IS_VARLEN,
+        IS_FP8=IS_FP8,
+    )
+
+    # dropout_mask
+    use_dropout = dropout_p > 0.0
+    if use_dropout:
+        dropout_mask = torch.zeros(
+            (batch, num_q_heads, max_seqlen_q, max_seqlen_k),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        dropout_strides = dropout_mask.stride()
+    else:
+        dropout_mask = None
+        dropout_strides = (0, 0, 0, 0)
+
+    grid_dkdv = ((max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, num_k_heads)
+    grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, num_k_heads)
+
+    if (
+        fused
+    ):  # fuses dk, dv, dq computations into one kernel by computing the dq using atomic adds between workgroups
+
+        BLOCK_N = (
+            128 if BLOCK_D_MODEL_POW2 < 160 else 64
+        )  # larger head sizes lead to oom
+        config = {
+            "BLOCK_M": 32,
+            "BLOCK_N": BLOCK_N,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 1,
+            "BLK_SLICE_FACTOR": 2,
+        }
+
+        num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
+        grid_dkdvdq = (batch * num_k_heads * num_k_pids,)
+
+        if causal:
+            _bwd_kernel_fused_atomics_dkdvdq_causal[grid_dkdvdq](
+                q,
+                k,
+                v,
+                sm_scale,
+                do,
+                dk,
+                dv,
+                dq,
+                softmax_lse,
+                delta,
+                *q_strides,
+                *k_strides,
+                *v_strides,
+                *dk_strides,
+                *dq_strides,
+                *delta_strides,
+                *do_strides,
+                *dropout_strides,
+                *descale_strides,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_mask,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_K_HEADS=num_k_heads,
+                BATCH=batch,
+                NUM_K_PIDS=num_k_pids,
+                BLOCK_D_MODEL=head_sz,
+                BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+                ENABLE_DROPOUT=use_dropout,
+                IS_VARLEN=IS_VARLEN,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                **config,
+            )
+        else:
+            _bwd_kernel_fused_atomics_dkdvdq_noncausal[grid_dkdvdq](
+                q,
+                k,
+                v,
+                sm_scale,
+                do,
+                dk,
+                dv,
+                dq,
+                softmax_lse,
+                delta,
+                *q_strides,
+                *k_strides,
+                *v_strides,
+                *dk_strides,
+                *dq_strides,
+                *delta_strides,
+                *do_strides,
+                *dropout_strides,
+                *descale_strides,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_mask,
+                dropout_p,
+                philox_seed,
+                philox_offset,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_K_HEADS=num_k_heads,
+                BATCH=batch,
+                NUM_K_PIDS=num_k_pids,
+                BLOCK_D_MODEL=head_sz,
+                BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+                ENABLE_DROPOUT=use_dropout,
+                IS_VARLEN=IS_VARLEN,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                **config,
+            )
+
+        return delta
+
+    # split kernels solution: one kernel computes dk, dv and the other computes dq
+
+    if causal:
+        _bwd_kernel_fused_atomics_dkdv_causal[grid_dkdv](
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dk,
+            dv,
+            softmax_lse,
+            delta,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            *dk_strides,
+            *delta_strides,
+            *do_strides,
+            *dropout_strides,
+            *descale_strides,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_K_HEADS=num_k_heads,
+            BLOCK_M=BLOCK_M1,
+            BLOCK_N=BLOCK_N1,
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            BLOCK_D_MODEL=head_sz,
+            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+            ENABLE_DROPOUT=use_dropout,
+            IS_VARLEN=IS_VARLEN,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+            waves_per_eu=WAVES_PER_EU,
+        )
+        _bwd_kernel_fused_atomics_dq_causal[grid_dq](
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dq,
+            softmax_lse,
+            delta,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            *dq_strides,
+            *delta_strides,
+            *do_strides,
+            *dropout_strides,
+            *descale_strides,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_K_HEADS=num_k_heads,
+            BLOCK_M=BLOCK_M2,
+            BLOCK_N=BLOCK_N2,
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            BLOCK_D_MODEL=head_sz,
+            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+            ENABLE_DROPOUT=use_dropout,
+            IS_VARLEN=IS_VARLEN,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+            waves_per_eu=WAVES_PER_EU,
+        )
+    else:
+        _bwd_kernel_fused_atomics_dkdv_noncausal[grid_dkdv](
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dk,
+            dv,
+            softmax_lse,
+            delta,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            *dk_strides,
+            *delta_strides,
+            *do_strides,
+            *dropout_strides,
+            *descale_strides,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_K_HEADS=num_k_heads,
+            BLOCK_M=BLOCK_M1,
+            BLOCK_N=BLOCK_N1,
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            BLOCK_D_MODEL=head_sz,
+            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+            ENABLE_DROPOUT=use_dropout,
+            IS_VARLEN=IS_VARLEN,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+            waves_per_eu=WAVES_PER_EU,
+        )
+
+        _bwd_kernel_fused_atomics_dq_noncausal[grid_dq](
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dq,
+            softmax_lse,
+            delta,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            *dq_strides,
+            *delta_strides,
+            *do_strides,
+            *dropout_strides,
+            *descale_strides,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_K_HEADS=num_k_heads,
+            BLOCK_M=BLOCK_M2,
+            BLOCK_N=BLOCK_N2,
+            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            BLOCK_D_MODEL=head_sz,
+            BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
+            ENABLE_DROPOUT=use_dropout,
+            IS_VARLEN=IS_VARLEN,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+            waves_per_eu=WAVES_PER_EU,
         )
 
     return delta

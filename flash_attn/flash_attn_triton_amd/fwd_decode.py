@@ -2,14 +2,14 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
-from .rotary import apply_rotary
 from .utils import (
     DEBUG,
     AUTOTUNE,
     get_padded_headsize,
     get_shape_and_strides_from_layout,
+    apply_rotary,
     is_cdna,
-    is_fp8,
+    is_fp8
 )
 
 def get_cdna_autotune_configs():

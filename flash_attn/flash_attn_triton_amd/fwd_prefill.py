@@ -3,7 +3,6 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
-from .rotary import apply_rotary
 from .utils import (
     DEBUG,
     DROPOUT_USE_PYTORCH,
@@ -16,6 +15,7 @@ from .utils import (
     is_fp8,
     is_rdna,
     create_dropout_mask,
+    apply_rotary
 )
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file

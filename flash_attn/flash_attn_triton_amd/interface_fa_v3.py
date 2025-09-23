@@ -3,7 +3,7 @@ import os
 from typing import Optional, Union, Tuple
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .fwd_decode import attention_decode_forward_triton_impl
-from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_impl
+from .bwd_prefill import attention_prefill_backward_triton_impl
 from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET, is_fp8
 
 def fwd(
