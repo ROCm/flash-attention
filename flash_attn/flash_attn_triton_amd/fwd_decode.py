@@ -1357,4 +1357,4 @@ def attention_decode_forward_triton_impl(
         num_warps=num_warps_reduce,
     )
 
-    return lse
+    return lse.view(batch_size, n_group_q * heads_per_group_q, seqlen_q)

@@ -1754,8 +1754,6 @@ def is_contiguous(x, name):
         print(f"{name} is not contiguous")
         return x.contiguous()
 
-
-OLD_LSE: bool = False
 DEBUG_TRITON: bool = False
 DEBUG_TRITON_DETAIL: bool = False
 
@@ -2057,40 +2055,16 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     ACTUAL_HEAD_DIM_V = head_size_v
 
     # init delta
-    if OLD_LSE:
-        delta = torch.empty_like(softmax_lse)
-        if IS_VARLEN:
-            stride_delta_b, stride_delta_h, stride_delta_m = (
-                0,
-                delta.stride(0),
-                delta.stride(1),
-            )
-        else:
-            stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
+    if IS_VARLEN:
+        # Shape expected by interface varlen backward: (Hq, Total_Q)
+        total_q, _, _ = q.shape
+        delta = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
+        stride_delta_b, stride_delta_h, stride_delta_m = (0, delta.stride(0), delta.stride(1))
     else:
-        if IS_VARLEN:
-            # interface expects the varlen sequence dims to rounded like this. Not sure why.
-            total_q, num_heads, _ = q.shape
-            total_q_rounded = total_q + 128 * batch
-            delta_padded = torch.zeros(
-                (nheads_q, total_q_rounded), device=q.device, dtype=torch.float32
-            )
-            delta = delta_padded[:, :total_q]
-            stride_delta_b, stride_delta_h, stride_delta_m = (
-                0,
-                delta.stride(0),
-                delta.stride(1),
-            )
-        else:
-            # the interface expects the sequence dimension to be rounded to 128
-            max_seqlen_q_rounded = round_multiple(max_seqlen_q, 128)
-            delta_padded = torch.zeros(
-                (batch, nheads_q, max_seqlen_q_rounded),
-                device=q.device,
-                dtype=torch.float32,
-            )
-            delta = delta_padded[:, :, :max_seqlen_q]
-            stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
+        # Shape expected by dense backward: (B, Hq, Sq)
+        seqlen_q = q.shape[1]
+        delta = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
 
     pre_grid = lambda META: (
         triton.cdiv(max_seqlen_q, META["PRE_BLOCK"]),
@@ -2340,10 +2314,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
 
-    if OLD_LSE:
-        return delta
-    else:
-        return delta_padded
+    return delta
 
 
 def attention_prefill_backward_triton_impl(

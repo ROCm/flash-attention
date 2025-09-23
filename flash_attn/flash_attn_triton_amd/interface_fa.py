@@ -2,12 +2,12 @@ import torch
 import os
 from typing import Literal, Optional, Union
 from .fwd_prefill import attention_prefill_forward_triton_impl
-from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .fwd_ref import (
     attention_prefill_forward_ref_impl,
     attention_decode_forward_ref_impl,
 )
+from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_impl
 from .bwd_ref import attention_backward_pytorch_ref_impl
 from .utils import DEBUG, USE_REF, MetaData
 
@@ -160,6 +160,27 @@ def fwd(
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None)
         print("rng_state:", rng_state)
 
+    # --- Assertions (shape + dtype contracts) ---
+    # out: (B, Sq, Hq, D)
+    assert out.shape == q.shape, f"[fwd] out shape {out.shape} != q shape {q.shape}"
+    # softmax_lse: (B, Hq, Sq)
+    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert softmax_lse.shape == expected_lse_shape, (
+        f"[fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    )
+    assert softmax_lse.dtype == torch.float32, (
+        f"[fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    )
+    if metadata.return_softmax:
+        # sd_mask: (B, Hq, Sq, Sk)
+        assert sd_mask is not None, "[fwd] return_softmax=True but sd_mask is None"
+        assert sd_mask.dim() == 4, f"[fwd] sd_mask dim {sd_mask.dim()} != 4"
+        assert sd_mask.shape[0] == q.shape[0] and sd_mask.shape[1] == q.shape[2] and sd_mask.shape[2] == q.shape[1], (
+            f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
+        )
+    else:
+        assert sd_mask is None, "[fwd] return_softmax=False but sd_mask is not None"
+
     return out, softmax_lse, sd_mask, rng_state
 
 
@@ -219,8 +240,8 @@ def bwd(
     # get shape
     batch, _, nheads_q, _ = q.shape
 
-    if dropout_p > 0.0:
-        assert rng_state is not None
+    # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
+    if rng_state is not None:
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
@@ -299,6 +320,15 @@ def bwd(
         print("dv:", dv, dv.shape)
         print("dk:", dk, dk.shape)
         print("dq:", dq, dq.shape)
+    # --- Assertions ---
+    assert dq.shape == q.shape, f"[bwd] dq shape {dq.shape} != q shape {q.shape}"
+    assert dk.shape == k.shape, f"[bwd] dk shape {dk.shape} != k shape {k.shape}"
+    assert dv.shape == v.shape, f"[bwd] dv shape {dv.shape} != v shape {v.shape}"
+    # delta (softmax_d) : (B, Hq, Sq)
+    expected_delta_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert delta.shape == expected_delta_shape, (
+        f"[bwd] delta shape {delta.shape} != {expected_delta_shape}"
+    )
     return dq, dk, dv, delta
 
 
@@ -465,7 +495,29 @@ def varlen_fwd(
         print("out:", out, out.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None)
-
+    # --- Assertions ---
+    # out: (Total_Q, Hq, D)
+    assert out.shape == q.shape, f"[varlen_fwd] out shape {out.shape} != q shape {q.shape}"
+    # softmax_lse: (Hq, Total_Q)
+    expected_lse_shape = (q.shape[1], q.shape[0])
+    assert softmax_lse.shape == expected_lse_shape, (
+        f"[varlen_fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    )
+    assert softmax_lse.dtype == torch.float32, (
+        f"[varlen_fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    )
+    if metadata.return_softmax:
+        # sd_mask expected: (B, Hq, max_seqlen_q, max_seqlen_k)
+        assert sd_mask is not None, "[varlen_fwd] return_softmax=True but sd_mask is None"
+        assert sd_mask.dim() == 4, f"[varlen_fwd] sd_mask dim {sd_mask.dim()} != 4"
+        assert sd_mask.shape[0] == (len(cu_seqlens_q) - 1), (
+            f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {len(cu_seqlens_q)-1}"
+        )
+        assert sd_mask.shape[1] == q.shape[1], (
+            f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
+        )
+    else:
+        assert sd_mask is None, "[varlen_fwd] return_softmax=False but sd_mask is not None"
     return out, softmax_lse, sd_mask, rng_state
 
 
@@ -538,8 +590,8 @@ def varlen_bwd(
     batch = len(cu_seqlens_q) - 1
     _, nheads_q, _ = q.shape
 
-    if dropout_p > 0.0:
-        assert rng_state is not None
+    # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
+    if rng_state is not None:
         philox_seed, philox_offset = rng_state[0].item(), rng_state[1].item()
     else:
         philox_seed, philox_offset = None, None
@@ -608,14 +660,6 @@ def varlen_bwd(
             dropout_p=dropout_p,
             philox_seed=philox_seed,
             philox_offset=philox_offset,
-            descale_q=None,
-            descale_k=None,
-            descale_v=None,
-            descale_o=None,
-            descale_do=None,
-            descale_dq=None,
-            descale_dk=None,
-            descale_dv=None,
             use_exp2=USE_EXP2,
             mode=BWD_MODE,
         )
@@ -626,7 +670,14 @@ def varlen_bwd(
         print("dv:", dv, dv.shape)
         print("dk:", dk, dk.shape)
         print("dq:", dq, dq.shape)
-
+    # --- Assertions ---
+    assert dq.shape == q.shape, f"[varlen_bwd] dq shape {dq.shape} != q shape {q.shape}"
+    assert dk.shape == k.shape, f"[varlen_bwd] dk shape {dk.shape} != k shape {k.shape}"
+    assert dv.shape == v.shape, f"[varlen_bwd] dv shape {dv.shape} != v shape {v.shape}"
+    expected_delta_shape = (q.shape[1], q.shape[0])  # (Hq, Total_Q)
+    assert delta.shape == expected_delta_shape, (
+        f"[varlen_bwd] delta shape {delta.shape} != {expected_delta_shape}"
+    )
     return dq, dk, dv, delta
 
 
@@ -791,4 +842,13 @@ def fwd_kvcache(
     if DEBUG:
         print("out:", out, out.shape)
         print("softmax_lse:", softmax_lse, softmax_lse.shape)
+    # --- Assertions ---
+    assert out.shape == q.shape, f"[fwd_kvcache] out shape {out.shape} != q shape {q.shape}"
+    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert softmax_lse.shape == expected_lse_shape, (
+        f"[fwd_kvcache] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    )
+    assert softmax_lse.dtype == torch.float32, (
+        f"[fwd_kvcache] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    )
     return out, softmax_lse
