@@ -4,15 +4,13 @@ import triton.language as tl
 from typing import Literal, Optional
 from .rotary import apply_rotary
 from .utils import (
+    DEBUG,
     AUTOTUNE,
     get_padded_headsize,
     get_shape_and_strides_from_layout,
     is_cdna,
     is_fp8,
 )
-
-DEBUG = False
-
 
 def get_cdna_autotune_configs():
     return [

@@ -4,12 +4,7 @@ from typing import Optional, Union, Tuple
 from .fwd_prefill import attention_prefill_forward_triton_impl
 from .fwd_decode import attention_decode_forward_triton_impl
 from .bwd_prefill_fused_no_atomics import attention_prefill_backward_triton_impl
-from .utils import DEBUG, MetaData, is_fp8
-
-USE_EXP2 = True
-BWD_MODE = os.environ.get("BWD_MODE", "fused_no_atomics").lower()
-USE_DECODE_PATH = os.environ.get("FLASH_ATTENTION_V3_USE_DECODE", "0") == "1"
-
+from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET, is_fp8
 
 def fwd(
     q: torch.Tensor,
@@ -192,41 +187,27 @@ def fwd(
     # if seqlens_rotary is not None:
     #     raise NotImplementedError("seqlens_rotary is not yet supported in the AMD Triton backend")
 
-    # Setup metadata
-    metadata = MetaData(sm_scale=softmax_scale)
-
-    # Handle variable length sequences first to determine layout
-    # Determine layout based on tensor dimensions and cu_seqlens presence
+    # establish layout / varlen & max seq lens
     if cu_seqlens_q is not None:
-        # Q has variable length - check tensor dimensions to confirm
-        if len(q.shape) == 3:  # [total_seqlen, nheads, head_dim]
-            metadata.layout = "thd"
-            metadata.varlen = True
-            metadata.cu_seqlens_q = cu_seqlens_q
-            metadata.max_seqlens_q = max_seqlen_q
-
-            # K might be varlen or batch mode
-            if cu_seqlens_k is not None:
-                metadata.cu_seqlens_k = cu_seqlens_k
-                metadata.max_seqlens_k = max_seqlen_k
-            else:
-                # K is in batch mode while Q is varlen (KV cache scenario)
-                metadata.cu_seqlens_k = None
-                metadata.max_seqlens_k = (
-                    k.shape[1] if len(k.shape) == 4 else max_seqlen_k
-                )
-        else:
+        if len(q.shape) != 3:
             raise ValueError(
                 f"cu_seqlens_q provided but q has shape {q.shape}, expected 3D tensor for varlen"
             )
+        layout = "thd"
+        cu_seqlens_q_local = cu_seqlens_q
+        max_seqlens_q_local = max_seqlen_q
+        if cu_seqlens_k is not None:
+            cu_seqlens_k_local = cu_seqlens_k
+            max_seqlens_k_local = max_seqlen_k
+        else:
+            cu_seqlens_k_local = None
+            max_seqlens_k_local = k.shape[1] if len(k.shape) == 4 else max_seqlen_k
     else:
-        # Regular batch mode
-        metadata.layout = "bshd"
-        metadata.varlen = False
-        metadata.cu_seqlens_q = None
-        metadata.cu_seqlens_k = None
-        metadata.max_seqlens_q = q.shape[1] if max_seqlen_q is None else max_seqlen_q
-        metadata.max_seqlens_k = k.shape[1] if max_seqlen_k is None else max_seqlen_k
+        layout = "bshd"
+        cu_seqlens_q_local = None
+        cu_seqlens_k_local = None
+        max_seqlens_q_local = q.shape[1] if max_seqlen_q is None else max_seqlen_q
+        max_seqlens_k_local = k.shape[1] if max_seqlen_k is None else max_seqlen_k
 
     # Now determine if we should use decode or prefill kernel
     # Decode kernel should be used for KV cache scenarios where:
@@ -235,26 +216,21 @@ def fwd(
     # 3. seqused_k without seqused_q - indicates KV cache fill levels (not varlen masking)
     # Note: In varlen, both seqused_q and seqused_k are used for sequence masking
     #       In KV cache, only seqused_k is used to track cache fill levels
-    if USE_DECODE_PATH:
-        # Force decode path
-        use_decode = True
-    else:
-        # Detect KV cache scenarios:
-        # - Clear KV cache indicators (k_new, v_new, kv_batch_idx)
-        # - OR seqused_k without seqused_q (KV cache fill tracking, not varlen masking)
-        use_decode = (
-            k_new is not None  # Have new KV to append (KV cache indicator)
-            or v_new is not None  # Have new KV to append (KV cache indicator)
-            or kv_batch_idx
-            is not None  # Have KV cache batch indexing (KV cache indicator)
-            or (
-                seqused_k is not None and seqused_q is None
-            )  # KV cache fill levels (not varlen)
-        )
+    # Detect KV cache scenarios:
+    # - Clear KV cache indicators (k_new, v_new, kv_batch_idx)
+    # - OR seqused_k without seqused_q (KV cache fill tracking, not varlen masking)
+    use_decode = (
+        k_new is not None  # Have new KV to append (KV cache indicator)
+        or v_new is not None  # Have new KV to append (KV cache indicator)
+        or kv_batch_idx is not None  # Have KV cache batch indexing (KV cache indicator)
+        or (
+            seqused_k is not None and seqused_q is None
+        )  # KV cache fill levels (not varlen)
+    )
 
     # Check for unsupported features with decode kernel
     if use_decode:
-        if metadata.layout == "thd":
+        if layout == "thd":
             raise NotImplementedError(
                 "Varlen is not yet supported with the decode kernel in the AMD Triton backend"
             )
@@ -265,23 +241,12 @@ def fwd(
 
     if out is None:
         out_dtype = torch.float32 if is_fp8(q) else q.dtype
-        if metadata.layout == "bshd":
-            out = torch.zeros(
-                q.shape[0],
-                q.shape[1],
-                q.shape[2],
-                v.shape[-1],
-                dtype=out_dtype,
-                device=q.device,
-            )
-        elif metadata.layout == "thd":
-            out = torch.zeros(
-                q.shape[0], q.shape[1], v.shape[-1], dtype=out_dtype, device=q.device
-            )
+        if layout == "bshd":
+            out = torch.zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1], dtype=out_dtype, device=q.device)
+        elif layout == "thd":
+            out = torch.zeros(q.shape[0], q.shape[1], v.shape[-1], dtype=out_dtype, device=q.device)
         else:
-            raise ValueError(
-                f"Unsupported layout: {metadata.layout}. Only 'bshd' and 'thd' layouts are supported."
-            )
+            raise ValueError(f"Unsupported layout: {layout}. Only 'bshd' and 'thd' layouts are supported.")
     else:
         out = out.zero_()
 
@@ -295,14 +260,12 @@ def fwd(
             )
         else:
             # Enforce exact expected shapes; no reshaping or normalization.
-            if metadata.layout == "bshd":
+            if layout == "bshd":
                 expected_batch = q.shape[0]
                 expected_q_heads = q.shape[2]
                 expected_kv_heads = k.shape[2]
             else:  # thd layout
-                expected_batch = (
-                    (len(cu_seqlens_q) - 1) if cu_seqlens_q is not None else 1
-                )
+                expected_batch = (len(cu_seqlens_q_local) - 1) if cu_seqlens_q_local is not None else 1
                 expected_q_heads = q.shape[1]
                 expected_kv_heads = k.shape[1]
 
@@ -322,41 +285,18 @@ def fwd(
                 and v_descale.shape[1] == expected_kv_heads
             ), f"v_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(v_descale.shape)}"
 
-    # Get shape
-    if metadata.layout == "bshd":
-        batch, _, nheads_q, _ = q.shape
-    else:  # "thd" layout for varlen
-        _, nheads_q, _ = q.shape
-        batch = len(cu_seqlens_q) - 1 if cu_seqlens_q is not None else 1
 
     # Handle causal mask
-    if causal:
-        metadata.need_causal(True)
+    causal_flag = bool(causal)
 
-    # Handle alibi slopes (not directly supported in v3 interface, but we'll keep the logic)
-    alibi_slopes = None  # V3 doesn't have alibi_slopes in the signature
-    if alibi_slopes is not None:
-        if alibi_slopes.dim() == 2:
-            pass
-        elif alibi_slopes.dim() == 1:
-            alibi_slopes = alibi_slopes.unsqueeze(0).expand(batch, -1)
-        else:
-            raise ValueError(
-                f"Alibi can be (nheads,) or (batch_size, nheads). Given tensor with shape {alibi_slopes.shape}"
-            )
-        metadata.need_alibi(alibi_slopes, batch, nheads_q)
+    # Handle alibi slopes
+    alibi_slopes = None
 
-    # Handle dropout (v3 doesn't have dropout in forward)
+    # Handle dropout
     dropout_p = 0.0
     return_softmax = False
-    metadata.need_dropout(dropout_p, return_softmax)
-
-    # rotary embeddings
-    if rotary_cos is not None and rotary_sin is not None:
-        metadata.need_rotary(rotary_sin, rotary_cos, rotary_interleaved)
-
-    # Store RNG state
-    rng_state = torch.as_tensor([metadata.philox_seed, metadata.philox_offset])
+    philox_seed = PHILOX_SEED
+    philox_offset = PHILOX_OFFSET
 
     # Call implementation
     if DEBUG:
@@ -375,12 +315,12 @@ def fwd(
             k_new,
             v_new,
             out,
-            metadata.sm_scale,
-            metadata.causal,
+            softmax_scale,
+            causal_flag,
             window_size_left,
             window_size_right,
-            metadata.alibi_slopes,
-            metadata.layout,
+            alibi_slopes,
+            layout,
             seqused_k,
             kv_batch_idx,
             page_table,
@@ -400,21 +340,21 @@ def fwd(
             k,
             v,
             out,
-            metadata.sm_scale,
-            metadata.alibi_slopes,
-            metadata.causal,
+            softmax_scale,
+            alibi_slopes,
+            causal_flag,
             window_size_left,
             window_size_right,
             None,
-            metadata.layout,
-            metadata.cu_seqlens_q,
-            metadata.cu_seqlens_k,
-            metadata.max_seqlens_q,
-            metadata.max_seqlens_k,
-            metadata.dropout_p,
-            metadata.philox_seed,
-            metadata.philox_offset,
-            metadata.return_softmax,
+            layout,
+            cu_seqlens_q_local,
+            cu_seqlens_k_local,
+            max_seqlens_q_local,
+            max_seqlens_k_local,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            return_softmax,
             USE_EXP2,
             q_descale,
             k_descale,

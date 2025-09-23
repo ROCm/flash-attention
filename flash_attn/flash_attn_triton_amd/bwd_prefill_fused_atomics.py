@@ -1,10 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-from .utils import compute_fp8_scaling_factors, DEBUG, is_fp8
-
-from typing import Optional, Tuple
-
+from typing import Optional
+from .utils import DEBUG, compute_fp8_scaling_factors, is_fp8
 
 # This function computes delta given output Out and gradient DO
 # Here is the I/O shape:

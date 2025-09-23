@@ -3,8 +3,10 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from typing import Literal, Optional
+from .bwd_prefill_fused_atomics import (
+    attention_prefill_backward_triton_fused_atomics_impl,
+)
 from .utils import (
-    AUTOTUNE,
     DROPOUT_USE_PYTORCH,
     DROPOUT_DUMP,
     DEBUG,
@@ -13,19 +15,11 @@ from .utils import (
     create_dropout_mask_varlen,
     is_cdna,
     is_fp8,
-    is_rdna,
-    round_multiple,
-)
-
-# Import atomics implementation (kept for kernel launch path) and expose a unified wrapper below.
-from .bwd_prefill_fused_atomics import (
-    attention_prefill_backward_triton_fused_atomics_impl,
 )
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
-
 
 def get_autotune_configs():
     if False:

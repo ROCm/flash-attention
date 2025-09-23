@@ -50,139 +50,12 @@ DEBUG_TRITON_DETAIL = (
 )
 if USE_TRITON_ROCM:  # TODO remove this
     random.seed(42)
+BWD_MODE = os.environ.get("BWD_MODE", "fused_no_atomics").lower()
 DROPOUT_USE_PYTORCH = False
 DROPOUT_DUMP = False
-
-
-# -------------------------------
-# Metadata
-# -------------------------------
-class MetaData:
-    cu_seqlens_q: Optional[torch.Tensor] = None
-    cu_seqlens_k: Optional[torch.Tensor] = None
-    max_seqlens_q: int = 0
-    max_seqlens_k: int = 0
-    bias: Optional[torch.Tensor] = None
-    alibi_slopes: Optional[torch.Tensor] = None
-    causal: bool = False
-    num_contexts = 0
-    varlen: bool = False
-    layout: Optional[Literal["bshd", "bhsd", "thd"]] = None
-    cache_seqlens: Optional[torch.Tensor] = None
-    cache_batch_idx = None
-    packing: Optional[bool] = None
-    return_softmax: bool = False
-    dropout_p: float = 0.0
-    philox_seed: Optional[int] = None
-    philox_offset: Optional[int] = (
-        None  # if dropout_p > 0.0 seed the RNG so we get reproducible results for testing.
-    )
-    # NOTE: scale sm_scale by log_2(e) and use 2^x in the loop as we do not have native e^x support in HW.
-    rotary_sin: Optional[torch.Tensor] = None
-    rotary_cos: Optional[torch.Tensor] = None
-    rotary_interleaved: bool = False
-    rotary_conjunction: bool = False
-    window_size_left: int = -1
-    window_size_right: int = -1
-
-    def __repr__(self) -> str:
-        return (
-            f"MetaData(\n"
-            f"  sm_scale={self.sm_scale},\n"
-            f"  cu_seqlens_q={self.cu_seqlens_q},\n"
-            f"  cu_seqlens_k={self.cu_seqlens_k},\n"
-            f"  max_seqlens_q={self.max_seqlens_q},\n"
-            f"  max_seqlens_k={self.max_seqlens_k},\n"
-            f"  bias={self.bias},\n"
-            f"  alibi_slopes={self.alibi_slopes},\n"
-            f"  causal={self.causal},\n"
-            f"  num_contexts={self.num_contexts},\n"
-            f"  varlen={self.varlen},\n"
-            f"  layout={self.layout},\n"
-            f"  cache_seqlens={self.cache_seqlens},\n"
-            f"  cache_batch_idx={self.cache_batch_idx},\n"
-            f"  dropout_p={self.dropout_p},\n"
-            f"  return_softmax={self.return_softmax}\n"
-            f"  window_size_left={self.window_size_left},\n"
-            f"  window_size_right={self.window_size_right},\n"
-            f")"
-        )
-
-    def __init__(self, sm_scale=1.0):
-        self.sm_scale = sm_scale
-
-    def set_varlen_params(self, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k):
-        self.varlen = True
-        self.layout = "thd"
-        self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_k = cu_seqlens_k
-        self.max_seqlens_q = max_seqlen_q
-        self.max_seqlens_k = max_seqlen_k
-
-        # Without "varlen", there should still be one sequence.
-        assert len(cu_seqlens_q) >= 2
-        assert len(cu_seqlens_q) == len(cu_seqlens_k)
-
-    def need_bias(self, bias, batch, nheads, seqlen_q, seqlen_k):
-        assert bias.is_cuda
-        assert bias.dim() == 4
-        assert bias.shape[0] == 1
-        assert bias.shape[2:] == (seqlen_q, seqlen_k)
-        self.bias = bias
-
-    def need_alibi(self, alibi_slopes, batch, nheads):
-        assert alibi_slopes.is_cuda
-        assert alibi_slopes.dim() == 2
-        assert alibi_slopes.shape[0] == batch
-        assert alibi_slopes.shape[1] == nheads
-        self.alibi_slopes = alibi_slopes
-
-    def need_causal(self, causal):
-        self.causal = causal
-
-    def need_rotary(self, sin, cos, rotary_interleaved, rotary_conjunction=False):
-        self.rotary_sin = sin
-        self.rotary_cos = cos
-        self.rotary_interleaved = rotary_interleaved
-        self.rotary_conjunction = rotary_conjunction
-
-    def need_dropout(self, dropout_p, return_softmax):
-        self.dropout_p = dropout_p
-        self.return_softmax = return_softmax
-        self.philox_seed, self.philox_offset = 0x1BF58, 0x1D4B49
-
-    def check_args(self, q, k, v, o):
-        assert q.dim() == k.dim() and q.dim() == v.dim()
-
-        batch, nheads_q, nheads_k, head_size, _, _ = get_shapes_from_layout(
-            q,
-            k,
-            self.layout,
-            self.cu_seqlens_q,
-            self.cu_seqlens_k,
-            self.max_seqlens_q,
-            self.max_seqlens_k,
-        )
-        if self.varlen:
-            assert q.dim() == 3
-            assert self.cu_seqlens_q is not None
-            assert self.cu_seqlens_k is not None
-            assert len(self.cu_seqlens_q) == len(self.cu_seqlens_k)
-            # TODO: Remove once bias is supported with varlen
-            assert self.bias is None
-            # assert not self.return_softmax
-        else:
-            assert q.dim() == 4
-            assert self.max_seqlens_q > 0 and self.max_seqlens_k > 0
-            assert self.cu_seqlens_q is None and self.cu_seqlens_k is None
-        # assert k.shape == v.shape
-        assert q.shape[-1] == k.shape[-1]  # and q.shape[-1] == v.shape[-1]
-        # TODO: Change assert if we support qkl f8 and v f16
-        assert q.dtype == k.dtype and q.dtype == v.dtype
-        assert o.shape[:-1] == q.shape[:-1] and o.shape[-1] == v.shape[-1]
-        assert (nheads_q % nheads_k) == 0
-        assert self.layout is not None
-        assert self.layout == "thd" or not self.varlen
+USE_EXP2 = True
+PHILOX_SEED = 0x1BF58
+PHILOX_OFFSET = 0x1D4B49
 
 
 # -------------------------------
@@ -681,10 +554,6 @@ def generate_varlen_kv_packed(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
-
-# Replace the existing input_helper function in utils.py with this updated version
-
-
 def input_helper(
     BATCH: int,
     HQ: int,
@@ -848,15 +717,6 @@ def input_helper(
                     equal_seqlens=equal_seqlens,
                 )
 
-        # setup metadata
-        sm_scale = D_HEAD**-0.5
-        metadata = MetaData(sm_scale=sm_scale)
-        metadata.set_varlen_params(
-            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
-        )
-        metadata.need_causal(CAUSAL)
-        metadata.need_dropout(DROPOUT_P, True)
-
     elif layout == "bshd" or layout == "bhsd":
         # deal with packing
         if packing is None:
@@ -964,39 +824,25 @@ def input_helper(
                         BATCH, HQ, N_CTX_Q, D_HEAD, dtype=dtype, device=device
                     )
 
-        # setup metadata
-        sm_scale = D_HEAD**-0.5
-        metadata = MetaData(sm_scale=sm_scale)
-        metadata.max_seqlens_q = N_CTX_Q
-        metadata.max_seqlens_k = N_CTX_K
-        metadata.layout = layout
-        metadata.need_causal(CAUSAL)
-        metadata.need_dropout(DROPOUT_P, True)
     else:
         raise ValueError(f"Unknown layout: {layout}")
 
     # return based on packing
     if packing is None:
         if is_fp8_dtype:
-            return (
-                (q, descale_q),
-                (k, descale_k),
-                (v, descale_v),
-                (do, descale_do),
-                metadata,
-            )
+            return (q, descale_q), (k, descale_k), (v, descale_v), (do, descale_do)
         else:
-            return q, k, v, do, metadata
+            return q, k, v, do
     elif packing == "kv":
         if is_fp8_dtype:
             raise ValueError("FP8 not supported kv packing yet")
         else:
-            return q, kv, do, metadata
+            return q, kv, do
     elif packing == "qkv":
         if is_fp8_dtype:
             raise ValueError("FP8 not supported qkv packing yet")
         else:
-            return qkv, do, metadata
+            return qkv, do
     else:
         assert False, f"Unsupported packing mode: {packing}"
 
