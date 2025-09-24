@@ -4,9 +4,9 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from typing import Literal, Optional
 from .utils import (
+    DEBUG,
     DROPOUT_USE_PYTORCH,
     DROPOUT_DUMP,
-    DEBUG,
     compute_fp8_scaling_factors,
     create_dropout_mask,
     create_dropout_mask_varlen,
@@ -3876,7 +3876,7 @@ DEBUG_TRITON: bool = False
 DEBUG_TRITON_DETAIL: bool = False
 
 
-def attention_prefill_backward_triton_split_fused_no_atomics_impl(
+def attention_backward_triton_split_fused_no_atomics_impl(
     do: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4148,7 +4148,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
 
         if DEBUG:
             print(
-                f"FP8 path triggered in bwd_prefill_fused_no_atomics.py (FP8_OUTPUT={FP8_OUTPUT})"
+                f"FP8 path triggered (FP8_OUTPUT={FP8_OUTPUT})"
             )
     else:
         FP8_MAX = None
@@ -4435,7 +4435,7 @@ def attention_prefill_backward_triton_split_fused_no_atomics_impl(
     return delta
 
 
-def attention_prefill_backward_triton_fused_atomics_impl(
+def attention_backward_triton_fused_atomics_impl(
     do: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4475,7 +4475,7 @@ def attention_prefill_backward_triton_fused_atomics_impl(
         )
 
         if DEBUG:
-            print(f"FP8 path triggered in bwd_prefill_fused_atomics.py")
+            print(f"FP8 path triggered")
     else:
         FP8_MAX = None
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
@@ -4881,7 +4881,7 @@ def attention_prefill_backward_triton_fused_atomics_impl(
     return delta
 
 
-def attention_prefill_backward_triton_impl(
+def attention_backward_triton_impl(
     *,
     do: torch.Tensor,
     q: torch.Tensor,
@@ -4924,7 +4924,7 @@ def attention_prefill_backward_triton_impl(
 
     if mode == "fused_atomics":
         # Atomics path ignores layout & use_exp2; pass varlen metadata directly.
-        return attention_prefill_backward_triton_fused_atomics_impl(
+        return attention_backward_triton_fused_atomics_impl(
             do,
             q,
             k,
@@ -4953,7 +4953,7 @@ def attention_prefill_backward_triton_impl(
             None,
         )
     elif mode == "fused_no_atomics":
-        return attention_prefill_backward_triton_split_fused_no_atomics_impl(
+        return attention_backward_triton_split_fused_no_atomics_impl(
             do,
             q,
             k,

@@ -834,7 +834,7 @@ def get_split_k(B: int, G: int, H: int, Mk: int) -> int:
     return split_k
 
 
-def attention_decode_forward_triton_impl(
+def attention_forward_decode_triton_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,

@@ -1,9 +1,9 @@
 import torch
 import os
 from typing import Optional, Union
-from .fwd_prefill import attention_prefill_forward_triton_impl
-from .fwd_decode import attention_decode_forward_triton_impl
-from .bwd import attention_prefill_backward_triton_impl
+from .fwd_prefill import attention_forward_prefill_triton_impl
+from .fwd_decode import attention_forward_decode_triton_impl
+from .bwd import attention_backward_triton_impl
 from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET
 
 
@@ -80,7 +80,7 @@ def fwd(
     # call implementation
     if DEBUG:
         print("Using Triton implementation")
-    softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
+    softmax_lse, sd_mask = attention_forward_prefill_triton_impl(
         q,
         k,
         v,
@@ -210,7 +210,7 @@ def bwd(
     # call implementation
     if DEBUG:
         print("Using Triton implementation")
-    delta = attention_prefill_backward_triton_impl(
+    delta = attention_backward_triton_impl(
         do=dout,
         q=q,
         k=k,
@@ -344,7 +344,7 @@ def varlen_fwd(
     # call implementation
     if DEBUG:
         print("Using Triton implementation")
-    softmax_lse, sd_mask = attention_prefill_forward_triton_impl(
+    softmax_lse, sd_mask = attention_forward_prefill_triton_impl(
         q,
         k,
         v,
@@ -487,7 +487,7 @@ def varlen_bwd(
     # call implementation
     if DEBUG:
         print("Using Triton implementation")
-    delta = attention_prefill_backward_triton_impl(
+    delta = attention_backward_triton_impl(
         do=dout,
         q=q,
         k=k,
@@ -617,7 +617,7 @@ def fwd_kvcache(
     # launch kernel
     if DEBUG:
         print("Using Triton implementation")
-    softmax_lse = attention_decode_forward_triton_impl(
+    softmax_lse = attention_forward_decode_triton_impl(
         q,
         k_cache,
         v_cache,

@@ -1,9 +1,9 @@
 import torch
 import os
 from typing import Optional, Union, Tuple
-from .fwd_prefill import attention_prefill_forward_triton_impl
-from .fwd_decode import attention_decode_forward_triton_impl
-from .bwd import attention_prefill_backward_triton_impl
+from .fwd_prefill import attention_forward_prefill_triton_impl
+from .fwd_decode import attention_forward_decode_triton_impl
+from .bwd import attention_backward_triton_impl
 from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET, is_fp8
 
 def fwd(
@@ -308,7 +308,7 @@ def fwd(
                 f"Using Decode Triton implementation (cache_seqlens={seqused_k is not None}, k_new={k_new is not None}, v_new={v_new is not None}, kv_batch_idx={kv_batch_idx is not None})"
             )
 
-        softmax_lse = attention_decode_forward_triton_impl(
+        softmax_lse = attention_forward_decode_triton_impl(
             q,
             k,
             v,
@@ -335,7 +335,7 @@ def fwd(
     else:
         if DEBUG:
             print("Using Prefill Triton implementation")
-        softmax_lse, _ = attention_prefill_forward_triton_impl(
+        softmax_lse, _ = attention_forward_prefill_triton_impl(
             q,
             k,
             v,
@@ -485,7 +485,7 @@ def bwd(
     # Call implementation
     if DEBUG:
         print("Using Triton implementation (unified backward dispatcher)")
-    delta = attention_prefill_backward_triton_impl(
+    delta = attention_backward_triton_impl(
         do=dout,
         q=q,
         k=k,
