@@ -35,6 +35,7 @@ scripts
 csrc/flash_attn_ck
 .eggs
 log
+*.rocprof*
 *.log
 core.*
 gpucore.*
