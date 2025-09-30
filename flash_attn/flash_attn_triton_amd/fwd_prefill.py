@@ -11,6 +11,7 @@ from .utils import (
     compute_alibi_block,
     compute_fp8_scaling_factors,
     get_arch,
+    get_cu_count,
     is_cdna,
     is_fp8,
     is_rdna,
@@ -152,7 +153,7 @@ def get_fwd_prefill_autotune_configs():
         elif (
             arch == "gfx942"
         ):
-            if torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count < 304:
+            if get_cu_count() < 304:
                 default_config = triton.Config(
                         {"BLOCK_M": 128, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
                         num_stages=1,

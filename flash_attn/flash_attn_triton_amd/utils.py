@@ -1736,6 +1736,9 @@ def is_hip():
 def get_arch():
     return triton.runtime.driver.active.get_current_target().arch
 
+@functools.cache
+def get_cu_count():
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 @functools.cache
 def is_cdna():
