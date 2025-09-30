@@ -150,13 +150,20 @@ def get_fwd_prefill_autotune_configs():
                 num_warps=4,
             )
         elif (
-            arch == "gfx942" and False
-        ):  # Disabled due shared mem oom in CI when using triton==3.3.0 when using top of tree everything seems fine.
-            default_config = triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                num_stages=1,
-                num_warps=4,
-            )
+            arch == "gfx942"
+        ):
+            if torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count < 304:
+                default_config = triton.Config(
+                        {"BLOCK_M": 128, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                        num_stages=1,
+                        num_warps=4,
+                    )
+            else:
+                default_config = triton.Config(
+                    {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                    num_stages=1,
+                    num_warps=4,
+                )
         else:
             default_config = triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
