@@ -159,28 +159,20 @@ def _attn_fwd_no_mask(
         v_ptrs = v_base_ptrs + start_n * stride_vk
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
+        # Load K
         if PADDED_HEAD_QK:
-            k_mask, k_mask_other = (offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK), 0.0
+            k_mask = offs_d_qk[:, None] < ACTUAL_BLOCK_DMODEL_QK
+            k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         else:
-            k_mask, k_mask_other = None, None
+            k = tl.load(k_ptrs)
 
-        if PADDED_HEAD_V:
-            v_mask, v_mask_other = (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V), 0.0
-        else:
-            v_mask, v_mask_other = None, None
-
-        # load k and if preload_v then v
-        k = (
-            tl.load(k_ptrs, mask=k_mask, other=k_mask_other)
-            if PADDED_HEAD_QK
-            else tl.load(k_ptrs)
-        )
+        # Optionally preload V
         if PRE_LOAD_V:
-            v = (
-                tl.load(v_ptrs, mask=v_mask, other=v_mask_other)
-                if PADDED_HEAD_V
-                else tl.load(v_ptrs)
-            )
+            if PADDED_HEAD_V:
+                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
 
         # setup qk accumlator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
@@ -260,11 +252,11 @@ def _attn_fwd_no_mask(
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
-            v = (
-                tl.load(v_ptrs, mask=v_mask, other=v_mask_other)
-                if PADDED_HEAD_V
-                else tl.load(v_ptrs)
-            )
+            if PADDED_HEAD_V:
+                v_mask = offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V
+                v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+            else:
+                v = tl.load(v_ptrs)
 
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
@@ -891,7 +883,6 @@ def attn_fwd(
     stride_q_descale_z,
     stride_k_descale_z,
     stride_v_descale_z,
-    SM_SCALE: tl.constexpr,
     LSE,
     Out,
     stride_qz,
@@ -940,6 +931,7 @@ def attn_fwd(
     MAX_SEQLENS_Q: tl.constexpr,
     MAX_SEQLENS_K: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_SLIDING_WINDOW: tl.constexpr,
     WINDOW_SIZE_LEFT: tl.constexpr,
@@ -1849,7 +1841,6 @@ def attention_forward_prefill_triton_impl(
         stride_q_descale_z,
         stride_k_descale_z,
         stride_v_descale_z,
-        sm_scale,
         softmax_lse,
         o,
         stride_qb,
@@ -1897,6 +1888,7 @@ def attention_forward_prefill_triton_impl(
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
         MAX_SEQLENS_Q=max_seqlens_q,
         MAX_SEQLENS_K=max_seqlens_k,
+        SM_SCALE=sm_scale,
         IS_CAUSAL=causal,
         USE_SLIDING_WINDOW=use_sliding_window,
         WINDOW_SIZE_LEFT=window_size_left,
