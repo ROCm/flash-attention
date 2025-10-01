@@ -241,7 +241,7 @@ def fwd(
             )
 
     if out is None:
-        out_dtype = torch.float32 if is_fp8(q) else q.dtype
+        out_dtype = torch.bfloat16 if is_fp8(q) else q.dtype
         if layout == "bshd":
             out = torch.zeros(
                 q.shape[0],

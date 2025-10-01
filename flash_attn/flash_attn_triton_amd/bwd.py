@@ -5,6 +5,7 @@ import triton.language as tl  # type: ignore
 from typing import Literal, Optional
 from .utils import (
     DEBUG,
+    AUTOTUNE,
     DROPOUT_USE_PYTORCH,
     DROPOUT_DUMP,
     compute_fp8_scaling_factors,
@@ -19,7 +20,7 @@ tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYT
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 
-def get_bwd_configs(autotune = False):
+def get_bwd_configs(autotune: bool):
     # default config
     if not autotune:
         # preprocess params
@@ -159,7 +160,7 @@ def get_bwd_configs(autotune = False):
     (preprocess_autotune_configs, preprocess_autotune_keys),
     (causal_autotune_configs, causal_autotune_keys),
     (noncausal_autotune_configs, noncausal_autotune_keys),
-) = get_bwd_configs()
+) = get_bwd_configs(AUTOTUNE)
 
 
 # This function computes delta given output Out and gradient DO
