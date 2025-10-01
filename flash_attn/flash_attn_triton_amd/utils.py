@@ -890,18 +890,29 @@ def compute_alibi_block(
 # FP8
 # -------------------------------
 def is_dtype_fp8(dtype):
-    if dtype in {
+    supported = {
         torch.float8_e4m3fnuz,
         torch.float8_e4m3fn,
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
-    }:
-        if arch_supports_fp8():
-            return True
-        else:
-            raise RuntimeError("This device doesnot support fp8")
-    else:
+    }
+    if dtype not in supported:
         return False
+    if not arch_supports_fp8():
+        raise RuntimeError("This device does not support FP8 on this architecture")
+
+    # check for architecture-specific restrictions
+    arch = get_arch()
+    if arch == "gfx942":
+        if dtype == torch.float8_e4m3fn:
+            replacement_dtype = torch.float8_e4m3fnuz
+        elif dtype == torch.float8_e5m2:
+            replacement_dtype = torch.float8_e5m2fnuz
+        else:
+            replacement_dtype = None
+        if replacement_dtype is not None:
+            raise TypeError(f"On {arch} use {replacement_dtype} instead of {dtype}")
+    return True
 
 
 def is_fp8(x):
