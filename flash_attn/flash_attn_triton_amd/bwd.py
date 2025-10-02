@@ -4790,7 +4790,6 @@ def attention_backward_triton_impl(
             )
 
     if mode == "fused_atomics":
-        # Atomics path ignores layout & use_exp2; pass varlen metadata directly.
         return attention_backward_triton_fused_atomics_impl(
             do,
             q,
