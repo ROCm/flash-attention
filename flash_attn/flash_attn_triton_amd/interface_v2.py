@@ -211,7 +211,7 @@ def bwd(
 
     # call implementation
     if DEBUG:
-        print("Using Triton implementation")
+        print(f"Using Triton implementation in {BWD_MODE} mode")
     delta = attention_backward_triton_impl(
         do=dout,
         q=q,
@@ -494,7 +494,7 @@ def varlen_bwd(
 
     # call implementation
     if DEBUG:
-        print("Using Triton implementation")
+        print(f"Using Triton implementation in {BWD_MODE} mode")
     delta = attention_backward_triton_impl(
         do=dout,
         q=q,
