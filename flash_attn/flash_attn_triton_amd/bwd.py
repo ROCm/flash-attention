@@ -3981,8 +3981,8 @@ def attention_backward_triton_split_fused_no_atomics_impl(
         stride_dob, stride_dom, stride_doh, stride_dod = do.stride()
         stride_lse_b, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
-    # fp8 setup - moved after all assertions
-    IS_FP8 = is_fp8(q)
+    # fp8
+    IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
         # we already asserted that do, q, k, v all have the same dtype, so no need to check each one
@@ -4331,7 +4331,7 @@ def attention_backward_triton_fused_atomics_impl(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
 ):
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
         descale_strides = (

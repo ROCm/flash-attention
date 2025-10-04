@@ -17,6 +17,7 @@ from .utils import (
     is_rdna,
     create_dropout_mask,
     apply_rotary,
+    get_recommended_fp8_dtype,
 )
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -24,7 +25,7 @@ tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYT
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 
-def get_fwd_configs(autotune: bool):
+def get_fwd_configs(autotune: bool, use_fallback: bool = True):
     keys = [
         "IS_CAUSAL",
         "dropout_p",
@@ -37,7 +38,17 @@ def get_fwd_configs(autotune: bool):
         "HK",
     ]
 
+    # default configs
     if not autotune:
+        # TODO: don't use fallback config used for function correctness testing due to some configs leading error on the scale of 1e-1.
+        if use_fallback:
+            cfg = triton.Config(
+                {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                num_stages=1,
+                num_warps=4,
+            )
+
+        # get best config for the architecture
         arch = get_arch()
         if arch == "gfx950":
             cfg = triton.Config(
@@ -64,6 +75,7 @@ def get_fwd_configs(autotune: bool):
                 num_stages=1,
                 num_warps=4,
             )
+
         return [cfg], keys
 
     # ===================== Autotune Sweep =====================
@@ -1716,12 +1728,19 @@ def attention_forward_prefill_triton_impl(
         )
 
     # fp8 setup and assertions
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
-        # we already asserted that q, k, v all have the same dtype, so no need to check each one
-
         FP8_MAX = torch.finfo(q.dtype).max
 
+        CAST_TO_REC = str(os.getenv("CAST_TO_REC", "0")).lower() in ("1", "true", "yes", "on")
+        if CAST_TO_REC:
+            # check fp8 is the correct dtype for this architecture
+            rec = get_recommended_fp8_dtype(q)
+            if q.dtype != rec:
+                raise TypeError(
+                    f"FP8 dtype mismatch: received {q.dtype}, expected recommended {rec} for this architecture. "
+                )
+        
         # Check and create default descale tensors if not provided
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
             import warnings

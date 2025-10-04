@@ -889,7 +889,7 @@ def compute_alibi_block(
 # -------------------------------
 # FP8
 # -------------------------------
-def is_dtype_fp8(dtype):
+def is_dtype_fp8(dtype) -> bool:
     supported = {
         torch.float8_e4m3fnuz,
         torch.float8_e4m3fn,
@@ -898,25 +898,62 @@ def is_dtype_fp8(dtype):
     }
     if dtype not in supported:
         return False
-    if not arch_supports_fp8():
-        raise RuntimeError("This device does not support FP8 on this architecture")
-
-    # check for architecture-specific restrictions
-    arch = get_arch()
-    if arch == "gfx942":
-        if dtype == torch.float8_e4m3fn:
-            replacement_dtype = torch.float8_e4m3fnuz
-        elif dtype == torch.float8_e5m2:
-            replacement_dtype = torch.float8_e5m2fnuz
-        else:
-            replacement_dtype = None
-        if replacement_dtype is not None:
-            raise TypeError(f"On {arch} use {replacement_dtype} instead of {dtype}")
     return True
 
 
-def is_fp8(x):
-    return is_dtype_fp8(x.dtype)
+
+_RECOMMENDED_FP8_REPLACEMENTS = {
+    "gfx942": {
+        torch.float8_e4m3fn: torch.float8_e4m3fnuz,
+        torch.float8_e5m2: torch.float8_e5m2fnuz,
+    },
+}
+
+def get_recommended_fp8_dtype(x):
+    dtype = x.dtype if isinstance(x, torch.Tensor) else x
+    if not is_dtype_fp8(dtype):
+        return dtype
+    arch = get_arch()
+    return _RECOMMENDED_FP8_REPLACEMENTS.get(arch, {}).get(dtype, dtype)
+
+def is_fp8(x) -> bool:
+    """Return whether tensor(s) use FP8.
+
+    Accepts either a single tensor or a list/tuple of tensors.
+
+    Rules:
+      * Single tensor: return True if FP8 (after arch validation), else False.
+      * Multiple tensors:
+          - If all tensors are FP8 -> return True.
+          - If none are FP8 -> return False.
+          - If a mix of FP8 and non-FP8 -> raise ValueError.
+
+    Empty list/tuple returns False.
+    """
+
+    def _is_fp8_single(t: torch.Tensor) -> bool:
+        if is_dtype_fp8(t.dtype):
+            arch = get_arch()
+            if arch not in ("gfx942", "gfx950"):
+                raise RuntimeError(
+                    f"{arch} is not in the list of supported architectures for FP8"
+                )
+            return True
+        return False
+
+    if isinstance(x, (list, tuple)):
+        if len(x) == 0:
+            return False
+        flags = [_is_fp8_single(t) for t in x]
+        if all(flags):
+            return True
+        if not any(flags):
+            return False
+        raise ValueError(
+            "Mixed FP8 and non-FP8 tensors provided; either all or none must be FP8."
+        )
+    else:
+        return _is_fp8_single(x)
 
 
 @triton.jit
@@ -1773,8 +1810,3 @@ def is_rdna():
         "gfx1200",
         "gfx1201",
     )
-
-
-@functools.cache
-def arch_supports_fp8():
-    return is_hip() and get_arch() in ("gfx942")

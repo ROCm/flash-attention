@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 import triton.language as tl
@@ -10,6 +11,7 @@ from .utils import (
     apply_rotary,
     is_cdna,
     is_fp8,
+    get_recommended_fp8_dtype,
 )
 
 
@@ -1118,8 +1120,16 @@ def attention_forward_decode_triton_impl(
         stride_bt_b, stride_bt_s = 0, 0
 
     # FP8 support
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = is_fp8([q, k_cache, v_cache])
     if IS_FP8:
+        CAST_TO_REC = str(os.getenv("CAST_TO_REC", "0")).lower() in ("1", "true", "yes", "on")
+        if CAST_TO_REC:
+            rec = get_recommended_fp8_dtype(q)
+            if q.dtype != rec:
+                raise TypeError(
+                    f"FP8 dtype mismatch: received {q.dtype}, expected recommended {rec}. "
+                    "Convert to the recommended FP8 dtype before calling (handled in interface)."
+                )
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
             import warnings
 

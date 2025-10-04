@@ -1,10 +1,19 @@
-import torch
 import os
+import warnings
+import torch
 from typing import Optional, Union, Tuple
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
-from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET, is_fp8
+from .utils import (
+    DEBUG,
+    USE_EXP2,
+    BWD_MODE,
+    PHILOX_SEED,
+    PHILOX_OFFSET,
+    is_fp8,
+    get_recommended_fp8_dtype,
+)
 
 
 def fwd(
@@ -185,9 +194,6 @@ def fwd(
             "cu_seqlens_k_new is not yet supported in the AMD Triton backend"
         )
 
-    # if seqlens_rotary is not None:
-    #     raise NotImplementedError("seqlens_rotary is not yet supported in the AMD Triton backend")
-
     # establish layout / varlen & max seq lens
     if cu_seqlens_q is not None:
         if len(q.shape) != 3:
@@ -241,7 +247,7 @@ def fwd(
             )
 
     if out is None:
-        out_dtype = torch.bfloat16 if is_fp8(q) else q.dtype
+        out_dtype = torch.bfloat16 if is_fp8([q, k, v]) else q.dtype
         if layout == "bshd":
             out = torch.zeros(
                 q.shape[0],
@@ -262,10 +268,30 @@ def fwd(
     else:
         out = out.zero_()
 
-    if is_fp8(q):
-        if (q_descale is None) or (k_descale is None) or (v_descale is None):
-            import warnings
+    if is_fp8([q, k, v]):
+        CAST_TO_REC = str(os.getenv("CAST_TO_REC", "0")).lower() in ("1", "true", "yes", "on")
+        if CAST_TO_REC:
+            # check recommended dtype
+            rec = get_recommended_fp8_dtype(q)
+            if rec != q.dtype:
+                warnings.warn(
+                    f"Casting q,k,v from {q.dtype} to recommended {rec} for this architecture.",
+                    UserWarning,
+                )
+                q = q.to(rec)
+                k = k.to(rec)
+                v = v.to(rec)
+            if k_new is not None and is_fp8(k_new):
+                rec_kn = get_recommended_fp8_dtype(k_new)
+                if rec_kn != k_new.dtype:
+                    k_new = k_new.to(rec_kn)
+            if v_new is not None and is_fp8(v_new):
+                rec_vn = get_recommended_fp8_dtype(v_new)
+                if rec_vn != v_new.dtype:
+                    v_new = v_new.to(rec_vn)
 
+
+        if (q_descale is None) or (k_descale is None) or (v_descale is None):
             warnings.warn(
                 "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
                 UserWarning,
