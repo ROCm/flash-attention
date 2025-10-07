@@ -2,6 +2,7 @@ import os
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+import warnings
 from typing import Literal, Optional
 from .utils import (
     DEBUG,
@@ -11,8 +12,10 @@ from .utils import (
     compute_fp8_scaling_factors,
     create_dropout_mask,
     create_dropout_mask_varlen,
+    get_cu_count,
     is_cdna,
     is_fp8,
+    get_arch,
 )
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
@@ -21,46 +24,65 @@ tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
 
 
 def get_bwd_configs(autotune: bool):
+    # keys
+    preprocess_autotune_keys = [
+        "max_seqlen_q",
+        "ACTUAL_HEAD_DIM", "IS_VARLEN",
+    ]
+    
+    causal_autotune_keys = [
+        "dropout_p", "max_seqlen_q", "max_seqlen_k", 
+        "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+    ]
+    
+    noncausal_autotune_keys = [
+        "dropout_p", "max_seqlen_q", "max_seqlen_k", 
+        "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+    ]
+
     # default config
     if not autotune:
-        # preprocess params
-        PRE_BLOCK = 64
-        PRE_WAVES_PER_EU=2
-        PRE_NUM_STAGES=2
-        PRE_NUM_WARPS=8
-
+        arch = get_arch()
         # configs for the kernels
-        preprocess_autotune_configs = [
-            triton.Config({"PRE_BLOCK": PRE_BLOCK, "waves_per_eu": PRE_WAVES_PER_EU}, num_stages=PRE_NUM_STAGES, num_warps=PRE_NUM_WARPS),
-        ]
-        preprocess_autotune_keys = [
-            "max_seqlen_q",
-           "ACTUAL_HEAD_DIM", "IS_VARLEN",
-        ]
+        if arch == "gfx942":
+            if get_cu_count() < 304:
+                preprocess_autotune_configs = [
+                    triton.Config({"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8),
+                    triton.Config({"PRE_BLOCK": 128, "waves_per_eu": 2}, num_stages=1, num_warps=4),
+                ]
+                noncausal_autotune_configs = [
+                    triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+                    triton.Config({"BLOCK_M1": 64, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+                ]
+                causal_autotune_configs = [
+                    triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+                ]
+            else:
+                preprocess_autotune_configs = [
+                    triton.Config({"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8),
+                ]
+                noncausal_autotune_configs = [
+                    triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+                ]
+                causal_autotune_configs = [
+                    triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+                ]
+        else:
+            preprocess_autotune_configs = [
+                triton.Config({"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8),
+            ]
+            noncausal_autotune_configs = [
+                triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+            ]
+            causal_autotune_configs = [
+                triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+            ]
 
-        # main params
-        NUM_STAGES=1
-        NUM_WARPS= 4
-        WAVES_PER_EU = 1
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 64
-        BLK_SLICE_FACTOR = 2
-        MATRIX_INSTR_NONKDIM=16
-        assert BLOCK_N1 == BLOCK_M2
+        # assert constraints
+        for (noncausal_cfg, causal_cfg) in zip(noncausal_autotune_configs, causal_autotune_configs):
+            assert noncausal_cfg.all_kwargs()["BLOCK_N1"] == noncausal_cfg.all_kwargs()["BLOCK_M2"], f"BLOCK_N1 ({noncausal_cfg.all_kwargs()['BLOCK_N1']}) must equal BLOCK_M2 ({noncausal_cfg.all_kwargs()['BLOCK_M2']})"
+            assert causal_cfg.all_kwargs()["BLOCK_N1"] == causal_cfg.all_kwargs()["BLOCK_M2"], f"BLOCK_N1 ({causal_cfg.all_kwargs()['BLOCK_N1']}) must equal BLOCK_M2 ({causal_cfg.all_kwargs()['BLOCK_M2']})"
 
-        causal_autotune_configs = [
-            triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-        ]
-        causal_autotune_keys = [
-            "dropout_p", "max_seqlen_q", "max_seqlen_k", 
-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
-        ]
-        noncausal_autotune_configs = [
-            triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-        ]
-        noncausal_autotune_keys = [
-            "dropout_p", "max_seqlen_q", "max_seqlen_k", 
-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
-        ]
         return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
 
 
@@ -69,21 +91,6 @@ def get_bwd_configs(autotune: bool):
     PRE_WAVES_PER_EU_OPTIONS=[1, 2]
     PRE_NUM_STAGES_OPTIONS=[1, 2]
     PRE_NUM_WARPS_OPTIONS=[4, 8]
-
-
-    # Preprocess configs
-    preprocess_autotune_configs = []
-    for pre_num_warps in PRE_NUM_WARPS_OPTIONS:
-        for pre_num_stages in PRE_NUM_STAGES_OPTIONS:
-            for pre_waves in PRE_WAVES_PER_EU_OPTIONS:
-                for pre_block in PRE_BLOCK_OPTIONS:
-                    preprocess_autotune_configs.append(
-                        triton.Config({
-                            "PRE_BLOCK": pre_block,
-                            "waves_per_eu": pre_waves,
-                        }, num_stages=pre_num_stages, num_warps=pre_num_warps)
-                    )
-
     NUM_STAGES_OPTIONS = [1, 2] # og: 1
     NUM_WARPS_OPTIONS = [4, 8] # og: 4
     WAVES_PER_EU_OPTIONS = [1, 2] # og: 1
@@ -98,10 +105,22 @@ def get_bwd_configs(autotune: bool):
         32, 64
     ]
     BLK_SLICE_FACTOR_OPTIONS = [2] # og: 2
-    
-    # build configs
+
+    # ==================== sweep configs ================================
+    preprocess_autotune_configs = []
     causal_autotune_configs = []
-    noncausal_autotune_configs = []
+    noncausal_autotune_configs = []  
+    for pre_num_warps in PRE_NUM_WARPS_OPTIONS:
+        for pre_num_stages in PRE_NUM_STAGES_OPTIONS:
+            for pre_waves in PRE_WAVES_PER_EU_OPTIONS:
+                for pre_block in PRE_BLOCK_OPTIONS:
+                    preprocess_autotune_configs.append(
+                        triton.Config({
+                            "PRE_BLOCK": pre_block,
+                            "waves_per_eu": pre_waves,
+                        }, num_stages=pre_num_stages, num_warps=pre_num_warps)
+                    )
+
     for num_warps in NUM_WARPS_OPTIONS:
         for num_stages in NUM_STAGES_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
@@ -135,21 +154,6 @@ def get_bwd_configs(autotune: bool):
                                         }, num_stages=num_stages, num_warps=num_warps)
                                     )
     
-    # kernel keys
-    preprocess_autotune_keys = [
-        "max_seqlen_q",
-        "ACTUAL_HEAD_DIM", "IS_VARLEN",
-    ]
-    
-    causal_autotune_keys = [
-        "dropout_p", "max_seqlen_q", "max_seqlen_k", 
-        "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
-    ]
-    
-    noncausal_autotune_keys = [
-        "dropout_p", "max_seqlen_q", "max_seqlen_k", 
-        "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
-    ]
 
     return (preprocess_autotune_configs, preprocess_autotune_keys), \
             (causal_autotune_configs, causal_autotune_keys), \
@@ -3786,8 +3790,8 @@ def attention_backward_triton_split_fused_no_atomics_impl(
         q.device == k.device == v.device == o.device == do.device == softmax_lse.device
     ), f"All tensors must be on the same device. Got: q={q.device}, k={k.device}, v={v.device}, o={o.device}, do={do.device}, softmax_lse={softmax_lse.device}"
     assert (
-        q.dtype == k.dtype == v.dtype == do.dtype
-    ), "q, k, v, do must have the same dtype"
+        q.dtype == k.dtype == v.dtype
+    ), "q, k, v must have the same dtype"
     current_device = torch.cuda.current_device()
     assert (
         q.is_cuda and q.device.index == current_device
@@ -3985,21 +3989,68 @@ def attention_backward_triton_split_fused_no_atomics_impl(
     IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
+        
+        # Check and create default descale tensors if not provided (for inputs)
+        if (descale_q is None) or (descale_k is None) or (descale_v is None) or (descale_do is None):
+            warnings.warn(
+                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0. "
+                "Note: Backward pass does not support proper FP8 descaling yet.",
+                UserWarning,
+            )
+            # Create default descale tensors if not provided
+            if descale_q is None:
+                descale_q = torch.ones(
+                    batch, nheads_q, dtype=torch.float32, device=q.device
+                )
+            if descale_k is None:
+                descale_k = torch.ones(
+                    batch, nheads_k, dtype=torch.float32, device=q.device
+                )
+            if descale_v is None:
+                descale_v = torch.ones(
+                    batch, nheads_k, dtype=torch.float32, device=q.device
+                )
+            if descale_do is None:
+                descale_do = torch.ones(
+                    batch, nheads_q, dtype=torch.float32, device=q.device
+                )
+        
         # we already asserted that do, q, k, v all have the same dtype, so no need to check each one
         if is_fp8(o):
             FP8_OUTPUT = True
-            assert (
-                descale_o is not None
-            ), f"descale_o is None. In fp8, you need to pass a tensor for descale_o along with a tensor o."
-            assert (
-                descale_dq is not None
-            ), f"descale_dq is None. In fp8, you need to pass a tensor for descale_dq along with a tensor dq."
-            assert (
-                descale_dk is not None
-            ), f"descale_dk is None. In fp8, you need to pass a tensor for descale_dk along with a tensor dk."
-            assert (
-                descale_dv is not None
-            ), f"descale_dv is None. In fp8, you need to pass a tensor for descale_dv along with a tensor dv."
+            # Create default descale tensors for outputs if not provided
+            if descale_o is None:
+                warnings.warn(
+                    "FP8 output tensor 'o' detected but descale_o not provided. Using default scale of 1.0",
+                    UserWarning,
+                )
+                descale_o = torch.ones(
+                    batch, nheads_q, dtype=torch.float32, device=q.device
+                )
+            if descale_dq is None:
+                warnings.warn(
+                    "FP8 backward requires descale_dq but not provided. Using default scale of 1.0",
+                    UserWarning,
+                )
+                descale_dq = torch.ones(
+                    batch, nheads_q, dtype=torch.float32, device=q.device
+                )
+            if descale_dk is None:
+                warnings.warn(
+                    "FP8 backward requires descale_dk but not provided. Using default scale of 1.0",
+                    UserWarning,
+                )
+                descale_dk = torch.ones(
+                    batch, nheads_k, dtype=torch.float32, device=q.device
+                )
+            if descale_dv is None:
+                warnings.warn(
+                    "FP8 backward requires descale_dv but not provided. Using default scale of 1.0",
+                    UserWarning,
+                )
+                descale_dv = torch.ones(
+                    batch, nheads_k, dtype=torch.float32, device=q.device
+                )
         else:
             FP8_OUTPUT = False
 
@@ -4010,7 +4061,7 @@ def attention_backward_triton_split_fused_no_atomics_impl(
         stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
 
         if DEBUG:
-            print(f"FP8 path triggered (FP8_OUTPUT={FP8_OUTPUT})")
+            print(f"FP8 path triggered in bwd.py (FP8_OUTPUT={FP8_OUTPUT})")
     else:
         FP8_MAX = None
         FP8_OUTPUT = False
@@ -4334,6 +4385,41 @@ def attention_backward_triton_fused_atomics_impl(
     IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
+        
+        # Check and create default descale tensors if not provided
+        if (descale_q is None) or (descale_k is None) or (descale_v is None) or (descale_do is None):
+            warnings.warn(
+                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0. "
+                "Note: Backward pass does not support proper FP8 descaling yet.",
+                UserWarning,
+            )
+            # Determine batch size for creating default descale tensors
+            if cu_seqlens_q is not None:
+                batch = len(cu_seqlens_q) - 1
+            else:
+                batch = q.shape[0]
+            
+            nheads_q = q.shape[1] if cu_seqlens_q is not None else q.shape[2]
+            nheads_k = k.shape[1] if cu_seqlens_q is not None else k.shape[2]
+            
+            # Create default descale tensors if not provided
+            if descale_q is None:
+                descale_q = torch.ones(
+                    batch, nheads_q, dtype=torch.float32, device=q.device
+                )
+            if descale_k is None:
+                descale_k = torch.ones(
+                    batch, nheads_k, dtype=torch.float32, device=q.device
+                )
+            if descale_v is None:
+                descale_v = torch.ones(
+                    batch, nheads_k, dtype=torch.float32, device=q.device
+                )
+            if descale_do is None:
+                descale_do = torch.ones(
+                    batch, nheads_q, dtype=torch.float32, device=q.device
+                )
+        
         descale_strides = (
             descale_q.stride(0),
             descale_k.stride(0),
@@ -4342,7 +4428,7 @@ def attention_backward_triton_fused_atomics_impl(
         )
 
         if DEBUG:
-            print(f"FP8 path triggered")
+            print(f"FP8 path triggered in bwd.py (fused_atomics)")
     else:
         FP8_MAX = None
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
@@ -4781,16 +4867,38 @@ def attention_backward_triton_impl(
     call ONLY this function going forward.
     mode: 'fused_atomics' or 'fused_no_atomics'; layout: 'bshd' or 'thd'; use_exp2 retained for parity.
     """
-    # Enforce supported dtypes (mirror Hopper behavior: FP8 forward-only)
-    supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
-    for name, t in {"q": q, "k": k, "v": v, "o": o, "do": do}.items():
-        if t.dtype not in supported_dtypes:
-            raise TypeError(
-                f"Backward only supports fp16/bf16/fp32; tensor '{name}' has dtype {t.dtype}"
-            )
+    # Allow FP8 dtypes and handle gradient tensor dtype casting
+    dq_original, dk_original, dv_original = None, None, None
+    do_original = None
+    
+    if is_fp8([q, k, v]):
+        warnings.warn(
+            "FP8 tensors detected in backward pass. Backward pass supports FP8 inputs but "
+            "descaling factors will default to 1.0 if not provided.",
+            UserWarning,
+        )
+        
+        # For FP8 backward, we need dout to be FP8 for the dot products in the kernel
+        # The kernel does: tl.dot(v, tl.trans(do)) which requires matching FP8 dtypes
+        if do.dtype != q.dtype:
+            do_original = do
+            # Cast dout to the same FP8 dtype as q/k/v
+            do = do.to(q.dtype)
+        
+        # For the output gradients (dq, dk, dv), we compute in float32 for precision
+        # and convert back at the end
+        if dq.dtype != torch.float32:
+            dq_original = dq
+            dq = torch.empty(dq.shape, dtype=torch.float32, device=dq.device)
+        if dk.dtype != torch.float32:
+            dk_original = dk
+            dk = torch.empty(dk.shape, dtype=torch.float32, device=dk.device)
+        if dv.dtype != torch.float32:
+            dv_original = dv
+            dv = torch.empty(dv.shape, dtype=torch.float32, device=dv.device)
 
     if mode == "fused_atomics":
-        return attention_backward_triton_fused_atomics_impl(
+        delta = attention_backward_triton_fused_atomics_impl(
             do,
             q,
             k,
@@ -4819,7 +4927,7 @@ def attention_backward_triton_impl(
             None,
         )
     elif mode == "fused_no_atomics":
-        return attention_backward_triton_split_fused_no_atomics_impl(
+        delta = attention_backward_triton_split_fused_no_atomics_impl(
             do,
             q,
             k,
@@ -4856,3 +4964,14 @@ def attention_backward_triton_impl(
         raise ValueError(
             f"Unknown backward mode '{mode}'. Expected 'fused_atomics' or 'fused_no_atomics'."
         )
+    
+    # Copy float32 gradients back to original FP8 tensors if needed
+    # Note: This conversion happens only once at the end, not in a loop
+    if dq_original is not None:
+        dq_original.copy_(dq.to(dq_original.dtype))
+    if dk_original is not None:
+        dk_original.copy_(dk.to(dk_original.dtype))
+    if dv_original is not None:
+        dv_original.copy_(dv.to(dv_original.dtype))
+    
+    return delta

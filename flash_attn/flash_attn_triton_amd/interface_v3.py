@@ -61,13 +61,13 @@ def fwd(
     if DEBUG:
         print()
         print("interface_fa_v3.py::fwd inputs")
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("k_new:", k_new, k_new.shape if k_new is not None else None)
-        print("v_new:", v_new, v_new.shape if v_new is not None else None)
-        print("qv:", qv, qv.shape if qv is not None else None)
-        print("out:", out, out.shape if out is not None else None)
+        print("q:", q.dtype if q is not None else None, q.shape)
+        print("k:", k.dtype if k is not None else None, k.shape)
+        print("v:", v.dtype if v is not None else None, v.shape)
+        print("k_new:", k_new.dtype if k_new is not None else None, k_new.shape if k_new is not None else None)
+        print("v_new:", v_new.dtype if v_new is not None else None, v_new.shape if v_new is not None else None)
+        print("qv:", qv.dtype if qv is not None else None, qv.shape if qv is not None else None)
+        print("out:", out.dtype if out is not None else None, out.shape if out is not None else None)
         print(
             "cu_seqlens_q:",
             cu_seqlens_q,
@@ -120,13 +120,13 @@ def fwd(
             seqlens_rotary.shape if seqlens_rotary is not None else None,
         )
         print(
-            "q_descale:", q_descale, q_descale.shape if q_descale is not None else None
+            "q_descale:", q_descale.dtype if q_descale is not None else None, q_descale.shape if q_descale is not None else None
         )
         print(
-            "k_descale:", k_descale, k_descale.shape if k_descale is not None else None
+            "k_descale:", k_descale.dtype if k_descale is not None else None, k_descale.shape if k_descale is not None else None
         )
         print(
-            "v_descale:", v_descale, v_descale.shape if v_descale is not None else None
+            "v_descale:", v_descale.dtype if v_descale is not None else None, v_descale.shape if v_descale is not None else None
         )
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
@@ -411,8 +411,8 @@ def fwd(
 
     if DEBUG:
         print("interface_fa_v3.py::fwd outputs")
-        print("out:", out, out.shape)
-        print("softmax_lse:", softmax_lse, softmax_lse.shape)
+        print("out:", out.dtype if out is not None else None, out.shape if out is not None else None)
+        print("softmax_lse:", softmax_lse.dtype if softmax_lse is not None else None, softmax_lse.shape if softmax_lse is not None else None)
 
     # Return format compatible with v3
     # V3 returns (out, softmax_lse, *rest) where rest can be empty or contain additional outputs
@@ -452,15 +452,15 @@ def bwd(
     if DEBUG:
         print()
         print("interface_fa_v3.py::bwd inputs")
-        print("dout:", dout, dout.shape)
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("out:", out, out.shape)
-        print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("dq:", dq, dq.shape if dq is not None else None)
-        print("dk:", dk, dk.shape if dk is not None else None)
-        print("dv:", dv, dv.shape if dv is not None else None)
+        print("dout:", dout.dtype if dout is not None else None, dout.shape if dout is not None else None)
+        print("q:", q.dtype if q is not None else None, q.shape if q is not None else None)
+        print("k:", k.dtype if k is not None else None, k.shape if k is not None else None)
+        print("v:", v.dtype if v is not None else None, v.shape if v is not None else None)
+        print("out:", out.dtype if out is not None else None, out.shape if out is not None else None)
+        print("softmax_lse:", softmax_lse.dtype if softmax_lse is not None else None, softmax_lse.shape if softmax_lse is not None else None)
+        print("dq:", dq.dtype if dq is not None else None, dq.shape if dq is not None else None)
+        print("dk:", dk.dtype if dk is not None else None, dk.shape if dk is not None else None)
+        print("dv:", dv.dtype if dv is not None else None, dv.shape if dv is not None else None)
         print(
             "cu_seqlens_q:",
             cu_seqlens_q,
@@ -502,9 +502,11 @@ def bwd(
         )
 
     # Initialize gradient tensors if not provided
-    dq = torch.zeros_like(q) if dq is None else dq.zero_()
-    dk = torch.zeros_like(k) if dk is None else dk.zero_()
-    dv = torch.zeros_like(v) if dv is None else dv.zero_()
+    # NOTE: Using types that are lower precision than float32 such as bfloat16 for fp8 causes mismatches on a small set of tests.
+    grad_dtype = torch.float32 if is_fp8([q, k, v]) else q.dtype
+    dq = torch.zeros_like(q, dtype=grad_dtype) if dq is None else dq.zero_()
+    dk = torch.zeros_like(k, dtype=grad_dtype) if dk is None else dk.zero_()
+    dv = torch.zeros_like(v, dtype=grad_dtype) if dv is None else dv.zero_()
 
     # Determine layout based on cu_seqlens
     if cu_seqlens_q is not None and cu_seqlens_k is not None:
@@ -556,10 +558,10 @@ def bwd(
 
     if DEBUG:
         print("interface_fa_v3.py::bwd outputs")
-        print("dq:", dq, dq.shape)
-        print("dk:", dk, dk.shape)
-        print("dv:", dv, dv.shape)
-        print("delta:", delta, delta.shape if delta is not None else None)
+        print("dq:", dq.dtype if dq is not None else None, dq.shape if dq is not None else None)
+        print("dk:", dk.dtype if dk is not None else None, dk.shape if dk is not None else None)
+        print("dv:", dv.dtype if dv is not None else None, dv.shape if dv is not None else None)
+        print("delta:", delta.dtype if delta is not None else None, delta.shape if delta is not None else None)
 
     # V3 expects (dq, dk, dv, softmax_d, *rest)
     # delta is the softmax_d in this case
