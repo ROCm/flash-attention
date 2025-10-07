@@ -1847,7 +1847,9 @@ def _bwd_kernel_fused_atomics_dkdvdq_noncausal(
             )
 
         if IS_FP8:
-            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hqid)
+            # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (hkid)
+            # For MHA (GROUP_SIZE == 1), hqid == hkid, so it doesn't matter
+            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hkid)
             descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
             descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
             descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
@@ -2048,7 +2050,9 @@ def _bwd_kernel_fused_atomics_dkdv_noncausal(
             )
 
         if IS_FP8:
-            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hqid)
+            # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (hkid)
+            # For MHA (GROUP_SIZE == 1), hqid == hkid, so it doesn't matter
+            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hkid)
             descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
             descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
             descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
@@ -2234,7 +2238,9 @@ def _bwd_kernel_fused_atomics_dq_noncausal(
 
         # FP8
         if IS_FP8:
-            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hqid)
+            # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (hkid)
+            # For MHA (GROUP_SIZE == 1), hqid == hkid, so it doesn't matter
+            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hkid)
             descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
             descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
             descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
@@ -2847,7 +2853,6 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_OUTPUT: tl.constexpr,
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
@@ -2999,7 +3004,9 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
                 )
 
             if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (hkid)
+                # For MHA (GROUP_SIZE == 1), hqid == hkid, so it doesn't matter
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
                 descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
@@ -3217,7 +3224,9 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
             num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)
 
             if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (hkid)
+                # For MHA (GROUP_SIZE == 1), hqid == hkid, so it doesn't matter
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
                 descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
@@ -3431,7 +3440,6 @@ def bwd_kernel_noncausal(
     USE_EXP2: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    FP8_OUTPUT: tl.constexpr,
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
@@ -3541,7 +3549,9 @@ def bwd_kernel_noncausal(
                 )
 
             if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (hkid)
+                # For MHA (GROUP_SIZE == 1), hqid == hkid, so it doesn't matter
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
                 descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
@@ -3662,7 +3672,9 @@ def bwd_kernel_noncausal(
             m = m[:, None]
 
             if IS_FP8:
-                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (hkid)
+                # For MHA (GROUP_SIZE == 1), hqid == hkid, so it doesn't matter
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
                 descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
@@ -3998,9 +4010,10 @@ def attention_backward_triton_split_fused_no_atomics_impl(
                 UserWarning,
             )
             # Create default descale tensors if not provided
+            # For GQA/MQA, q_descale should be shaped (batch, nheads_k) to match forward pass
             if descale_q is None:
                 descale_q = torch.ones(
-                    batch, nheads_q, dtype=torch.float32, device=q.device
+                    batch, nheads_k, dtype=torch.float32, device=q.device
                 )
             if descale_k is None:
                 descale_k = torch.ones(
@@ -4015,59 +4028,18 @@ def attention_backward_triton_split_fused_no_atomics_impl(
                     batch, nheads_q, dtype=torch.float32, device=q.device
                 )
         
-        # we already asserted that do, q, k, v all have the same dtype, so no need to check each one
-        if is_fp8(o):
-            FP8_OUTPUT = True
-            # Create default descale tensors for outputs if not provided
-            if descale_o is None:
-                warnings.warn(
-                    "FP8 output tensor 'o' detected but descale_o not provided. Using default scale of 1.0",
-                    UserWarning,
-                )
-                descale_o = torch.ones(
-                    batch, nheads_q, dtype=torch.float32, device=q.device
-                )
-            if descale_dq is None:
-                warnings.warn(
-                    "FP8 backward requires descale_dq but not provided. Using default scale of 1.0",
-                    UserWarning,
-                )
-                descale_dq = torch.ones(
-                    batch, nheads_q, dtype=torch.float32, device=q.device
-                )
-            if descale_dk is None:
-                warnings.warn(
-                    "FP8 backward requires descale_dk but not provided. Using default scale of 1.0",
-                    UserWarning,
-                )
-                descale_dk = torch.ones(
-                    batch, nheads_k, dtype=torch.float32, device=q.device
-                )
-            if descale_dv is None:
-                warnings.warn(
-                    "FP8 backward requires descale_dv but not provided. Using default scale of 1.0",
-                    UserWarning,
-                )
-                descale_dv = torch.ones(
-                    batch, nheads_k, dtype=torch.float32, device=q.device
-                )
-        else:
-            FP8_OUTPUT = False
-
         stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
         stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
         stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
-        stride_descale_o_z = descale_o.stride(0) if descale_o is not None else None
         stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
 
         if DEBUG:
-            print(f"FP8 path triggered in bwd.py (FP8_OUTPUT={FP8_OUTPUT})")
+            print(f"FP8 path triggered in bwd.py")
     else:
         FP8_MAX = None
-        FP8_OUTPUT = False
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-            stride_descale_o_z
-        ) = stride_descale_do_z = None
+            stride_descale_do_z
+        ) = None
 
     # alibi setup
     use_alibi, (stride_az, stride_ah) = (
@@ -4252,7 +4224,6 @@ def attention_backward_triton_split_fused_no_atomics_impl(
             USE_EXP2=use_exp2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_OUTPUT=FP8_OUTPUT,
             USE_SEQUSED=(
                 seqused_q is not None or seqused_k is not None
             ),  # Add flag for seqused
@@ -4342,7 +4313,6 @@ def attention_backward_triton_split_fused_no_atomics_impl(
             USE_EXP2=use_exp2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_OUTPUT=FP8_OUTPUT,
             USE_SEQUSED=(
                 seqused_q is not None or seqused_k is not None
             ),  # Add flag for seqused
