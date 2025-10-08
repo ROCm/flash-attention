@@ -47,6 +47,7 @@ def get_bwd_configs(autotune: bool):
         if arch == "gfx942":
             if get_cu_count() < 304:
                 preprocess_autotune_configs = [
+                    triton.Config({"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=8),
                     triton.Config({"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8),
                     triton.Config({"PRE_BLOCK": 128, "waves_per_eu": 2}, num_stages=1, num_warps=4),
                 ]
@@ -56,6 +57,8 @@ def get_bwd_configs(autotune: bool):
                 ]
                 causal_autotune_configs = [
                     triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+                    triton.Config({"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
+                    triton.Config({"BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16}, num_stages=1, num_warps=4),
                 ]
             else:
                 preprocess_autotune_configs = [
@@ -86,7 +89,7 @@ def get_bwd_configs(autotune: bool):
         return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
 
 
-    # params
+    # param options
     PRE_BLOCK_OPTIONS = [64, 128] # og: 128
     PRE_WAVES_PER_EU_OPTIONS=[1, 2]
     PRE_NUM_STAGES_OPTIONS=[1, 2]
@@ -95,21 +98,28 @@ def get_bwd_configs(autotune: bool):
     NUM_WARPS_OPTIONS = [4, 8] # og: 4
     WAVES_PER_EU_OPTIONS = [1, 2] # og: 1
     MATRIX_INSTR_NONKDIM_OPTIONS = [16, 32] # og: 16
-    BLOCK_M1_OPTIONS = [ # og: 32
+    CAUSAL_BLOCK_M1_OPTIONS = [ # og: 32
+        32, 64,
+    ]
+    CAUSAL_BLOCK_N1_M2_OPTIONS = [ # og: 128
+        64, 128, 256
+    ]
+    CAUSAL_BLOCK_N2_OPTIONS = [ # og: 32
         32, 64
     ]
-    BLOCK_N1_M2_OPTIONS = [ # og: 128
-        64, 128
+    NON_CAUSAL_BLOCK_M1_OPTIONS = [ # og: 32
+        32, 64
     ]
-    BLOCK_N2_OPTIONS = [ # og: 32
+    NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [ # og: 128
+        64, 128, 256
+    ]
+    NON_CAUSAL_BLOCK_N2_OPTIONS = [ # og: 32
         32, 64
     ]
     BLK_SLICE_FACTOR_OPTIONS = [2] # og: 2
 
     # ==================== sweep configs ================================
     preprocess_autotune_configs = []
-    causal_autotune_configs = []
-    noncausal_autotune_configs = []  
     for pre_num_warps in PRE_NUM_WARPS_OPTIONS:
         for pre_num_stages in PRE_NUM_STAGES_OPTIONS:
             for pre_waves in PRE_WAVES_PER_EU_OPTIONS:
@@ -121,15 +131,15 @@ def get_bwd_configs(autotune: bool):
                         }, num_stages=pre_num_stages, num_warps=pre_num_warps)
                     )
 
+    causal_autotune_configs = []
     for num_warps in NUM_WARPS_OPTIONS:
         for num_stages in NUM_STAGES_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
                 for matrix_instr_nonkdim in MATRIX_INSTR_NONKDIM_OPTIONS:
-                    # Causal and non-causal configs
-                    for m1 in BLOCK_M1_OPTIONS:
-                        for n1 in BLOCK_N1_M2_OPTIONS:
+                    for m1 in CAUSAL_BLOCK_M1_OPTIONS:
+                        for n1 in CAUSAL_BLOCK_N1_M2_OPTIONS:
                             m2 = n1
-                            for n2 in BLOCK_N2_OPTIONS:
+                            for n2 in CAUSAL_BLOCK_N2_OPTIONS:
                                 # Ensure constraint
                                 assert n1 == m2, f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
                                 
@@ -144,6 +154,18 @@ def get_bwd_configs(autotune: bool):
                                         }, num_stages=num_stages, num_warps=num_warps)
                                     )
 
+    noncausal_autotune_configs = []  
+    for num_warps in NUM_WARPS_OPTIONS:
+        for num_stages in NUM_STAGES_OPTIONS:
+            for waves in WAVES_PER_EU_OPTIONS:
+                for matrix_instr_nonkdim in MATRIX_INSTR_NONKDIM_OPTIONS:
+                    for m1 in NON_CAUSAL_BLOCK_M1_OPTIONS:
+                        for n1 in NON_CAUSAL_BLOCK_N1_M2_OPTIONS:
+                            m2 = n1
+                            for n2 in NON_CAUSAL_BLOCK_N2_OPTIONS:
+                                # Ensure constraint
+                                assert n1 == m2, f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
+                                for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
                                     noncausal_autotune_configs.append(
                                         triton.Config({
                                             "BLOCK_M1": m1, "BLOCK_N1": n1,
@@ -153,12 +175,10 @@ def get_bwd_configs(autotune: bool):
                                             "matrix_instr_nonkdim": matrix_instr_nonkdim
                                         }, num_stages=num_stages, num_warps=num_warps)
                                     )
-    
 
     return (preprocess_autotune_configs, preprocess_autotune_keys), \
             (causal_autotune_configs, causal_autotune_keys), \
             (noncausal_autotune_configs, noncausal_autotune_keys)
-
 
 (
     (preprocess_autotune_configs, preprocess_autotune_keys),
@@ -358,7 +378,11 @@ def _bwd_fused_atomics_dq_inner(
         # dq
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT)) * descale_k
+            # Rewrite dq += ds @ kT.T as dq += (kT @ ds.T).T
+            # This puts FP8 tensor (kT) on LHS of dot product
+            # Cast the transposed ds to FP8 to match kT's dtype
+            ds_transposed = tl.trans(ds).to(kT.type.element_ty)
+            dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
 
@@ -2630,7 +2654,11 @@ def _bwd_dq_inner(
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT)) * descale_k
+            # Rewrite dq += ds @ kT.T as dq += (kT @ ds.T).T
+            # This puts FP8 tensor (kT) on LHS of dot product
+            # Cast the transposed ds to FP8 to match kT's dtype
+            ds_transposed = tl.trans(ds).to(kT.type.element_ty)
+            dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
         # Increment pointers.
