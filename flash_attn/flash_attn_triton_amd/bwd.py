@@ -184,10 +184,8 @@ def _bwd_fused_atomics_preprocess(
     stride_delta_b,
     stride_delta_h,
     stride_delta_m,
-    stride_descale_do_z,
     cu_seqlens_q,
     max_seqlen_q,
-    descale_do_ptr,
     BLOCK_M: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
     BLOCK_D_MODEL_POW2: tl.constexpr,
@@ -234,13 +232,8 @@ def _bwd_fused_atomics_preprocess(
     do = tl.load(do_ptr + offs, mask=mask, other=0.0)
 
     # compute and write-back to delta
-    if IS_FP8:
-        descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hid)
-
-        # NOTE: do is in the fp8 range and o is not in fp8
-        delta = tl.sum(o.to(tl.float32) * (do.to(tl.float32) * descale_do), axis=1)
-    else:
-        delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
+    # NOTE: Both o and do are FP32
+    delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
 
     offs_delta = (
         bid * stride_delta_b
@@ -283,7 +276,6 @@ def _bwd_fused_atomics_dq_inner(
     descale_q,
     descale_k,
     descale_v,
-    descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
@@ -352,7 +344,7 @@ def _bwd_fused_atomics_dq_inner(
 
         # dp
         if IS_FP8:
-            dp = tl.dot(do, vT) * descale_do * descale_v
+            dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
         else:
             dp = tl.dot(do, vT)
 
@@ -366,12 +358,7 @@ def _bwd_fused_atomics_dq_inner(
         # dq
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
-            scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
-            dq += (
-                tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT))
-                * descale_ds
-                * descale_k
-            )
+            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT)) * descale_k
         else:
             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
 
@@ -411,7 +398,6 @@ def _bwd_fused_atomics_dkdv_inner(
     descale_q,
     descale_k,
     descale_v,
-    descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
@@ -502,34 +488,16 @@ def _bwd_fused_atomics_dkdv_inner(
         # dV
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            if IS_FP8:
-                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(
-                    pT_dropout, FP8_MAX
-                )
-                dv += (
-                    tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)
-                    * descale_p_dropout
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
-            if IS_FP8:
-                scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (
-                    tl.dot((pT * scale_pT).to(do.type.element_ty), do)
-                    * descale_pT
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv += tl.dot(pT.to(do.type.element_ty), do)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
 
         # Compute dP and dS
         if IS_FP8:
-            dpT = tl.dot(v, tl.trans(do)) * descale_v * descale_do
+            dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
         else:
             dpT = tl.dot(v, tl.trans(do))
 
@@ -541,14 +509,13 @@ def _bwd_fused_atomics_dkdv_inner(
 
         # compute dk
         if IS_FP8:
-            scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (
-                tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
-                * descale_dsT
-                * descale_q
-            )
+            # Rewrite dk += dsT @ qT.T as dk += (qT @ dsT.T).T
+            # This puts FP8 tensor (qT) on LHS of dot product
+            # Cast the transposed dsT to FP8 to match qT's dtype
+            dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
+            dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk += tl.dot(dsT, tl.trans(qT))
 
         # increment pointers
         curr_m += step_m
@@ -591,7 +558,6 @@ def _bwd_fused_atomics_dkdvdq_inner(
     descale_q,
     descale_k,
     descale_v,
-    descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
@@ -706,34 +672,16 @@ def _bwd_fused_atomics_dkdvdq_inner(
         # dV
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            if IS_FP8:
-                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(
-                    pT_dropout, FP8_MAX
-                )
-                dv += (
-                    tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)
-                    * descale_p_dropout
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
-            if IS_FP8:
-                scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (
-                    tl.dot((pT * scale_pT).to(do.type.element_ty), do)
-                    * descale_pT
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv += tl.dot(pT.to(do.type.element_ty), do)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
 
         # Compute dP and dS
         if IS_FP8:
-            dpT = tl.dot(v, tl.trans(do)) * descale_v * descale_do
+            dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
         else:
             dpT = tl.dot(v, tl.trans(do))
 
@@ -745,24 +693,23 @@ def _bwd_fused_atomics_dkdvdq_inner(
 
         # compute dk
         if IS_FP8:
-            scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (
-                tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
-                * descale_dsT
-                * descale_q
-            )
+            # Rewrite dk += dsT @ qT.T as dk += (qT @ dsT.T).T
+            # This puts FP8 tensor (qT) on LHS of dot product
+            # Cast the transposed dsT to FP8 to match qT's dtype
+            dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
+            dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk += tl.dot(dsT, tl.trans(qT))
 
         # We can compute the dq_partial here and do a atomic add to the correct memory location
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
         # (BLOCK_M, BLOCK_N) x (BLOCK_N, D)
         if IS_FP8:
             dq_partial = (
-                tl.dot((dsT * scale_dsT).to(k.dtype).T, k) * descale_dsT * descale_k
+                tl.dot(dsT.to(k.type.element_ty).T, k) * descale_k
             )
         else:
-            dq_partial = tl.dot(dsT.to(k.dtype).T, k)
+            dq_partial = tl.dot(dsT.to(k.type.element_ty).T, k)
         tl.atomic_add(
             dq_ptrs,
             dq_partial * sm_scale,
@@ -819,7 +766,6 @@ def _bwd_kernel_fused_atomics_dkdvdq_causal(
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -831,7 +777,6 @@ def _bwd_kernel_fused_atomics_dkdvdq_causal(
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
-    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -994,11 +939,8 @@ def _bwd_kernel_fused_atomics_dkdvdq_causal(
             descale_v = tl.load(
                 descale_v_ptr + batch_idx * stride_descale_v_z + head_k_idx
             )
-            descale_do = tl.load(
-                descale_do_ptr + batch_idx * stride_descale_do_z + head_q_idx
-            )
         else:
-            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+            descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
         # if unaligned start_m is negative, the current N-tile has no block on the
         #   diagonal of causal mask, so everything have no causal mask
@@ -1034,7 +976,6 @@ def _bwd_kernel_fused_atomics_dkdvdq_causal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,  # fp8 descale factors from user
             MASK_BLOCK_M,
             BLOCK_N,  # block dim
             BLOCK_D_MODEL,
@@ -1082,7 +1023,6 @@ def _bwd_kernel_fused_atomics_dkdvdq_causal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,  # fp8 descale factors from user
             BLOCK_M,
             BLOCK_N,  # block dim
             BLOCK_D_MODEL,
@@ -1148,7 +1088,6 @@ def _bwd_kernel_fused_atomics_dkdv_causal(
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1160,7 +1099,6 @@ def _bwd_kernel_fused_atomics_dkdv_causal(
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
-    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1312,11 +1250,8 @@ def _bwd_kernel_fused_atomics_dkdv_causal(
             descale_v = tl.load(
                 descale_v_ptr + batch_idx * stride_descale_v_z + head_k_idx
             )
-            descale_do = tl.load(
-                descale_do_ptr + batch_idx * stride_descale_do_z + head_q_idx
-            )
         else:
-            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+            descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
         # if start_m is negative, the current N-tile has no block on the
         #   diagonal of causal mask, so everything have no causal mask
@@ -1349,7 +1284,6 @@ def _bwd_kernel_fused_atomics_dkdv_causal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,  # fp8 descale factors from user
             MASK_BLOCK_M,
             BLOCK_N,  # block dim
             BLOCK_D_MODEL,
@@ -1392,7 +1326,6 @@ def _bwd_kernel_fused_atomics_dkdv_causal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,  # fp8 descale factors from user
             BLOCK_M,
             BLOCK_N,  # block dim
             BLOCK_D_MODEL,
@@ -1456,7 +1389,6 @@ def _bwd_kernel_fused_atomics_dq_causal(
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1468,7 +1400,6 @@ def _bwd_kernel_fused_atomics_dq_causal(
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
-    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -1587,11 +1518,8 @@ def _bwd_kernel_fused_atomics_dq_causal(
             descale_v = tl.load(
                 descale_v_ptr + batch_idx * stride_descale_v_z + head_k_idx
             )
-            descale_do = tl.load(
-                descale_do_ptr + batch_idx * stride_descale_do_z + head_q_idx
-            )
         else:
-            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+            descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
         dq = tl.zeros([BLOCK_M, BLOCK_D_MODEL_POW2], dtype=tl.float32)
         # Compute dQ for masked (diagonal) blocks.
@@ -1630,7 +1558,6 @@ def _bwd_kernel_fused_atomics_dq_causal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             BLOCK_M,
             MASK_BLOCK_N,
             BLOCK_D_MODEL,
@@ -1674,7 +1601,6 @@ def _bwd_kernel_fused_atomics_dq_causal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             BLOCK_M,
             BLOCK_N,
             BLOCK_D_MODEL,
@@ -1742,7 +1668,6 @@ def _bwd_kernel_fused_atomics_dkdvdq_noncausal(
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1754,7 +1679,6 @@ def _bwd_kernel_fused_atomics_dkdvdq_noncausal(
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
-    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -1852,9 +1776,8 @@ def _bwd_kernel_fused_atomics_dkdvdq_noncausal(
             descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hkid)
             descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
             descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
-            descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
         else:
-            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+            descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
         start_m = 0
         num_steps = tl.cdiv(seqlen_q, BLOCK_M)
@@ -1891,7 +1814,6 @@ def _bwd_kernel_fused_atomics_dkdvdq_noncausal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             BLOCK_M,
             BLOCK_N,
             BLOCK_D_MODEL,
@@ -1956,7 +1878,6 @@ def _bwd_kernel_fused_atomics_dkdv_noncausal(
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1968,7 +1889,6 @@ def _bwd_kernel_fused_atomics_dkdv_noncausal(
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
-    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -2055,9 +1975,8 @@ def _bwd_kernel_fused_atomics_dkdv_noncausal(
             descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hkid)
             descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
             descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
-            descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
         else:
-            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+            descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
         start_m = 0
         num_steps = tl.cdiv(seqlen_q, BLOCK_M)
@@ -2090,7 +2009,6 @@ def _bwd_kernel_fused_atomics_dkdv_noncausal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             BLOCK_M,
             BLOCK_N,
             BLOCK_D_MODEL,
@@ -2153,7 +2071,6 @@ def _bwd_kernel_fused_atomics_dq_noncausal(
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -2165,7 +2082,6 @@ def _bwd_kernel_fused_atomics_dq_noncausal(
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
-    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -2243,9 +2159,8 @@ def _bwd_kernel_fused_atomics_dq_noncausal(
             descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hkid)
             descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
             descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
-            descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
         else:
-            descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+            descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
         start_n = 0
         end_n = seqlen_k
@@ -2282,7 +2197,6 @@ def _bwd_kernel_fused_atomics_dq_noncausal(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             BLOCK_M,
             BLOCK_N,
             BLOCK_D_MODEL,
@@ -2325,10 +2239,8 @@ def _bwd_preprocess(
     stride_delta_b,
     stride_delta_h,
     stride_delta_m,
-    stride_descale_do_z,
     cu_seqlens_q,
     max_seqlen_q,
-    Descale_do,
     PRE_BLOCK: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     ACTUAL_HEAD_DIM_V: tl.constexpr,
@@ -2376,14 +2288,8 @@ def _bwd_preprocess(
     o = tl.load(O + off_o, mask=mask_md, other=0.0)
     do = tl.load(DO + off_do, mask=mask_md, other=0.0)
     # compute and write-back to delta
-    if IS_FP8:
-        off_descale_do = bid * stride_descale_do_z + hid
-        descale_do = tl.load(Descale_do + off_descale_do)
-
-        # NOTE: do is in the fp8 range and o is not in fp8
-        delta = tl.sum(o.to(tl.float32) * (do.to(tl.float32) * descale_do), axis=1)
-    else:
-        delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
+    # NOTE: Both o and do are FP32
+    delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
     off_delta = (
         bid * stride_delta_b
         + hid * stride_delta_h
@@ -2433,7 +2339,6 @@ def _bwd_dkdv_inner(
     descale_q,
     descale_k,
     descale_v,
-    descale_do,  # fp8 descale factors from user
     MASK: tl.constexpr,  # causal masking, only apply to tiles on mask diagonal
     ENABLE_DROPOUT: tl.constexpr,  # activate dropout
     USE_ALIBI: tl.constexpr,
@@ -2540,27 +2445,9 @@ def _bwd_dkdv_inner(
         # Compute dV.
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            if IS_FP8:
-                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(
-                    pT_dropout, FP8_MAX
-                )
-                dv += (
-                    tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)
-                    * descale_p_dropout
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
-            if IS_FP8:
-                scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (
-                    tl.dot((pT * scale_pT).to(do.type.element_ty), do)
-                    * descale_pT
-                    * descale_do
-                )
-            else:
-                dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv += tl.dot(pT.to(do.type.element_ty), do)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -2569,7 +2456,7 @@ def _bwd_dkdv_inner(
         Di = tl.load(D + offs_m * stride_delta_m, mask=mask_m)
         # Compute dP and dS.
         if IS_FP8:
-            dpT = tl.dot(v, tl.trans(do)) * descale_v * descale_do
+            dpT = tl.dot(v, tl.trans(do.to(v.type.element_ty))) * descale_v
         else:
             dpT = tl.dot(v, tl.trans(do))
         if ENABLE_DROPOUT:
@@ -2577,14 +2464,13 @@ def _bwd_dkdv_inner(
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
         if IS_FP8:
-            scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (
-                tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
-                * descale_dsT
-                * descale_q
-            )
+            # Rewrite dk += dsT @ qT.T as dk += (qT @ dsT.T).T
+            # This puts FP8 tensor (qT) on LHS of dot product
+            # Cast the transposed dsT to FP8 to match qT's dtype
+            dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
+            dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk += tl.dot(dsT, tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -2635,7 +2521,6 @@ def _bwd_dq_inner(
     descale_q,
     descale_k,
     descale_v,
-    descale_do,  # fp8 descale factors from user
     MASK: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     USE_ALIBI: tl.constexpr,
@@ -2735,7 +2620,7 @@ def _bwd_dq_inner(
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:
-            dp = tl.dot(do, vT) * descale_do * descale_v
+            dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
         else:
             dp = tl.dot(do, vT)
         if ENABLE_DROPOUT:
@@ -2745,12 +2630,7 @@ def _bwd_dq_inner(
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
-            scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
-            dq += (
-                tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT))
-                * descale_ds
-                * descale_k
-            )
+            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT)) * descale_k
         else:
             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
         # Increment pointers.
@@ -2818,7 +2698,6 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     stride_az,
     stride_ah,
     HQ,
@@ -2837,7 +2716,6 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
     Descale_q,
     Descale_k,
     Descale_v,
-    Descale_do,
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
     BLOCK_M2: tl.constexpr,
@@ -3009,9 +2887,8 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
             else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+                descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
             MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
             # bound the masked operation to q len so it does not have to wast cycles
@@ -3064,7 +2941,6 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,
                 MASK=True,  # causal masking
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
@@ -3125,7 +3001,6 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,
                 MASK=False,  # causal masking
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
@@ -3229,9 +3104,8 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
             else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+                descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
             dq = tl.zeros([BLOCK_M2, HEAD_DIM_QK], dtype=tl.float32)
             dq = _bwd_dq_inner(
@@ -3273,7 +3147,6 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,
                 MASK=True,  #
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
@@ -3329,7 +3202,6 @@ def bwd_kernel_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), b
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,
                 MASK=False,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
@@ -3405,7 +3277,6 @@ def bwd_kernel_noncausal(
     stride_descale_q_z,
     stride_descale_k_z,
     stride_descale_v_z,
-    stride_descale_do_z,
     stride_az,
     stride_ah,
     HQ,
@@ -3424,7 +3295,6 @@ def bwd_kernel_noncausal(
     Descale_q,
     Descale_k,
     Descale_v,
-    Descale_do,
     BLOCK_M1: tl.constexpr,  # 32
     BLOCK_N1: tl.constexpr,  # 128
     BLOCK_M2: tl.constexpr,  # 128
@@ -3554,9 +3424,8 @@ def bwd_kernel_noncausal(
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
             else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+                descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
             # because there is no causal, we always start from the beginning
             start_m = 0
@@ -3598,7 +3467,6 @@ def bwd_kernel_noncausal(
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,  # fp8 descale factors from user
                 MASK=False,  # causal masking
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
@@ -3677,9 +3545,8 @@ def bwd_kernel_noncausal(
                 descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hkid)
                 descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
                 descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
-                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
             else:
-                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+                descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
             # start can only be 0 at minimum
             start_n = 0
@@ -3726,7 +3593,6 @@ def bwd_kernel_noncausal(
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,
                 MASK=False,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
@@ -3782,7 +3648,6 @@ def attention_backward_triton_split_fused_no_atomics_impl(
     descale_k: Optional[torch.Tensor],
     descale_v: Optional[torch.Tensor],
     descale_o: Optional[torch.Tensor],
-    descale_do: Optional[torch.Tensor],
     descale_dq: Optional[torch.Tensor],
     descale_dk: Optional[torch.Tensor],
     descale_dv: Optional[torch.Tensor],
@@ -4003,10 +3868,9 @@ def attention_backward_triton_split_fused_no_atomics_impl(
         FP8_MAX = torch.finfo(q.dtype).max
         
         # Check and create default descale tensors if not provided (for inputs)
-        if (descale_q is None) or (descale_k is None) or (descale_v is None) or (descale_do is None):
+        if (descale_q is None) or (descale_k is None) or (descale_v is None):
             warnings.warn(
-                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0. "
-                "Note: Backward pass does not support proper FP8 descaling yet.",
+                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0.",
                 UserWarning,
             )
             # Create default descale tensors if not provided
@@ -4023,22 +3887,16 @@ def attention_backward_triton_split_fused_no_atomics_impl(
                 descale_v = torch.ones(
                     batch, nheads_k, dtype=torch.float32, device=q.device
                 )
-            if descale_do is None:
-                descale_do = torch.ones(
-                    batch, nheads_q, dtype=torch.float32, device=q.device
-                )
         
         stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
         stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
         stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
-        stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
 
         if DEBUG:
             print(f"FP8 path triggered in bwd.py")
     else:
         FP8_MAX = None
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-            stride_descale_do_z
         ) = None
 
     # alibi setup
@@ -4094,10 +3952,8 @@ def attention_backward_triton_split_fused_no_atomics_impl(
         stride_delta_b,
         stride_delta_h,
         stride_delta_m,
-        stride_descale_do_z,
         cu_seqlens_q,
         max_seqlen_q,
-        descale_do,
         HEAD_DIM_V=HEAD_DIM_V,
         ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
         IS_VARLEN=IS_VARLEN,
@@ -4194,7 +4050,6 @@ def attention_backward_triton_split_fused_no_atomics_impl(
             stride_descale_q_z,
             stride_descale_k_z,
             stride_descale_v_z,
-            stride_descale_do_z,
             stride_az,
             stride_ah,
             nheads_q,
@@ -4213,7 +4068,6 @@ def attention_backward_triton_split_fused_no_atomics_impl(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             HEAD_DIM_QK=HEAD_DIM_QK,
             HEAD_DIM_V=HEAD_DIM_V,
             ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
@@ -4283,7 +4137,6 @@ def attention_backward_triton_split_fused_no_atomics_impl(
             stride_descale_q_z,
             stride_descale_k_z,
             stride_descale_v_z,
-            stride_descale_do_z,
             stride_az,
             stride_ah,
             nheads_q,
@@ -4302,7 +4155,6 @@ def attention_backward_triton_split_fused_no_atomics_impl(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             HEAD_DIM_QK=HEAD_DIM_QK,
             HEAD_DIM_V=HEAD_DIM_V,
             ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
@@ -4346,7 +4198,6 @@ def attention_backward_triton_fused_atomics_impl(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
     fused: bool = False,
     # seqused for FA v3 (currently ignored in this implementation)
     seqused_q: Optional[torch.Tensor] = None,
@@ -4359,8 +4210,7 @@ def attention_backward_triton_fused_atomics_impl(
         # Check and create default descale tensors if not provided
         if (descale_q is None) or (descale_k is None) or (descale_v is None) or (descale_do is None):
             warnings.warn(
-                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0. "
-                "Note: Backward pass does not support proper FP8 descaling yet.",
+                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0.",
                 UserWarning,
             )
             # Determine batch size for creating default descale tensors
@@ -4402,13 +4252,11 @@ def attention_backward_triton_fused_atomics_impl(
     else:
         FP8_MAX = None
         stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-            stride_descale_do_z
         ) = None
         descale_strides = (
             stride_descale_q_z,
             stride_descale_k_z,
             stride_descale_v_z,
-            stride_descale_do_z,
         )
 
     IS_VARLEN = True if cu_seqlens_q is not None else False
@@ -4481,7 +4329,6 @@ def attention_backward_triton_fused_atomics_impl(
         descale_strides[3],
         cu_seqlens_q,
         max_seqlen_q,
-        descale_do,
         BLOCK_M=PRE_BLOCK,
         BLOCK_D_MODEL=head_sz,
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
@@ -4556,7 +4403,6 @@ def attention_backward_triton_fused_atomics_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,
                 NUM_Q_HEADS=num_q_heads,
                 NUM_K_HEADS=num_k_heads,
                 BATCH=batch,
@@ -4601,7 +4447,6 @@ def attention_backward_triton_fused_atomics_impl(
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_do,
                 NUM_Q_HEADS=num_q_heads,
                 NUM_K_HEADS=num_k_heads,
                 BATCH=batch,
@@ -4649,7 +4494,6 @@ def attention_backward_triton_fused_atomics_impl(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
             BLOCK_M=BLOCK_M1,
@@ -4693,7 +4537,6 @@ def attention_backward_triton_fused_atomics_impl(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
             BLOCK_M=BLOCK_M2,
@@ -4739,7 +4582,6 @@ def attention_backward_triton_fused_atomics_impl(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
             BLOCK_M=BLOCK_M1,
@@ -4784,7 +4626,6 @@ def attention_backward_triton_fused_atomics_impl(
             descale_q,
             descale_k,
             descale_v,
-            descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
             BLOCK_M=BLOCK_M2,
@@ -4844,28 +4685,9 @@ def attention_backward_triton_impl(
     if is_fp8([q, k, v]):
         warnings.warn(
             "FP8 tensors detected in backward pass. Backward pass supports FP8 inputs but "
-            "descaling factors will default to 1.0 if not provided.",
+            "descaling factors will default to 1.0.",
             UserWarning,
         )
-        
-        # For FP8 backward, we need dout to be FP8 for the dot products in the kernel
-        # The kernel does: tl.dot(v, tl.trans(do)) which requires matching FP8 dtypes
-        if do.dtype != q.dtype:
-            do_original = do
-            # Cast dout to the same FP8 dtype as q/k/v
-            do = do.to(q.dtype)
-        
-        # For the output gradients (dq, dk, dv), we compute in float32 for precision
-        # and convert back at the end
-        if dq.dtype != torch.float32:
-            dq_original = dq
-            dq = torch.empty(dq.shape, dtype=torch.float32, device=dq.device)
-        if dk.dtype != torch.float32:
-            dk_original = dk
-            dk = torch.empty(dk.shape, dtype=torch.float32, device=dk.device)
-        if dv.dtype != torch.float32:
-            dv_original = dv
-            dv = torch.empty(dv.shape, dtype=torch.float32, device=dv.device)
 
     if mode == "fused_atomics":
         delta = attention_backward_triton_fused_atomics_impl(
@@ -4926,7 +4748,6 @@ def attention_backward_triton_impl(
             None,
             None,
             None,
-            None,
             seqused_q,
             seqused_k,
         )
@@ -4934,14 +4755,5 @@ def attention_backward_triton_impl(
         raise ValueError(
             f"Unknown backward mode '{mode}'. Expected 'fused_atomics' or 'fused_no_atomics'."
         )
-    
-    # Copy float32 gradients back to original FP8 tensors if needed
-    # Note: This conversion happens only once at the end, not in a loop
-    if dq_original is not None:
-        dq_original.copy_(dq.to(dq_original.dtype))
-    if dk_original is not None:
-        dk_original.copy_(dk.to(dk_original.dtype))
-    if dv_original is not None:
-        dv_original.copy_(dv.to(dv_original.dtype))
-    
+
     return delta
