@@ -40,15 +40,6 @@ def get_fwd_configs(autotune: bool):
         "HK",
     ]
 
-    # fallback config
-    if False:
-        configs.append(triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-            num_stages=1,
-            num_warps=4,
-        ))
-        return configs, keys
-
     # get best config for the architecture
     if not autotune:
         arch = get_arch()

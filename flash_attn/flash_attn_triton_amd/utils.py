@@ -50,7 +50,7 @@ DEBUG_TRITON_DETAIL = (
 )
 if USE_TRITON_ROCM:  # TODO remove this
     random.seed(42)
-BWD_MODE = os.environ.get("BWD_MODE", "fused_no_atomics").lower()
+BWD_MODE = os.environ.get("BWD_MODE", "fused").lower()
 DROPOUT_USE_PYTORCH = False
 DROPOUT_DUMP = False
 USE_EXP2 = True
