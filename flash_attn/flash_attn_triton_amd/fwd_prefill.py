@@ -1742,11 +1742,12 @@ def attention_forward_prefill_triton_impl(
     IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
-        rec = get_recommended_fp8_dtype(q)
-        if q.dtype != rec:
+        rec_dtype = get_recommended_fp8_dtype(q)
+        if q.dtype != rec_dtype or k.dtype != rec_dtype or v.dtype != rec_dtype:
+            arch = get_arch()
             warnings.warn(
-            f"FP8 dtype mismatch: received {q.dtype}, expected recommended {rec} for this architecture.",
-            UserWarning,
+                f"Use {rec_dtype} data type on {arch}. Got q: {q.dtype}, k: {k.dtype}, v: {v.dtype}",
+                UserWarning,
             )
 
         if (q_descale is None) or (k_descale is None) or (v_descale is None):

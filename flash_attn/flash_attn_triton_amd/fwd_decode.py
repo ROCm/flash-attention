@@ -7,6 +7,7 @@ from typing import Literal, Optional
 from .utils import (
     DEBUG,
     AUTOTUNE,
+    get_arch,
     get_padded_headsize,
     get_shape_and_strides_from_layout,
     apply_rotary,
@@ -1123,12 +1124,12 @@ def attention_forward_decode_triton_impl(
     # FP8 support
     IS_FP8 = is_fp8([q, k_cache, v_cache])
     if IS_FP8:
-        rec = get_recommended_fp8_dtype(q)
-        if q.dtype != rec:
+        rec_dtype = get_recommended_fp8_dtype(q)
+        if q.dtype != rec_dtype or k_cache.dtype != rec_dtype or v_cache.dtype != rec_dtype:
+            arch = get_arch()
             warnings.warn(
-                f"FP8 dtype mismatch: received {q.dtype}, expected recommended {rec}. "
-                "Convert to the recommended FP8 dtype before calling (handled in interface).",
-                UserWarning,
+            f"Use {rec_dtype} data type on {arch}. Got q: {q.dtype}, k: {k_cache.dtype}, v: {v_cache.dtype}",
+            UserWarning,
             )
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
             warnings.warn(
