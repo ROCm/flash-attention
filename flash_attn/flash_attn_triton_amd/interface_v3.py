@@ -269,64 +269,6 @@ def fwd(
     else:
         out = out.zero_()
 
-    if is_fp8([q, k, v]):
-        CAST_TO_REC = str(os.getenv("CAST_TO_REC", "0")).lower() in ("1", "true", "yes", "on")
-        if CAST_TO_REC:
-            # check recommended dtype
-            rec = get_recommended_fp8_dtype(q)
-            if rec != q.dtype:
-                warnings.warn(
-                    f"Casting q,k,v from {q.dtype} to recommended {rec} for this architecture.",
-                    UserWarning,
-                )
-                q = q.to(rec)
-                k = k.to(rec)
-                v = v.to(rec)
-            if k_new is not None and is_fp8(k_new):
-                rec_kn = get_recommended_fp8_dtype(k_new)
-                if rec_kn != k_new.dtype:
-                    k_new = k_new.to(rec_kn)
-            if v_new is not None and is_fp8(v_new):
-                rec_vn = get_recommended_fp8_dtype(v_new)
-                if rec_vn != v_new.dtype:
-                    v_new = v_new.to(rec_vn)
-
-
-        if (q_descale is None) or (k_descale is None) or (v_descale is None):
-            warnings.warn(
-                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
-                UserWarning,
-            )
-        else:
-            # Enforce exact expected shapes; no reshaping or normalization.
-            if layout == "bshd":
-                expected_batch = q.shape[0]
-                expected_q_heads = q.shape[2]
-                expected_kv_heads = k.shape[2]
-            else:  # thd layout
-                expected_batch = (
-                    (len(cu_seqlens_q_local) - 1)
-                    if cu_seqlens_q_local is not None
-                    else 1
-                )
-                expected_q_heads = q.shape[1]
-                expected_kv_heads = k.shape[1]
-
-            assert (
-                q_descale.dim() == 2
-                and q_descale.shape[0] == expected_batch
-                and q_descale.shape[1] == expected_kv_heads
-            ), f"q_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(q_descale.shape)}"
-            assert (
-                k_descale.dim() == 2
-                and k_descale.shape[0] == expected_batch
-                and k_descale.shape[1] == expected_kv_heads
-            ), f"k_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(k_descale.shape)}"
-            assert (
-                v_descale.dim() == 2
-                and v_descale.shape[0] == expected_batch
-                and v_descale.shape[1] == expected_kv_heads
-            ), f"v_descale expected shape ({expected_batch}, {expected_kv_heads}) got {tuple(v_descale.shape)}"
 
     # Handle causal mask
     causal_flag = bool(causal)

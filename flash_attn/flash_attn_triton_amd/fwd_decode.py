@@ -1,4 +1,5 @@
 import os
+import warnings
 import torch
 import triton
 import triton.language as tl
@@ -1122,17 +1123,14 @@ def attention_forward_decode_triton_impl(
     # FP8 support
     IS_FP8 = is_fp8([q, k_cache, v_cache])
     if IS_FP8:
-        CAST_TO_REC = str(os.getenv("CAST_TO_REC", "0")).lower() in ("1", "true", "yes", "on")
-        if CAST_TO_REC:
-            rec = get_recommended_fp8_dtype(q)
-            if q.dtype != rec:
-                raise TypeError(
-                    f"FP8 dtype mismatch: received {q.dtype}, expected recommended {rec}. "
-                    "Convert to the recommended FP8 dtype before calling (handled in interface)."
-                )
+        rec = get_recommended_fp8_dtype(q)
+        if q.dtype != rec:
+            warnings.warn(
+                f"FP8 dtype mismatch: received {q.dtype}, expected recommended {rec}. "
+                "Convert to the recommended FP8 dtype before calling (handled in interface).",
+                UserWarning,
+            )
         if (q_descale is None) or (k_descale is None) or (v_descale is None):
-            import warnings
-
             warnings.warn(
                 "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
                 UserWarning,
@@ -1150,6 +1148,23 @@ def attention_forward_decode_triton_impl(
                 v_descale = torch.ones(
                     batch_size, nheads_vc, dtype=torch.float32, device=q.device
                 )
+        else:
+            # Enforce exact expected shapes; no reshaping or normalization.
+            assert (
+                q_descale.dim() == 2
+                and q_descale.shape[0] == batch_size
+                and q_descale.shape[1] == nheads_kc
+            ), f"q_descale expected shape ({batch_size}, {nheads_kc}) got {tuple(q_descale.shape)}"
+            assert (
+                k_descale.dim() == 2
+                and k_descale.shape[0] == batch_size
+                and k_descale.shape[1] == nheads_kc
+            ), f"k_descale expected shape ({batch_size}, {nheads_kc}) got {tuple(k_descale.shape)}"
+            assert (
+                v_descale.dim() == 2
+                and v_descale.shape[0] == batch_size
+                and v_descale.shape[1] == nheads_kc
+            ), f"v_descale expected shape ({batch_size}, {nheads_kc}) got {tuple(v_descale.shape)}"
         stride_q_descale_z, stride_q_descale_h = q_descale.stride()
         stride_k_descale_z, stride_k_descale_h = k_descale.stride()
         stride_v_descale_z, stride_v_descale_h = v_descale.stride()

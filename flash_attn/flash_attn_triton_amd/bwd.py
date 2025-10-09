@@ -539,7 +539,7 @@ def _bwd_fused_atomics_dkdv_inner(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT, tl.trans(qT))
+            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
 
         # increment pointers
         curr_m += step_m
@@ -723,7 +723,7 @@ def _bwd_fused_atomics_dkdvdq_inner(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT, tl.trans(qT))
+            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
 
         # We can compute the dq_partial here and do a atomic add to the correct memory location
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
@@ -2494,7 +2494,7 @@ def _bwd_dkdv_inner(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT, tl.trans(qT))
+            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -3924,8 +3924,7 @@ def attention_backward_triton_split_fused_no_atomics_impl(
             print(f"FP8 path triggered in bwd.py")
     else:
         FP8_MAX = None
-        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-        ) = None
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = None
 
     # alibi setup
     use_alibi, (stride_az, stride_ah) = (
@@ -4279,8 +4278,7 @@ def attention_backward_triton_fused_atomics_impl(
             print(f"FP8 path triggered in bwd.py (fused_atomics)")
     else:
         FP8_MAX = None
-        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-        ) = None
+        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = None
         descale_strides = (
             stride_descale_q_z,
             stride_descale_k_z,
