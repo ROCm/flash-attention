@@ -4,7 +4,15 @@ from typing import Optional, Union
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
-from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET, SHAPE_EXPECTATIONS, round_multiple
+from .utils import (
+    DEBUG,
+    USE_EXP2,
+    BWD_MODE,
+    PHILOX_SEED,
+    PHILOX_OFFSET,
+    SHAPE_EXPECTATIONS,
+    round_multiple,
+)
 
 
 def fwd(
@@ -86,7 +94,12 @@ def fwd(
         )
         if return_softmax:
             sd_mask = torch.zeros(
-                (batch, nheads_q, round_multiple(max_seqlen_q, 128), round_multiple(max_seqlen_k, 128)),
+                (
+                    batch,
+                    nheads_q,
+                    round_multiple(max_seqlen_q, 128),
+                    round_multiple(max_seqlen_k, 128),
+                ),
                 device=q.device,
                 dtype=torch.float32,
             )
@@ -254,7 +267,9 @@ def bwd(
             dtype=torch.float32,
         )
     else:
-        delta = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        delta = torch.zeros(
+            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+        )
 
     # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
     if rng_state is not None:
@@ -490,8 +505,12 @@ def varlen_fwd(
         ), "[varlen_fwd] return_softmax=True but sd_mask is None"
         assert sd_mask.dim() == 4, f"[varlen_fwd] sd_mask dim {sd_mask.dim()} != 4"
         batch = len(cu_seqlens_q) - 1
-        assert sd_mask.shape[0] == batch, f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {batch}"
-        assert sd_mask.shape[1] == q.shape[1], f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
+        assert (
+            sd_mask.shape[0] == batch
+        ), f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {batch}"
+        assert (
+            sd_mask.shape[1] == q.shape[1]
+        ), f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
         if SHAPE_EXPECTATIONS == "rounded":
             expected_sq = round_multiple(max_seqlen_q, 128)
             expected_sk = round_multiple(max_seqlen_k, 128)
@@ -739,7 +758,9 @@ def fwd_kvcache(
     batch, seqlen_q, nheads_q, _ = q.shape
 
     # Create softmax_lse tensor - decode always uses exact shape (B, Hq, Sq)
-    softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+    softmax_lse = torch.zeros(
+        (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+    )
 
     if alibi_slopes is not None:
         if alibi_slopes.dim() == 1:

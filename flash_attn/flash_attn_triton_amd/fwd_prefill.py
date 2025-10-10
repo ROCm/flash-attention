@@ -44,56 +44,101 @@ def get_fwd_configs(autotune: bool):
     if not autotune:
         arch = get_arch()
         if arch == "gfx950":
-            configs.append(triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 128, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                num_stages=1,
-                num_warps=4,
-            ))
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 128,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                )
+            )
         elif arch == "gfx942":
             if get_cu_count() < 304:
                 configs.extend(
                     [
                         # best fp8 config
                         triton.Config(
-                            {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                            {
+                                "BLOCK_M": 128,
+                                "BLOCK_N": 64,
+                                "waves_per_eu": 2,
+                                "PRE_LOAD_V": False,
+                            },
                             num_stages=1,
                             num_warps=4,
                         ),
                         # best f16 config
                         triton.Config(
-                            {"BLOCK_M": 128, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                            {
+                                "BLOCK_M": 128,
+                                "BLOCK_N": 32,
+                                "waves_per_eu": 2,
+                                "PRE_LOAD_V": False,
+                            },
                             num_stages=2,
                             num_warps=4,
-                        )
+                        ),
                     ]
                 )
             else:
-                configs.append(triton.Config(
-                    {"BLOCK_M": 128, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                configs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "waves_per_eu": 2,
+                            "PRE_LOAD_V": False,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    )
+                )
+        elif arch in (
+            "gfx1030",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1200",
+            "gfx1201",
+        ):  # RDNA architectures
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 32,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=2,
+                )
+            )
+        else:
+            configs.append(
+                triton.Config(
+                    {
+                        "BLOCK_M": 64,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
                     num_stages=1,
                     num_warps=4,
-                ))
-        elif arch in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"):  # RDNA architectures
-            configs.append(triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                num_stages=1,
-                num_warps=2,
-            ))
-        else:
-            configs.append(triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                num_stages=1,
-                num_warps=4,
-            ))
+                )
+            )
 
         return configs, keys
 
     # ===================== Autotune Sweep =====================
     BLOCK_M_OPTIONS = [128, 64, 32]
     BLOCK_N_OPTIONS = [128, 64, 32]
-    NUM_WARPS_OPTIONS = [2, 4, 8]         
-    NUM_STAGES_OPTIONS = [1, 2]           
-    WAVES_PER_EU_OPTIONS = [4, 2, 1] 
+    NUM_WARPS_OPTIONS = [2, 4, 8]
+    NUM_STAGES_OPTIONS = [1, 2]
+    WAVES_PER_EU_OPTIONS = [4, 2, 1]
     PRE_LOAD_V_OPTIONS = [False]
     for bm in BLOCK_M_OPTIONS:
         for bn in BLOCK_N_OPTIONS:
@@ -115,6 +160,7 @@ def get_fwd_configs(autotune: bool):
                             )
 
     return configs, keys
+
 
 fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = get_fwd_configs(AUTOTUNE)
 
@@ -1611,10 +1657,18 @@ def attention_forward_prefill_triton_impl(
         head_size_qk = head_size_q
 
         # Assert softmax_lse tensor is large enough
-        assert softmax_lse.shape[0] >= nheads_q, f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= nheads_q={nheads_q}"
-        assert softmax_lse.shape[1] >= total_seqlen_q, f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= total_seqlen_q={total_seqlen_q}"
-        assert softmax_lse.dtype == torch.float32, f"softmax_lse must be float32, got {softmax_lse.dtype}"
-        assert softmax_lse.device == q.device, f"softmax_lse must be on same device as q"
+        assert (
+            softmax_lse.shape[0] >= nheads_q
+        ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= nheads_q={nheads_q}"
+        assert (
+            softmax_lse.shape[1] >= total_seqlen_q
+        ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= total_seqlen_q={total_seqlen_q}"
+        assert (
+            softmax_lse.dtype == torch.float32
+        ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
+        assert (
+            softmax_lse.device == q.device
+        ), f"softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1688,11 +1742,21 @@ def attention_forward_prefill_triton_impl(
         max_seqlens_k = seqlen_k
 
         # Assert softmax_lse tensor is large enough
-        assert softmax_lse.shape[0] >= batch, f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= batch={batch}"
-        assert softmax_lse.shape[1] >= nheads_q, f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= nheads_q={nheads_q}"
-        assert softmax_lse.shape[2] >= seqlen_q, f"softmax_lse.shape[2]={softmax_lse.shape[2]} must be >= seqlen_q={seqlen_q}"
-        assert softmax_lse.dtype == torch.float32, f"softmax_lse must be float32, got {softmax_lse.dtype}"
-        assert softmax_lse.device == q.device, f"softmax_lse must be on same device as q"
+        assert (
+            softmax_lse.shape[0] >= batch
+        ), f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= batch={batch}"
+        assert (
+            softmax_lse.shape[1] >= nheads_q
+        ), f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= nheads_q={nheads_q}"
+        assert (
+            softmax_lse.shape[2] >= seqlen_q
+        ), f"softmax_lse.shape[2]={softmax_lse.shape[2]} must be >= seqlen_q={seqlen_q}"
+        assert (
+            softmax_lse.dtype == torch.float32
+        ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
+        assert (
+            softmax_lse.device == q.device
+        ), f"softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1834,15 +1898,27 @@ def attention_forward_prefill_triton_impl(
     # only. This return holds no useful output aside from debugging.
     NEEDS_SDMASK = (dropout_p > 0.0) or return_softmax
     if NEEDS_SDMASK:
-        assert sd_mask is not None, "sd_mask must be provided when return_softmax=True or dropout_p > 0"
+        assert (
+            sd_mask is not None
+        ), "sd_mask must be provided when return_softmax=True or dropout_p > 0"
         # Assert sd_mask tensor is large enough
-        assert sd_mask.shape[0] >= batch, f"sd_mask.shape[0]={sd_mask.shape[0]} must be >= batch={batch}"
-        assert sd_mask.shape[1] >= nheads_q, f"sd_mask.shape[1]={sd_mask.shape[1]} must be >= nheads_q={nheads_q}"
-        assert sd_mask.shape[2] >= max_seqlens_q, f"sd_mask.shape[2]={sd_mask.shape[2]} must be >= max_seqlens_q={max_seqlens_q}"
-        assert sd_mask.shape[3] >= max_seqlens_k, f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
-        assert sd_mask.dtype == torch.float32, f"sd_mask must be float32, got {sd_mask.dtype}"
+        assert (
+            sd_mask.shape[0] >= batch
+        ), f"sd_mask.shape[0]={sd_mask.shape[0]} must be >= batch={batch}"
+        assert (
+            sd_mask.shape[1] >= nheads_q
+        ), f"sd_mask.shape[1]={sd_mask.shape[1]} must be >= nheads_q={nheads_q}"
+        assert (
+            sd_mask.shape[2] >= max_seqlens_q
+        ), f"sd_mask.shape[2]={sd_mask.shape[2]} must be >= max_seqlens_q={max_seqlens_q}"
+        assert (
+            sd_mask.shape[3] >= max_seqlens_k
+        ), f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
+        assert (
+            sd_mask.dtype == torch.float32
+        ), f"sd_mask must be float32, got {sd_mask.dtype}"
         assert sd_mask.device == q.device, f"sd_mask must be on same device as q"
-        
+
         if DROPOUT_USE_PYTORCH:
             dropout_mask = create_dropout_mask(
                 dropout_p,

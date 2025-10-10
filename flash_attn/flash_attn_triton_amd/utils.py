@@ -555,6 +555,7 @@ def generate_varlen_kv_packed(
         x.requires_grad_()
         return x, cu_seqlens, max_seqlen
 
+
 # -------------------------------
 # Alibi
 # -------------------------------
@@ -608,7 +609,6 @@ def is_dtype_fp8(dtype) -> bool:
     return True
 
 
-
 _RECOMMENDED_FP8_REPLACEMENTS = {
     "gfx942": {
         torch.float8_e4m3fn: torch.float8_e4m3fnuz,
@@ -616,12 +616,14 @@ _RECOMMENDED_FP8_REPLACEMENTS = {
     },
 }
 
+
 def get_recommended_fp8_dtype(x):
     dtype = x.dtype if isinstance(x, torch.Tensor) else x
     if not is_dtype_fp8(dtype):
         return dtype
     arch = get_arch()
     return _RECOMMENDED_FP8_REPLACEMENTS.get(arch, {}).get(dtype, dtype)
+
 
 def is_fp8(x) -> bool:
     """Return whether tensor(s) use FP8.
@@ -1491,9 +1493,13 @@ def is_hip():
 def get_arch():
     return triton.runtime.driver.active.get_current_target().arch
 
+
 @functools.cache
 def get_cu_count():
-    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
 
 @functools.cache
 def is_cdna():

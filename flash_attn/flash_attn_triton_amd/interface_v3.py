@@ -64,10 +64,26 @@ def fwd(
         print("q:", q.dtype if q is not None else None, q.shape)
         print("k:", k.dtype if k is not None else None, k.shape)
         print("v:", v.dtype if v is not None else None, v.shape)
-        print("k_new:", k_new.dtype if k_new is not None else None, k_new.shape if k_new is not None else None)
-        print("v_new:", v_new.dtype if v_new is not None else None, v_new.shape if v_new is not None else None)
-        print("qv:", qv.dtype if qv is not None else None, qv.shape if qv is not None else None)
-        print("out:", out.dtype if out is not None else None, out.shape if out is not None else None)
+        print(
+            "k_new:",
+            k_new.dtype if k_new is not None else None,
+            k_new.shape if k_new is not None else None,
+        )
+        print(
+            "v_new:",
+            v_new.dtype if v_new is not None else None,
+            v_new.shape if v_new is not None else None,
+        )
+        print(
+            "qv:",
+            qv.dtype if qv is not None else None,
+            qv.shape if qv is not None else None,
+        )
+        print(
+            "out:",
+            out.dtype if out is not None else None,
+            out.shape if out is not None else None,
+        )
         print(
             "cu_seqlens_q:",
             cu_seqlens_q,
@@ -120,13 +136,19 @@ def fwd(
             seqlens_rotary.shape if seqlens_rotary is not None else None,
         )
         print(
-            "q_descale:", q_descale.dtype if q_descale is not None else None, q_descale.shape if q_descale is not None else None
+            "q_descale:",
+            q_descale.dtype if q_descale is not None else None,
+            q_descale.shape if q_descale is not None else None,
         )
         print(
-            "k_descale:", k_descale.dtype if k_descale is not None else None, k_descale.shape if k_descale is not None else None
+            "k_descale:",
+            k_descale.dtype if k_descale is not None else None,
+            k_descale.shape if k_descale is not None else None,
         )
         print(
-            "v_descale:", v_descale.dtype if v_descale is not None else None, v_descale.shape if v_descale is not None else None
+            "v_descale:",
+            v_descale.dtype if v_descale is not None else None,
+            v_descale.shape if v_descale is not None else None,
         )
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
@@ -269,7 +291,6 @@ def fwd(
     else:
         out = out.zero_()
 
-
     # Handle causal mask
     causal_flag = bool(causal)
 
@@ -294,7 +315,9 @@ def fwd(
 
         # Create softmax_lse tensor for decode - always exact shape (B, Hq, Sq)
         batch, seqlen_q, nheads_q, _ = q.shape
-        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        softmax_lse = torch.zeros(
+            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+        )
 
         attention_forward_decode_triton_impl(
             q,
@@ -324,20 +347,24 @@ def fwd(
     else:
         if DEBUG:
             print("Using Prefill Triton implementation")
-        
+
         # Create softmax_lse tensor - FA3 always uses exact shapes
         if layout == "thd":
             # varlen: (Hq, Total_Q)
             total_q, nheads_q, _ = q.shape
-            softmax_lse = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
+            softmax_lse = torch.zeros(
+                (nheads_q, total_q), device=q.device, dtype=torch.float32
+            )
         else:
             # bshd: (B, Hq, Sq)
             batch, seqlen_q, nheads_q, _ = q.shape
-            softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
-        
+            softmax_lse = torch.zeros(
+                (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+            )
+
         # sd_mask is not returned in v3 interface
         sd_mask = None
-        
+
         attention_forward_prefill_triton_impl(
             q,
             k,
@@ -374,25 +401,49 @@ def fwd(
 
     if DEBUG:
         print("interface_fa_v3.py::fwd outputs")
-        print("out:", out.dtype if out is not None else None, out.shape if out is not None else None)
-        print("softmax_lse:", softmax_lse.dtype if softmax_lse is not None else None, softmax_lse.shape if softmax_lse is not None else None)
+        print(
+            "out:",
+            out.dtype if out is not None else None,
+            out.shape if out is not None else None,
+        )
+        print(
+            "softmax_lse:",
+            softmax_lse.dtype if softmax_lse is not None else None,
+            softmax_lse.shape if softmax_lse is not None else None,
+        )
 
     # --- Assertions (FA3 always expects exact shapes) ---
     # out: same shape as q except last dim is v's head_dim
     if layout == "thd":
         # varlen: (Total_Q, Hq, Dv)
-        assert out.shape[0] == q.shape[0], f"[fwd_v3] out.shape[0] {out.shape[0]} != q.shape[0] {q.shape[0]}"
-        assert out.shape[1] == q.shape[1], f"[fwd_v3] out.shape[1] {out.shape[1]} != q.shape[1] {q.shape[1]}"
-        assert out.shape[2] == v.shape[-1], f"[fwd_v3] out.shape[2] {out.shape[2]} != v.shape[-1] {v.shape[-1]}"
+        assert (
+            out.shape[0] == q.shape[0]
+        ), f"[fwd_v3] out.shape[0] {out.shape[0]} != q.shape[0] {q.shape[0]}"
+        assert (
+            out.shape[1] == q.shape[1]
+        ), f"[fwd_v3] out.shape[1] {out.shape[1]} != q.shape[1] {q.shape[1]}"
+        assert (
+            out.shape[2] == v.shape[-1]
+        ), f"[fwd_v3] out.shape[2] {out.shape[2]} != v.shape[-1] {v.shape[-1]}"
     else:
         # bshd: (B, Sq, Hq, Dv)
-        assert out.shape[0] == q.shape[0], f"[fwd_v3] out.shape[0] {out.shape[0]} != q.shape[0] {q.shape[0]}"
-        assert out.shape[1] == q.shape[1], f"[fwd_v3] out.shape[1] {out.shape[1]} != q.shape[1] {q.shape[1]}"
-        assert out.shape[2] == q.shape[2], f"[fwd_v3] out.shape[2] {out.shape[2]} != q.shape[2] {q.shape[2]}"
-        assert out.shape[3] == v.shape[-1], f"[fwd_v3] out.shape[3] {out.shape[3]} != v.shape[-1] {v.shape[-1]}"
-    
+        assert (
+            out.shape[0] == q.shape[0]
+        ), f"[fwd_v3] out.shape[0] {out.shape[0]} != q.shape[0] {q.shape[0]}"
+        assert (
+            out.shape[1] == q.shape[1]
+        ), f"[fwd_v3] out.shape[1] {out.shape[1]} != q.shape[1] {q.shape[1]}"
+        assert (
+            out.shape[2] == q.shape[2]
+        ), f"[fwd_v3] out.shape[2] {out.shape[2]} != q.shape[2] {q.shape[2]}"
+        assert (
+            out.shape[3] == v.shape[-1]
+        ), f"[fwd_v3] out.shape[3] {out.shape[3]} != v.shape[-1] {v.shape[-1]}"
+
     # softmax_lse dtype
-    assert softmax_lse.dtype == torch.float32, f"[fwd_v3] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    assert (
+        softmax_lse.dtype == torch.float32
+    ), f"[fwd_v3] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
     # softmax_lse shape depends on layout
     if layout == "thd":
         # varlen: (Hq, Total_Q)
@@ -400,7 +451,9 @@ def fwd(
     else:
         # bshd: (B, Hq, Sq)
         expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
-    assert softmax_lse.shape == expected_lse_shape, f"[fwd_v3] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    assert (
+        softmax_lse.shape == expected_lse_shape
+    ), f"[fwd_v3] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
 
     # Return format compatible with v3
     # V3 returns (out, softmax_lse, *rest) where rest can be empty or contain additional outputs
@@ -440,15 +493,45 @@ def bwd(
     if DEBUG:
         print()
         print("interface_fa_v3.py::bwd inputs")
-        print("dout:", dout.dtype if dout is not None else None, dout.shape if dout is not None else None)
-        print("q:", q.dtype if q is not None else None, q.shape if q is not None else None)
-        print("k:", k.dtype if k is not None else None, k.shape if k is not None else None)
-        print("v:", v.dtype if v is not None else None, v.shape if v is not None else None)
-        print("out:", out.dtype if out is not None else None, out.shape if out is not None else None)
-        print("softmax_lse:", softmax_lse.dtype if softmax_lse is not None else None, softmax_lse.shape if softmax_lse is not None else None)
-        print("dq:", dq.dtype if dq is not None else None, dq.shape if dq is not None else None)
-        print("dk:", dk.dtype if dk is not None else None, dk.shape if dk is not None else None)
-        print("dv:", dv.dtype if dv is not None else None, dv.shape if dv is not None else None)
+        print(
+            "dout:",
+            dout.dtype if dout is not None else None,
+            dout.shape if dout is not None else None,
+        )
+        print(
+            "q:", q.dtype if q is not None else None, q.shape if q is not None else None
+        )
+        print(
+            "k:", k.dtype if k is not None else None, k.shape if k is not None else None
+        )
+        print(
+            "v:", v.dtype if v is not None else None, v.shape if v is not None else None
+        )
+        print(
+            "out:",
+            out.dtype if out is not None else None,
+            out.shape if out is not None else None,
+        )
+        print(
+            "softmax_lse:",
+            softmax_lse.dtype if softmax_lse is not None else None,
+            softmax_lse.shape if softmax_lse is not None else None,
+        )
+        print(
+            "dq:",
+            dq.dtype if dq is not None else None,
+            dq.shape if dq is not None else None,
+        )
+        print(
+            "dk:",
+            dk.dtype if dk is not None else None,
+            dk.shape if dk is not None else None,
+        )
+        print(
+            "dv:",
+            dv.dtype if dv is not None else None,
+            dv.shape if dv is not None else None,
+        )
         print(
             "cu_seqlens_q:",
             cu_seqlens_q,
@@ -511,7 +594,9 @@ def bwd(
         max_seqlen_q = q.shape[1] if max_seqlen_q is None else max_seqlen_q
         max_seqlen_k = k.shape[1] if max_seqlen_k is None else max_seqlen_k
         # Create delta tensor - bshd: (B, Hq, Sq)
-        delta = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        delta = torch.zeros(
+            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+        )
 
     # V3 backward doesn't have dropout or alibi slopes
     dropout_p = 0.0
@@ -551,10 +636,26 @@ def bwd(
 
     if DEBUG:
         print("interface_fa_v3.py::bwd outputs")
-        print("dq:", dq.dtype if dq is not None else None, dq.shape if dq is not None else None)
-        print("dk:", dk.dtype if dk is not None else None, dk.shape if dk is not None else None)
-        print("dv:", dv.dtype if dv is not None else None, dv.shape if dv is not None else None)
-        print("delta:", delta.dtype if delta is not None else None, delta.shape if delta is not None else None)
+        print(
+            "dq:",
+            dq.dtype if dq is not None else None,
+            dq.shape if dq is not None else None,
+        )
+        print(
+            "dk:",
+            dk.dtype if dk is not None else None,
+            dk.shape if dk is not None else None,
+        )
+        print(
+            "dv:",
+            dv.dtype if dv is not None else None,
+            dv.shape if dv is not None else None,
+        )
+        print(
+            "delta:",
+            delta.dtype if delta is not None else None,
+            delta.shape if delta is not None else None,
+        )
 
     # --- Assertions (FA3 always expects exact shapes) ---
     # Gradients should match input shapes
@@ -562,14 +663,18 @@ def bwd(
     assert dk.shape == k.shape, f"[bwd_v3] dk shape {dk.shape} != k shape {k.shape}"
     assert dv.shape == v.shape, f"[bwd_v3] dv shape {dv.shape} != v shape {v.shape}"
     # delta (softmax_d) should match softmax_lse shape
-    assert delta.dtype == torch.float32, f"[bwd_v3] delta dtype {delta.dtype} != torch.float32"
+    assert (
+        delta.dtype == torch.float32
+    ), f"[bwd_v3] delta dtype {delta.dtype} != torch.float32"
     if layout == "thd":
         # varlen: (Hq, Total_Q)
         expected_delta_shape = (q.shape[1], q.shape[0])
     else:
         # bshd: (B, Hq, Sq)
         expected_delta_shape = (q.shape[0], q.shape[2], q.shape[1])
-    assert delta.shape == expected_delta_shape, f"[bwd_v3] delta shape {delta.shape} != {expected_delta_shape}"
+    assert (
+        delta.shape == expected_delta_shape
+    ), f"[bwd_v3] delta shape {delta.shape} != {expected_delta_shape}"
 
     # V3 expects (dq, dk, dv, softmax_d, *rest)
     # delta is the softmax_d in this case
