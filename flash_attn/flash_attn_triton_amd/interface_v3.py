@@ -292,13 +292,18 @@ def fwd(
                 f"Using Decode Triton implementation (cache_seqlens={seqused_k is not None}, k_new={k_new is not None}, v_new={v_new is not None}, kv_batch_idx={kv_batch_idx is not None})"
             )
 
-        softmax_lse = attention_forward_decode_triton_impl(
+        # Create softmax_lse tensor for decode - always exact shape (B, Hq, Sq)
+        batch, seqlen_q, nheads_q, _ = q.shape
+        softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+
+        attention_forward_decode_triton_impl(
             q,
             k,
             v,
             k_new,
             v_new,
             out,
+            softmax_lse,
             softmax_scale,
             causal_flag,
             window_size_left,
@@ -319,11 +324,27 @@ def fwd(
     else:
         if DEBUG:
             print("Using Prefill Triton implementation")
-        softmax_lse, _ = attention_forward_prefill_triton_impl(
+        
+        # Create softmax_lse tensor - FA3 always uses exact shapes
+        if layout == "thd":
+            # varlen: (Hq, Total_Q)
+            total_q, nheads_q, _ = q.shape
+            softmax_lse = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
+        else:
+            # bshd: (B, Hq, Sq)
+            batch, seqlen_q, nheads_q, _ = q.shape
+            softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        
+        # sd_mask is not returned in v3 interface
+        sd_mask = None
+        
+        attention_forward_prefill_triton_impl(
             q,
             k,
             v,
             out,
+            softmax_lse,
+            sd_mask,
             softmax_scale,
             alibi_slopes,
             causal_flag,
@@ -355,6 +376,31 @@ def fwd(
         print("interface_fa_v3.py::fwd outputs")
         print("out:", out.dtype if out is not None else None, out.shape if out is not None else None)
         print("softmax_lse:", softmax_lse.dtype if softmax_lse is not None else None, softmax_lse.shape if softmax_lse is not None else None)
+
+    # --- Assertions (FA3 always expects exact shapes) ---
+    # out: same shape as q except last dim is v's head_dim
+    if layout == "thd":
+        # varlen: (Total_Q, Hq, Dv)
+        assert out.shape[0] == q.shape[0], f"[fwd_v3] out.shape[0] {out.shape[0]} != q.shape[0] {q.shape[0]}"
+        assert out.shape[1] == q.shape[1], f"[fwd_v3] out.shape[1] {out.shape[1]} != q.shape[1] {q.shape[1]}"
+        assert out.shape[2] == v.shape[-1], f"[fwd_v3] out.shape[2] {out.shape[2]} != v.shape[-1] {v.shape[-1]}"
+    else:
+        # bshd: (B, Sq, Hq, Dv)
+        assert out.shape[0] == q.shape[0], f"[fwd_v3] out.shape[0] {out.shape[0]} != q.shape[0] {q.shape[0]}"
+        assert out.shape[1] == q.shape[1], f"[fwd_v3] out.shape[1] {out.shape[1]} != q.shape[1] {q.shape[1]}"
+        assert out.shape[2] == q.shape[2], f"[fwd_v3] out.shape[2] {out.shape[2]} != q.shape[2] {q.shape[2]}"
+        assert out.shape[3] == v.shape[-1], f"[fwd_v3] out.shape[3] {out.shape[3]} != v.shape[-1] {v.shape[-1]}"
+    
+    # softmax_lse dtype
+    assert softmax_lse.dtype == torch.float32, f"[fwd_v3] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    # softmax_lse shape depends on layout
+    if layout == "thd":
+        # varlen: (Hq, Total_Q)
+        expected_lse_shape = (q.shape[1], q.shape[0])
+    else:
+        # bshd: (B, Hq, Sq)
+        expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert softmax_lse.shape == expected_lse_shape, f"[fwd_v3] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
 
     # Return format compatible with v3
     # V3 returns (out, softmax_lse, *rest) where rest can be empty or contain additional outputs
@@ -455,13 +501,17 @@ def bwd(
         # Variable length sequence mode
         layout = "thd"
         batch = len(cu_seqlens_q) - 1
-        _, nheads_q, _ = q.shape
+        total_q, nheads_q, _ = q.shape
+        # Create delta tensor - varlen: (Hq, Total_Q)
+        delta = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
     else:
         # Regular batch mode
         layout = "bshd"
-        batch, _, nheads_q, _ = q.shape
+        batch, seqlen_q, nheads_q, _ = q.shape
         max_seqlen_q = q.shape[1] if max_seqlen_q is None else max_seqlen_q
         max_seqlen_k = k.shape[1] if max_seqlen_k is None else max_seqlen_k
+        # Create delta tensor - bshd: (B, Hq, Sq)
+        delta = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
 
     # V3 backward doesn't have dropout or alibi slopes
     dropout_p = 0.0
@@ -471,7 +521,7 @@ def bwd(
     # Call implementation
     if DEBUG:
         print(f"Using Triton implementation in {BWD_MODE} mode")
-    delta = attention_backward_triton_impl(
+    attention_backward_triton_impl(
         do=dout,
         q=q,
         k=k,
@@ -481,6 +531,7 @@ def bwd(
         dq=dq,
         dk=dk,
         dv=dv,
+        delta=delta,
         sm_scale=softmax_scale,
         alibi_slopes=alibi_slopes,
         causal=causal,
@@ -504,6 +555,21 @@ def bwd(
         print("dk:", dk.dtype if dk is not None else None, dk.shape if dk is not None else None)
         print("dv:", dv.dtype if dv is not None else None, dv.shape if dv is not None else None)
         print("delta:", delta.dtype if delta is not None else None, delta.shape if delta is not None else None)
+
+    # --- Assertions (FA3 always expects exact shapes) ---
+    # Gradients should match input shapes
+    assert dq.shape == q.shape, f"[bwd_v3] dq shape {dq.shape} != q shape {q.shape}"
+    assert dk.shape == k.shape, f"[bwd_v3] dk shape {dk.shape} != k shape {k.shape}"
+    assert dv.shape == v.shape, f"[bwd_v3] dv shape {dv.shape} != v shape {v.shape}"
+    # delta (softmax_d) should match softmax_lse shape
+    assert delta.dtype == torch.float32, f"[bwd_v3] delta dtype {delta.dtype} != torch.float32"
+    if layout == "thd":
+        # varlen: (Hq, Total_Q)
+        expected_delta_shape = (q.shape[1], q.shape[0])
+    else:
+        # bshd: (B, Hq, Sq)
+        expected_delta_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert delta.shape == expected_delta_shape, f"[bwd_v3] delta shape {delta.shape} != {expected_delta_shape}"
 
     # V3 expects (dq, dk, dv, softmax_d, *rest)
     # delta is the softmax_d in this case

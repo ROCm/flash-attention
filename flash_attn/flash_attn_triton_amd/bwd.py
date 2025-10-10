@@ -3583,6 +3583,7 @@ def attention_backward_triton_impl(
     dq: torch.Tensor,
     dk: torch.Tensor,
     dv: torch.Tensor,
+    delta: torch.Tensor,
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
@@ -3598,7 +3599,7 @@ def attention_backward_triton_impl(
     philox_offset: Optional[int] = None,
     use_exp2: bool = True,
     mode: Literal["fused", "fused_atomic", "split"] = "fused",
-) -> torch.Tensor:
+):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
     use_dropout = dropout_p > 0.0
@@ -3856,11 +3857,14 @@ def attention_backward_triton_impl(
     ACTUAL_HEAD_DIM_QK = head_size_qk
     ACTUAL_HEAD_DIM_V = head_size_v
 
-    # init delta
+    # Validate pre-allocated delta tensor
     if IS_VARLEN:
         # Shape expected by interface varlen backward: (Hq, Total_Q)
         total_q, _, _ = q.shape
-        delta = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
+        assert delta.shape[0] == nheads_q, f"delta.shape[0] ({delta.shape[0]}) must equal nheads_q ({nheads_q})"
+        assert delta.shape[1] >= total_q, f"delta.shape[1] ({delta.shape[1]}) must be >= total_q ({total_q})"
+        assert delta.dtype == torch.float32, f"delta must be float32, got {delta.dtype}"
+        assert delta.device == q.device, f"delta must be on same device as q"
         stride_delta_b, stride_delta_h, stride_delta_m = (
             0,
             delta.stride(0),
@@ -3869,9 +3873,11 @@ def attention_backward_triton_impl(
     else:
         # Shape expected by dense backward: (B, Hq, Sq)
         seqlen_q = q.shape[1]
-        delta = torch.zeros(
-            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
-        )
+        assert delta.shape[0] == batch, f"delta.shape[0] ({delta.shape[0]}) must equal batch ({batch})"
+        assert delta.shape[1] == nheads_q, f"delta.shape[1] ({delta.shape[1]}) must equal nheads_q ({nheads_q})"
+        assert delta.shape[2] >= seqlen_q, f"delta.shape[2] ({delta.shape[2]}) must be >= seqlen_q ({seqlen_q})"
+        assert delta.dtype == torch.float32, f"delta must be float32, got {delta.dtype}"
+        assert delta.device == q.device, f"delta must be on same device as q"
         stride_delta_b, stride_delta_h, stride_delta_m = delta.stride()
 
     pre_grid = lambda META: (
@@ -4550,6 +4556,3 @@ def attention_backward_triton_impl(
         raise ValueError(
             f"Unknown backward mode '{mode}'. Expected 'split', 'fused_atomic' or 'fused'."
         )
-
-
-    return delta

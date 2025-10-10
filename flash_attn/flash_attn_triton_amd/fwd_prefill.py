@@ -1495,6 +1495,8 @@ def attention_forward_prefill_triton_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    sd_mask: Optional[torch.Tensor],
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
@@ -1602,10 +1604,11 @@ def attention_forward_prefill_triton_impl(
         batch = len(cu_seqlens_q) - 1
         head_size_qk = head_size_q
 
-        # softmax_lse shape
-        softmax_lse = torch.zeros(
-            (nheads_q, total_seqlen_q), device=q.device, dtype=torch.float32
-        )
+        # Assert softmax_lse tensor is large enough
+        assert softmax_lse.shape[0] >= nheads_q, f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= nheads_q={nheads_q}"
+        assert softmax_lse.shape[1] >= total_seqlen_q, f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= total_seqlen_q={total_seqlen_q}"
+        assert softmax_lse.dtype == torch.float32, f"softmax_lse must be float32, got {softmax_lse.dtype}"
+        assert softmax_lse.device == q.device, f"softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1678,10 +1681,12 @@ def attention_forward_prefill_triton_impl(
         max_seqlens_q = seqlen_q
         max_seqlens_k = seqlen_k
 
-        # softmax_lse shape
-        softmax_lse = torch.zeros(
-            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
-        )
+        # Assert softmax_lse tensor is large enough
+        assert softmax_lse.shape[0] >= batch, f"softmax_lse.shape[0]={softmax_lse.shape[0]} must be >= batch={batch}"
+        assert softmax_lse.shape[1] >= nheads_q, f"softmax_lse.shape[1]={softmax_lse.shape[1]} must be >= nheads_q={nheads_q}"
+        assert softmax_lse.shape[2] >= seqlen_q, f"softmax_lse.shape[2]={softmax_lse.shape[2]} must be >= seqlen_q={seqlen_q}"
+        assert softmax_lse.dtype == torch.float32, f"softmax_lse must be float32, got {softmax_lse.dtype}"
+        assert softmax_lse.device == q.device, f"softmax_lse must be on same device as q"
 
         # strides
         stride_qb, stride_qh, stride_qm, stride_qd = (
@@ -1823,11 +1828,15 @@ def attention_forward_prefill_triton_impl(
     # only. This return holds no useful output aside from debugging.
     NEEDS_SDMASK = (dropout_p > 0.0) or return_softmax
     if NEEDS_SDMASK:
-        sd_mask = torch.zeros(
-            (batch, nheads_q, max_seqlens_q, max_seqlens_k),
-            device=q.device,
-            dtype=torch.float32,
-        )
+        assert sd_mask is not None, "sd_mask must be provided when return_softmax=True or dropout_p > 0"
+        # Assert sd_mask tensor is large enough
+        assert sd_mask.shape[0] >= batch, f"sd_mask.shape[0]={sd_mask.shape[0]} must be >= batch={batch}"
+        assert sd_mask.shape[1] >= nheads_q, f"sd_mask.shape[1]={sd_mask.shape[1]} must be >= nheads_q={nheads_q}"
+        assert sd_mask.shape[2] >= max_seqlens_q, f"sd_mask.shape[2]={sd_mask.shape[2]} must be >= max_seqlens_q={max_seqlens_q}"
+        assert sd_mask.shape[3] >= max_seqlens_k, f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
+        assert sd_mask.dtype == torch.float32, f"sd_mask must be float32, got {sd_mask.dtype}"
+        assert sd_mask.device == q.device, f"sd_mask must be on same device as q"
+        
         if DROPOUT_USE_PYTORCH:
             dropout_mask = create_dropout_mask(
                 dropout_p,
@@ -1940,5 +1949,3 @@ def attention_forward_prefill_triton_impl(
         FP8_P_DESCALE=False,
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
     )  # Add flag for seqused
-
-    return softmax_lse, sd_mask if return_softmax else None

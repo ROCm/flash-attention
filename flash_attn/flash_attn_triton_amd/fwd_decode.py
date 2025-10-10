@@ -846,6 +846,7 @@ def attention_forward_decode_triton_impl(
     k_new: Optional[torch.Tensor],
     v_new: Optional[torch.Tensor],
     out: torch.Tensor,
+    softmax_lse: torch.Tensor,
     sm_scale: float,
     causal: bool,
     window_size_left: int,
@@ -1104,11 +1105,19 @@ def attention_forward_decode_triton_impl(
         dtype=torch.float32,
         device=q.device,
     )
-    lse = torch.empty(
-        (batch_size * n_group_q * heads_per_group_q, seqlen_q),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    
+    # Validate pre-allocated softmax_lse tensor
+    # Expected shape after view: (batch_size, n_group_q * heads_per_group_q, seqlen_q)
+    # Internal shape: (batch_size * n_group_q * heads_per_group_q, seqlen_q)
+    expected_h_total = batch_size * n_group_q * heads_per_group_q
+    assert softmax_lse.shape[0] == batch_size, f"softmax_lse.shape[0] ({softmax_lse.shape[0]}) must equal batch_size ({batch_size})"
+    assert softmax_lse.shape[1] == n_group_q * heads_per_group_q, f"softmax_lse.shape[1] ({softmax_lse.shape[1]}) must equal n_group_q * heads_per_group_q ({n_group_q * heads_per_group_q})"
+    assert softmax_lse.shape[2] >= seqlen_q, f"softmax_lse.shape[2] ({softmax_lse.shape[2]}) must be >= seqlen_q ({seqlen_q})"
+    assert softmax_lse.dtype == torch.float32, f"softmax_lse must be float32, got {softmax_lse.dtype}"
+    assert softmax_lse.device == q.device, f"softmax_lse must be on same device as q"
+    
+    # Create internal lse view for kernel use
+    lse = softmax_lse.view(expected_h_total, -1)[:, :seqlen_q].contiguous()
 
     # get intermediate tensor strides
     stride_osk_zhg, stride_osk_s, stride_osk_m, stride_osk_d = out_splitk.stride()
@@ -1381,5 +1390,3 @@ def attention_forward_decode_triton_impl(
         PADDED_HEAD=is_padded_head,
         num_warps=num_warps_reduce,
     )
-
-    return lse.view(batch_size, n_group_q * heads_per_group_q, seqlen_q)

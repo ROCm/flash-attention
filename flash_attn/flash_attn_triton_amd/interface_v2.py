@@ -4,7 +4,7 @@ from typing import Optional, Union
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
-from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET
+from .utils import DEBUG, USE_EXP2, BWD_MODE, PHILOX_SEED, PHILOX_OFFSET, SHAPE_EXPECTATIONS, round_multiple
 
 
 def fwd(
@@ -77,14 +77,48 @@ def fwd(
     nheads_k = k.shape[2]
     assert (nheads_q % nheads_k) == 0
 
+    # Create output tensors based on shape expectations
+    if SHAPE_EXPECTATIONS == "rounded":
+        # Rounded shapes for NVIDIA compatibility
+        softmax_lse = torch.zeros(
+            (batch, nheads_q, round_multiple(max_seqlen_q, 128)),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        if return_softmax:
+            sd_mask = torch.zeros(
+                (batch, nheads_q, round_multiple(max_seqlen_q, 128), round_multiple(max_seqlen_k, 128)),
+                device=q.device,
+                dtype=torch.float32,
+            )
+        else:
+            sd_mask = None
+    else:
+        # Exact shapes for AMD
+        softmax_lse = torch.zeros(
+            (batch, nheads_q, max_seqlen_q),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        if return_softmax:
+            sd_mask = torch.zeros(
+                (batch, nheads_q, max_seqlen_q, max_seqlen_k),
+                device=q.device,
+                dtype=torch.float32,
+            )
+        else:
+            sd_mask = None
+
     # call implementation
     if DEBUG:
         print("Using Triton implementation")
-    softmax_lse, sd_mask = attention_forward_prefill_triton_impl(
+    attention_forward_prefill_triton_impl(
         q,
         k,
         v,
         out,
+        softmax_lse,
+        sd_mask,
         softmax_scale,
         alibi_slopes,
         causal,
@@ -104,6 +138,11 @@ def fwd(
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
 
     if DEBUG:
@@ -116,23 +155,37 @@ def fwd(
     # --- Assertions (shape + dtype contracts) ---
     # out: (B, Sq, Hq, D)
     assert out.shape == q.shape, f"[fwd] out shape {out.shape} != q shape {q.shape}"
-    # softmax_lse: (B, Hq, Sq)
-    expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
-    assert (
-        softmax_lse.shape == expected_lse_shape
-    ), f"[fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
+    # softmax_lse dtype
     assert (
         softmax_lse.dtype == torch.float32
     ), f"[fwd] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
+    # softmax_lse shape depends on SHAPE_EXPECTATIONS
+    if SHAPE_EXPECTATIONS == "rounded":
+        expected_lse_shape = (q.shape[0], q.shape[2], round_multiple(q.shape[1], 128))
+    else:
+        expected_lse_shape = (q.shape[0], q.shape[2], q.shape[1])
+    assert (
+        softmax_lse.shape == expected_lse_shape
+    ), f"[fwd] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
     if return_softmax:
         # sd_mask: (B, Hq, Sq, Sk)
         assert sd_mask is not None, "[fwd] return_softmax=True but sd_mask is None"
         assert sd_mask.dim() == 4, f"[fwd] sd_mask dim {sd_mask.dim()} != 4"
-        assert (
-            sd_mask.shape[0] == q.shape[0]
-            and sd_mask.shape[1] == q.shape[2]
-            and sd_mask.shape[2] == q.shape[1]
-        ), f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
+        if SHAPE_EXPECTATIONS == "rounded":
+            expected_sq = round_multiple(q.shape[1], 128)
+            expected_sk = round_multiple(k.shape[1], 128)
+            assert (
+                sd_mask.shape[0] == q.shape[0]
+                and sd_mask.shape[1] == q.shape[2]
+                and sd_mask.shape[2] == expected_sq
+                and sd_mask.shape[3] == expected_sk
+            ), f"[fwd] sd_mask shape {sd_mask.shape} != (B={q.shape[0]}, Hq={q.shape[2]}, Sq={expected_sq}, Sk={expected_sk})"
+        else:
+            assert (
+                sd_mask.shape[0] == q.shape[0]
+                and sd_mask.shape[1] == q.shape[2]
+                and sd_mask.shape[2] == q.shape[1]
+            ), f"[fwd] sd_mask leading dims {sd_mask.shape[:3]} mismatch (B,Hq,Sq) {(q.shape[0], q.shape[2], q.shape[1])}"
     else:
         assert sd_mask is None, "[fwd] return_softmax=False but sd_mask is not None"
 
@@ -193,7 +246,18 @@ def bwd(
     dv = torch.zeros_like(v) if dv is None else dv.zero_()
 
     # get shape
-    batch, _, nheads_q, _ = q.shape
+    batch, seqlen_q, nheads_q, _ = q.shape
+
+    # Create delta tensor with shape based on expectations
+    # delta (softmax_d) : (B, Hq, Sq) or (B, Hq, round_multiple(Sq, 128))
+    if SHAPE_EXPECTATIONS == "rounded":
+        delta = torch.zeros(
+            (batch, nheads_q, round_multiple(seqlen_q, 128)),
+            device=q.device,
+            dtype=torch.float32,
+        )
+    else:
+        delta = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
 
     # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
     if rng_state is not None:
@@ -212,7 +276,7 @@ def bwd(
     # call implementation
     if DEBUG:
         print(f"Using Triton implementation in {BWD_MODE} mode")
-    delta = attention_backward_triton_impl(
+    attention_backward_triton_impl(
         do=dout,
         q=q,
         k=k,
@@ -222,13 +286,14 @@ def bwd(
         dq=dq,
         dk=dk,
         dv=dv,
+        delta=delta,
         sm_scale=softmax_scale,
         alibi_slopes=alibi_slopes,
         causal=causal,
         layout="bshd",
         cu_seqlens_q=None,
         cu_seqlens_k=None,
-        max_seqlen_q=q.shape[1],
+        max_seqlen_q=seqlen_q,
         max_seqlen_k=k.shape[1],
         seqused_q=None,
         seqused_k=None,
@@ -249,7 +314,10 @@ def bwd(
     assert dk.shape == k.shape, f"[bwd] dk shape {dk.shape} != k shape {k.shape}"
     assert dv.shape == v.shape, f"[bwd] dv shape {dv.shape} != v shape {v.shape}"
     # delta (softmax_d) : (B, Hq, Sq)
-    expected_delta_shape = (q.shape[0], q.shape[2], q.shape[1])
+    if SHAPE_EXPECTATIONS == "rounded":
+        expected_delta_shape = (q.shape[0], q.shape[2], round_multiple(q.shape[1], 128))
+    else:
+        expected_delta_shape = (q.shape[0], q.shape[2], q.shape[1])
     assert (
         delta.shape == expected_delta_shape
     ), f"[bwd] delta shape {delta.shape} != {expected_delta_shape}"
@@ -324,7 +392,33 @@ def varlen_fwd(
     # Layout and basic info for varlen
     layout = "thd"
     batch = len(cu_seqlens_q) - 1
-    _, nheads_q, _ = q.shape
+    total_q, nheads_q, _ = q.shape
+
+    # Create softmax_lse tensor - varlen always uses exact shape (Hq, Total_Q)
+    softmax_lse = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
+
+    # Create sd_mask tensor if needed
+    if return_softmax:
+        # sd_mask: (B, Hq, Sq, Sk) - shape based on expectations
+        if SHAPE_EXPECTATIONS == "rounded":
+            sd_mask = torch.zeros(
+                (
+                    batch,
+                    nheads_q,
+                    round_multiple(max_seqlen_q, 128),
+                    round_multiple(max_seqlen_k, 128),
+                ),
+                device=q.device,
+                dtype=q.dtype,
+            )
+        else:
+            sd_mask = torch.zeros(
+                (batch, nheads_q, max_seqlen_q, max_seqlen_k),
+                device=q.device,
+                dtype=q.dtype,
+            )
+    else:
+        sd_mask = None
 
     if alibi_slopes is not None:
         if alibi_slopes.dim() == 1:
@@ -346,11 +440,13 @@ def varlen_fwd(
     # call implementation
     if DEBUG:
         print("Using Triton implementation")
-    softmax_lse, sd_mask = attention_forward_prefill_triton_impl(
+    attention_forward_prefill_triton_impl(
         q,
         k,
         v,
         out,
+        softmax_lse,
+        sd_mask,
         softmax_scale,
         alibi_slopes,
         causal,
@@ -396,12 +492,19 @@ def varlen_fwd(
             sd_mask is not None
         ), "[varlen_fwd] return_softmax=True but sd_mask is None"
         assert sd_mask.dim() == 4, f"[varlen_fwd] sd_mask dim {sd_mask.dim()} != 4"
-        assert sd_mask.shape[0] == (
-            len(cu_seqlens_q) - 1
-        ), f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {len(cu_seqlens_q)-1}"
-        assert (
-            sd_mask.shape[1] == q.shape[1]
-        ), f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
+        batch = len(cu_seqlens_q) - 1
+        assert sd_mask.shape[0] == batch, f"[varlen_fwd] sd_mask batch {sd_mask.shape[0]} != {batch}"
+        assert sd_mask.shape[1] == q.shape[1], f"[varlen_fwd] sd_mask nheads {sd_mask.shape[1]} != {q.shape[1]}"
+        if SHAPE_EXPECTATIONS == "rounded":
+            expected_sq = round_multiple(max_seqlen_q, 128)
+            expected_sk = round_multiple(max_seqlen_k, 128)
+            assert (
+                sd_mask.shape[2] == expected_sq and sd_mask.shape[3] == expected_sk
+            ), f"[varlen_fwd] sd_mask shape {sd_mask.shape} != (B={batch}, Hq={q.shape[1]}, Sq={expected_sq}, Sk={expected_sk})"
+        else:
+            assert (
+                sd_mask.shape[2] == max_seqlen_q and sd_mask.shape[3] == max_seqlen_k
+            ), f"[varlen_fwd] sd_mask shape {sd_mask.shape} != (B={batch}, Hq={q.shape[1]}, Sq={max_seqlen_q}, Sk={max_seqlen_k})"
     else:
         assert (
             sd_mask is None
@@ -476,7 +579,16 @@ def varlen_bwd(
 
     # get shape
     batch = len(cu_seqlens_q) - 1
-    _, nheads_q, _ = q.shape
+    total_q, nheads_q, _ = q.shape
+
+    # Create delta tensor with shape based on expectations
+    # delta (softmax_d) : (Hq, Total_Q) or (Hq, Total_Q + 128*batch)
+    if SHAPE_EXPECTATIONS == "rounded":
+        delta = torch.zeros(
+            (nheads_q, total_q + 128 * batch), device=q.device, dtype=torch.float32
+        )
+    else:
+        delta = torch.zeros((nheads_q, total_q), device=q.device, dtype=torch.float32)
 
     # Upstream change: base seeding logic on provided rng_state instead of dropout probability.
     if rng_state is not None:
@@ -495,7 +607,7 @@ def varlen_bwd(
     # call implementation
     if DEBUG:
         print(f"Using Triton implementation in {BWD_MODE} mode")
-    delta = attention_backward_triton_impl(
+    attention_backward_triton_impl(
         do=dout,
         q=q,
         k=k,
@@ -505,6 +617,7 @@ def varlen_bwd(
         dq=dq,
         dk=dk,
         dv=dv,
+        delta=delta,
         sm_scale=softmax_scale,
         alibi_slopes=alibi_slopes,
         causal=causal,
@@ -532,7 +645,11 @@ def varlen_bwd(
     assert dq.shape == q.shape, f"[varlen_bwd] dq shape {dq.shape} != q shape {q.shape}"
     assert dk.shape == k.shape, f"[varlen_bwd] dk shape {dk.shape} != k shape {k.shape}"
     assert dv.shape == v.shape, f"[varlen_bwd] dv shape {dv.shape} != v shape {v.shape}"
-    expected_delta_shape = (q.shape[1], q.shape[0])  # (Hq, Total_Q)
+    if SHAPE_EXPECTATIONS == "rounded":
+        batch = len(cu_seqlens_q) - 1
+        expected_delta_shape = (q.shape[1], q.shape[0] + 128 * batch)
+    else:
+        expected_delta_shape = (q.shape[1], q.shape[0])  # (Hq, Total_Q)
     assert (
         delta.shape == expected_delta_shape
     ), f"[varlen_bwd] delta shape {delta.shape} != {expected_delta_shape}"
@@ -622,7 +739,10 @@ def fwd_kvcache(
     v_new = v
 
     # get shape
-    batch, _, nheads_q, _ = q.shape
+    batch, seqlen_q, nheads_q, _ = q.shape
+
+    # Create softmax_lse tensor - decode always uses exact shape (B, Hq, Sq)
+    softmax_lse = torch.zeros((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
 
     if alibi_slopes is not None:
         if alibi_slopes.dim() == 1:
@@ -633,13 +753,14 @@ def fwd_kvcache(
     # launch kernel
     if DEBUG:
         print("Using Triton implementation")
-    softmax_lse = attention_forward_decode_triton_impl(
+    attention_forward_decode_triton_impl(
         q,
         k_cache,
         v_cache,
         k_new,
         v_new,
         out,
+        softmax_lse,
         softmax_scale,
         causal,
         window_left,
