@@ -1271,9 +1271,7 @@ def _apply_rotary_kernel(
         batch,
     )
 
-    # NOTE: We assume CUDA device indexing compatibility in upstream; adapt for ROCm by using device context.
-    # For ROCm, torch.cuda.device works if HIP_VISIBLE_DEVICES mapping is set.
-    with torch.cuda.device(x.device.index):  # Works for ROCm as alias
+    with torch.cuda.device(x.device.index):
         torch.library.wrap_triton(_rotary_kernel)[grid](
             out,
             x,
