@@ -79,7 +79,6 @@ def fwd(
 
     # Create output tensors based on shape expectations
     if SHAPE_EXPECTATIONS == "rounded":
-        # Rounded shapes for NVIDIA compatibility
         softmax_lse = torch.zeros(
             (batch, nheads_q, round_multiple(max_seqlen_q, 128)),
             device=q.device,
@@ -94,7 +93,6 @@ def fwd(
         else:
             sd_mask = None
     else:
-        # Exact shapes for AMD
         softmax_lse = torch.zeros(
             (batch, nheads_q, max_seqlen_q),
             device=q.device,
@@ -135,7 +133,6 @@ def fwd(
         philox_offset,
         return_softmax,
         USE_EXP2,
-        None,
         None,
         None,
         None,
