@@ -3063,8 +3063,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             + offs_d_v[None, :] * stride_vd
         )
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = tl.load(K + adj_k, mask=mask_k, other=0.0)
-        v = tl.load(V + adj_v, mask=mask_v, other=0.0)
+        k = tl.load(K + adj_k, mask=mask_k)
+        v = tl.load(V + adj_v, mask=mask_v)
         # If MQA / GQA, set the K and V head offsets appropriately.
         # hqid = hkid
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
@@ -3615,8 +3615,8 @@ def bwd_kernel_fused_noncausal(
             + offs_d_v[None, :] * stride_vd
         )
         # load K and V: they stay in SRAM throughout the inner loop.
-        k = tl.load(K + adj_k, mask=mask_k, other=0.0)
-        v = tl.load(V + adj_v, mask=mask_v, other=0.0)
+        k = tl.load(K + adj_k, mask=mask_k)
+        v = tl.load(V + adj_v, mask=mask_v)
         # If MQA / GQA, set the K and V head offsets appropriately.
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
             # offset input and output tensor by batch and Q/K heads
