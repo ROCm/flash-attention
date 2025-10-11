@@ -410,6 +410,10 @@ def get_bwd_configs(autotune: bool):
                                 assert (
                                     n1 == m2
                                 ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
+                                
+                                # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
+                                if m2 % n2 != 0:
+                                    continue
 
                                 for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
                                     causal_autotune_configs.append(
@@ -439,6 +443,11 @@ def get_bwd_configs(autotune: bool):
                                 assert (
                                     n1 == m2
                                 ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
+                                
+                                # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
+                                if m2 % n2 != 0:
+                                    continue
+                                    
                                 for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
                                     noncausal_autotune_configs.append(
                                         triton.Config(
