@@ -241,6 +241,55 @@ def get_bwd_configs(autotune: bool):
                         num_warps=4,
                     ),
                 ]
+        elif arch == "gfx950":
+            preprocess_autotune_configs = [
+                triton.Config(
+                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
+                ),
+                triton.Config(
+                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=1, num_warps=8
+                ),
+            ]
+            noncausal_autotune_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 64,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M1": 64,
+                        "BLOCK_N1": 64,
+                        "BLOCK_M2": 64,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                )
+            ]
+            causal_autotune_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
         else:
             preprocess_autotune_configs = [
                 triton.Config(
@@ -256,7 +305,6 @@ def get_bwd_configs(autotune: bool):
                         "BLOCK_N2": 64,
                         "BLK_SLICE_FACTOR": 2,
                         "waves_per_eu": 1,
-                        "matrix_instr_nonkdim": 16,
                     },
                     num_stages=1,
                     num_warps=4,
@@ -271,7 +319,6 @@ def get_bwd_configs(autotune: bool):
                         "BLOCK_N2": 64,
                         "BLK_SLICE_FACTOR": 2,
                         "waves_per_eu": 1,
-                        "matrix_instr_nonkdim": 16,
                     },
                     num_stages=1,
                     num_warps=4,
@@ -305,7 +352,6 @@ def get_bwd_configs(autotune: bool):
     NUM_STAGES_OPTIONS = [1, 2]  # og: 1
     NUM_WARPS_OPTIONS = [4, 8]  # og: 4
     WAVES_PER_EU_OPTIONS = [1, 2]  # og: 1
-    MATRIX_INSTR_NONKDIM_OPTIONS = [16, 32]  # og: 16
     CAUSAL_BLOCK_M1_OPTIONS = [  # og: 32
         32,
         64,
@@ -338,7 +384,6 @@ def get_bwd_configs(autotune: bool):
     for num_warps in NUM_WARPS_OPTIONS:
         for num_stages in NUM_STAGES_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
-                for matrix_instr_nonkdim in MATRIX_INSTR_NONKDIM_OPTIONS:
                     for m1 in CAUSAL_BLOCK_M1_OPTIONS:
                         for n1 in CAUSAL_BLOCK_N1_M2_OPTIONS:
                             m2 = n1
@@ -358,7 +403,6 @@ def get_bwd_configs(autotune: bool):
                                                 "BLOCK_N2": n2,
                                                 "BLK_SLICE_FACTOR": blk_slice,
                                                 "waves_per_eu": waves,
-                                                "matrix_instr_nonkdim": matrix_instr_nonkdim,
                                             },
                                             num_stages=num_stages,
                                             num_warps=num_warps,
@@ -369,7 +413,6 @@ def get_bwd_configs(autotune: bool):
     for num_warps in NUM_WARPS_OPTIONS:
         for num_stages in NUM_STAGES_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
-                for matrix_instr_nonkdim in MATRIX_INSTR_NONKDIM_OPTIONS:
                     for m1 in NON_CAUSAL_BLOCK_M1_OPTIONS:
                         for n1 in NON_CAUSAL_BLOCK_N1_M2_OPTIONS:
                             m2 = n1
@@ -388,7 +431,6 @@ def get_bwd_configs(autotune: bool):
                                                 "BLOCK_N2": n2,
                                                 "BLK_SLICE_FACTOR": blk_slice,
                                                 "waves_per_eu": waves,
-                                                "matrix_instr_nonkdim": matrix_instr_nonkdim,
                                             },
                                             num_stages=num_stages,
                                             num_warps=num_warps,
@@ -407,7 +449,7 @@ def get_bwd_configs(autotune: bool):
     (preprocess_autotune_configs, preprocess_autotune_keys),
     (causal_autotune_configs, causal_autotune_keys),
     (noncausal_autotune_configs, noncausal_autotune_keys),
-) = get_bwd_configs(AUTOTUNE)
+) = get_bwd_configs(False)
 
 
 @triton.jit
