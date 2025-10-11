@@ -371,12 +371,12 @@ def get_bwd_configs(autotune: bool):
     NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [64, 128, 256]  # og: 128
     NON_CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64]  # og: 32
     CAUSAL_BLOCK_M1_OPTIONS = [  # og: 32
-        16,
         32,
         64,
+        128
     ]
     CAUSAL_BLOCK_N1_M2_OPTIONS = [64, 128, 256]  # og: 128
-    CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64]  # og: 32
+    CAUSAL_BLOCK_N2_OPTIONS = [32, 64, 128]  # og: 32
     BLK_SLICE_FACTOR_OPTIONS = [2]  # og: 2
 
     # ==================== sweep configs ================================
