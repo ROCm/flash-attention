@@ -414,6 +414,10 @@ def get_bwd_configs(autotune: bool):
                                 # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
                                 if m2 % n2 != 0:
                                     continue
+                                
+                                # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
+                                if n1 % m1 != 0:
+                                    continue
 
                                 for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
                                     causal_autotune_configs.append(
@@ -446,6 +450,10 @@ def get_bwd_configs(autotune: bool):
                                 
                                 # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
                                 if m2 % n2 != 0:
+                                    continue
+                                
+                                # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
+                                if n1 % m1 != 0:
                                     continue
                                     
                                 for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
