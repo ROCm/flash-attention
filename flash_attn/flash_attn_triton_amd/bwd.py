@@ -249,6 +249,9 @@ def get_bwd_configs(autotune: bool):
                 triton.Config(
                     {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=1, num_warps=8
                 ),
+                triton.Config(
+                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=4
+                ),
             ]
             noncausal_autotune_configs = [
                 triton.Config(
@@ -274,7 +277,19 @@ def get_bwd_configs(autotune: bool):
                     },
                     num_stages=1,
                     num_warps=4,
-                )
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M1": 16,
+                        "BLOCK_N1": 64,
+                        "BLOCK_M2": 64,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
             ]
             causal_autotune_configs = [
                 triton.Config(
@@ -352,18 +367,21 @@ def get_bwd_configs(autotune: bool):
     NUM_STAGES_OPTIONS = [1, 2]  # og: 1
     NUM_WARPS_OPTIONS = [4, 8]  # og: 4
     WAVES_PER_EU_OPTIONS = [1, 2]  # og: 1
+    NON_CAUSAL_BLOCK_M1_OPTIONS = [16, 32, 64]  # og: 32
+    NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [64, 128, 256]  # og: 128
+    NON_CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64]  # og: 32
     CAUSAL_BLOCK_M1_OPTIONS = [  # og: 32
+        16,
         32,
         64,
     ]
     CAUSAL_BLOCK_N1_M2_OPTIONS = [64, 128, 256]  # og: 128
-    CAUSAL_BLOCK_N2_OPTIONS = [32, 64]  # og: 32
-    NON_CAUSAL_BLOCK_M1_OPTIONS = [32, 64]  # og: 32
-    NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [64, 128, 256]  # og: 128
-    NON_CAUSAL_BLOCK_N2_OPTIONS = [32, 64]  # og: 32
+    CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64]  # og: 32
     BLK_SLICE_FACTOR_OPTIONS = [2]  # og: 2
 
     # ==================== sweep configs ================================
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+    
     preprocess_autotune_configs = []
     for pre_num_warps in PRE_NUM_WARPS_OPTIONS:
         for pre_num_stages in PRE_NUM_STAGES_OPTIONS:
@@ -444,12 +462,11 @@ def get_bwd_configs(autotune: bool):
     )
 
 
-# os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 (
     (preprocess_autotune_configs, preprocess_autotune_keys),
     (causal_autotune_configs, causal_autotune_keys),
     (noncausal_autotune_configs, noncausal_autotune_keys),
-) = get_bwd_configs(False)
+) = get_bwd_configs(True)
 
 
 @triton.jit
