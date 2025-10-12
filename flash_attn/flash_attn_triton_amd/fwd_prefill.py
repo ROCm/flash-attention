@@ -1914,9 +1914,6 @@ def attention_forward_prefill_triton_impl(
         assert (
             sd_mask.shape[3] >= max_seqlens_k
         ), f"sd_mask.shape[3]={sd_mask.shape[3]} must be >= max_seqlens_k={max_seqlens_k}"
-        assert (
-            sd_mask.dtype == torch.float32
-        ), f"sd_mask must be float32, got {sd_mask.dtype}"
         assert sd_mask.device == q.device, f"sd_mask must be on same device as q"
 
         if DROPOUT_USE_PYTORCH:
