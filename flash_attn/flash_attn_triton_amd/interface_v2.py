@@ -46,10 +46,10 @@ def fwd(
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::fwd inputs")
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("out:", out, out.shape if out is not None else None)
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
+        print("out:", out.shape if out is not None else None)
         print("alibi_slopes:", alibi_slopes)
         print("dropout_p:", dropout_p)
         print("softmax_scale:", softmax_scale)
@@ -58,7 +58,11 @@ def fwd(
         print("window_size_right:", window_size_right)
         print("softcap:", softcap)
         print("return_softmax:", return_softmax)
-    out = torch.zeros_like(q) if out is None else out.zero_()
+    
+    if out is None:
+        out = torch.zeros_like(q) 
+    else:
+        out.zero_()
 
     # Layout / shapes
     layout = "bshd"
@@ -92,7 +96,7 @@ def fwd(
             device=q.device,
             dtype=torch.float32,
         )
-        if return_softmax:
+        if dropout_p > 0.0 or return_softmax:
             sd_mask = torch.zeros(
                 (
                     batch,
@@ -111,7 +115,7 @@ def fwd(
             device=q.device,
             dtype=torch.float32,
         )
-        if return_softmax:
+        if dropout_p > 0.0 or return_softmax:
             sd_mask = torch.zeros(
                 (batch, nheads_q, max_seqlen_q, max_seqlen_k),
                 device=q.device,
@@ -157,9 +161,9 @@ def fwd(
 
     if DEBUG:
         print("flash_attn_triton_amd.py::fwd outputs")
-        print("o:", out, out.shape)
-        print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("sd_mask:", sd_mask, sd_mask.shape if sd_mask is not None else None)
+        print("o:", out.shape if out is not None else None)
+        print("softmax_lse:", softmax_lse.shape if softmax_lse is not None else None)
+        print("sd_mask:", sd_mask.shape if sd_mask is not None else None)
         print("rng_state:", rng_state)
 
     # --- Assertions (shape + dtype contracts) ---
@@ -232,14 +236,14 @@ def bwd(
         print()
         print("flash_attn_triton_amd.py::bwd inputs")
         print("dout:", dout, dout.shape)
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
-        print("out:", out, out.shape)
-        print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("dq:", dq, dq.shape if dq is not None else None)
-        print("dk:", dk, dk.shape if dk is not None else None)
-        print("dv:", dv, dv.shape if dv is not None else None)
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
+        print("out:", out.shape)
+        print("softmax_lse:", softmax_lse.shape)
+        print("dq:", dq.shape if dq is not None else None)
+        print("dk:", dk.shape if dk is not None else None)
+        print("dv:", dv.shape if dv is not None else None)
         print("alibi_slopes:", alibi_slopes)
         print("dropout_p:", dropout_p)
         print("out:", out)
@@ -385,9 +389,9 @@ def varlen_fwd(
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::varlen_fwd")
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
         print("cu_seqlens_q:", cu_seqlens_q, cu_seqlens_q.shape)
         print("cu_seqlens_k:", cu_seqlens_k, cu_seqlens_k.shape)
         print("alibi_slopes:", alibi_slopes)
@@ -566,15 +570,15 @@ def varlen_bwd(
     if DEBUG:
         print()
         print("varlen_bwd")
-        print("dout:", dout, dout.shape)
-        print("q:", q, q.shape)
-        print("k:", k, k.shape)
-        print("v:", v, v.shape)
+        print("dout:", dout.shape)
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
         print("out:", out)
-        print("softmax_lse:", softmax_lse, softmax_lse.shape)
-        print("dq:", dq, dq.shape if dq is not None else None)
-        print("dk:", dk, dk.shape if dk is not None else None)
-        print("dv:", dv, dv.shape if dv is not None else None)
+        print("softmax_lse:", softmax_lse.shape)
+        print("dq:", dq.shape if dq is not None else None)
+        print("dk:", dk.shape if dk is not None else None)
+        print("dv:", dv.shape if dv is not None else None)
         print("cu_seqlens_q:", cu_seqlens_q, cu_seqlens_q.shape)
         print("cu_seqlens_k:", cu_seqlens_k, cu_seqlens_k.shape)
         print("alibi_slopes:", alibi_slopes)

@@ -7,21 +7,12 @@ from typing import Literal, Optional
 from .utils import (
     DEBUG,
     AUTOTUNE,
-    DROPOUT_USE_PYTORCH,
-    DROPOUT_DUMP,
     compute_fp8_scaling_factors,
-    create_dropout_mask,
-    create_dropout_mask_varlen,
     get_cu_count,
     is_cdna,
     is_fp8,
     get_arch,
 )
-
-# NOTE: triton fails to import tl.constexprs so create them here for the file
-tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
-tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
-
 
 def get_bwd_configs(autotune: bool):
     # keys
@@ -2658,15 +2649,8 @@ def _bwd_dkdv_inner(
                 + offs_m[None, :] * stride_dropoutm
                 + offs_n[:, None] * stride_dropoutn
             )
-            if tl_DROPOUT_USE_PYTORCH:
-                dropout_offs = (
-                    offs_m[None, :] * stride_dropoutm
-                    + offs_n[:, None] * stride_dropoutn
-                )
-                dropout_mask = tl.load(curr_dropout_offset + dropout_offs, mask=mask_nm)
-            else:
-                rand_vals = tl.rand(philox_seed, philox_offs)
-                dropout_mask = rand_vals > dropout_p
+            rand_vals = tl.rand(philox_seed, philox_offs)
+            dropout_mask = rand_vals > dropout_p
             dropout_scale = 1.0 / (1 - dropout_p)
         # Load m before computing qk to reduce pipeline stall.
         m = tl.load(M + offs_m * stride_lse_m, mask=mask_m, other=0.0)
@@ -2849,15 +2833,8 @@ def _bwd_dq_inner(
                 + offs_m[:, None] * stride_dropoutm
                 + offs_n[None, :] * stride_dropoutn
             )
-            if tl_DROPOUT_USE_PYTORCH:
-                dropout_offs = (
-                    offs_m[:, None] * stride_dropoutm
-                    + offs_n[None, :] * stride_dropoutn
-                )
-                dropout_mask = tl.load(curr_dropout_offset + dropout_offs, mask=mask_mn)
-            else:
-                rand_vals = tl.rand(philox_seed, philox_offs)
-                dropout_mask = rand_vals > dropout_p
+            rand_vals = tl.rand(philox_seed, philox_offs)
+            dropout_mask = rand_vals > dropout_p
             dropout_scale = 1 / (1 - dropout_p)
 
         if IS_FP8:
@@ -4242,17 +4219,6 @@ def attention_backward_triton_impl(
             dtype=torch.float32,
         )
 
-        if DROPOUT_USE_PYTORCH:
-            if not IS_VARLEN:
-                dropout_mask = create_dropout_mask(
-                    dropout_p,
-                    (batch, nheads_q, max_seqlen_q, max_seqlen_k),
-                    seed=philox_seed,
-                )
-            else:
-                dropout_mask = create_dropout_mask_varlen(
-                    dropout_p, batch, nheads_q, cu_seqlens_q, cu_seqlens_k, philox_seed
-                )
         stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = (
             dropout_mask.stride()
         )

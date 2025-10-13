@@ -17,23 +17,13 @@ AUTOTUNE = os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0").lower() in
     "true",
     "yes",
 )
-if AUTOTUNE:
-    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 DEBUG = os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0").lower() in (
     "1",
     "true",
     "yes",
 )
-PERF = os.environ.get("FLASH_ATTENTION_TRITON_AMD_PERF", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-USE_SINGLE_BWD_KERNEL = os.environ.get("USE_SINGLE_BWD_KERNEL", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+if AUTOTUNE or DEBUG:
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 USE_TRITON_INTERPRET = os.environ.get("TRITON_INTERPRET", "0").lower() in (
     "1",
@@ -51,8 +41,6 @@ DEBUG_TRITON_DETAIL = (
 if USE_TRITON_ROCM:  # TODO remove this
     random.seed(42)
 BWD_MODE: Literal["fused", "fused_atomic", "split"] = "fused"
-DROPOUT_USE_PYTORCH = False
-DROPOUT_DUMP = False
 USE_EXP2 = True
 PHILOX_SEED = 0x1BF58
 PHILOX_OFFSET = 0x1D4B49
