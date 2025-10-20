@@ -302,8 +302,9 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     ],
 )
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
+@pytest.mark.parametrize("compiled", [False, True])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, compiled
 ):
     device = "cuda"
     # set seed
@@ -343,7 +344,8 @@ def test_flash_attn_output(
             return_attn_probs=True,
         )
     else:
-        out, lse, S_dmask = flash_attn_func(
+        flash_func = torch.compile(flash_attn_func) if compiled else flash_attn_func
+        out, lse, S_dmask = flash_func(
             q,
             k,
             v,
@@ -519,8 +521,9 @@ def test_flash_attn_output(
     ],
 )
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
+@pytest.mark.parametrize("compiled", [False, True])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, compiled
 ):
     device = "cuda"
     # set seed
@@ -598,7 +601,8 @@ def test_flash_attn_varlen_output(
             dq_pad_fn,
             dk_pad_fn,
         ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-        out_unpad, sm_lse, S_dmask = flash_attn_varlen_func(
+        flash_varlen_func = torch.compile(flash_attn_varlen_func) if compiled else flash_attn_varlen_func
+        out_unpad, sm_lse, S_dmask = flash_varlen_func(
             q_unpad,
             k_unpad,
             v_unpad,

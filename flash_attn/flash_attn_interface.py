@@ -214,7 +214,6 @@ def _flash_attn_varlen_forward_fake(
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
-    
     out = torch.empty_like(q)
     softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
@@ -252,8 +251,7 @@ def _flash_attn_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    # dq, dk, dv are allocated by us so they should already be contiguous
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
         dq,
@@ -281,7 +279,7 @@ def _flash_attn_backward(
         None,
         rng_state,
     )
-    return softmax_d
+    return dq.clone(), dk.clone(), dv.clone(), softmax_d
 
 
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_backward")
@@ -304,18 +302,17 @@ def _flash_attn_backward_fake(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if dq is None:
-        dq = torch.empty_like(q)
-    if dk is None:
-        dk = torch.empty_like(k)
-    if dv is None:
-        dv = torch.empty_like(v)
     batch_size, seqlen_q, num_heads, _ = q.shape
-    softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
-    
-    return softmax_d
+    if torch.cuda.is_available() and torch.version.hip:
+        softmax_d = torch.empty((batch_size, num_heads, seqlen_q), device=q.device, dtype=torch.float32)
+    else:
+        softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
+    # dq, dk, dv are already allocated in the fwd pass
+    # we are passing them here to match the cpp signature and help torch.compile in infering shape during tracing
+    # without this torch.compile will struggels infer the shape of softmax_d
+    return dq, dk, dv, softmax_d
 
 
 if torch.__version__ >= "2.4.0":
@@ -348,8 +345,7 @@ def _flash_attn_varlen_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    # dq, dk, dv are allocated by us so they should already be contiguous
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
         dq,
@@ -382,9 +378,8 @@ def _flash_attn_varlen_backward(
         None,
         rng_state,
     )
-    # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
-    #     breakpoint()
-    return softmax_d
+    # return clones else torch.compile will about mutated tensors being returned
+    return dq.clone(), dk.clone(), dv.clone(), softmax_d
 
 
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_backward")
@@ -411,20 +406,22 @@ def _flash_attn_varlen_backward_fake(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
 
-    if dq is None:
-        dq = torch.empty_like(q)
-    if dk is None:
-        dk = torch.empty_like(k)
-    if dv is None:
-        dv = torch.empty_like(v)
-    softmax_d = torch.empty((num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32)
-    
-    return softmax_d
+
+    # The CUDA kernel appears to round up max_seqlen_q to a multiple of 128
+    if torch.cuda.is_available() and torch.version.hip:
+        softmax_d = torch.empty((batch_size, num_heads, max_seqlen_q), device=q.device, dtype=torch.float32)
+    else:
+        softmax_d = torch.empty((batch_size, num_heads, round_multiple(max_seqlen_q, 128)), device=q.device, dtype=torch.float32)
+
+    # dq, dk, dv are already allocated in the fwd pass
+    # we are passing them here to match the cpp signature and help torch.compile in infering shape during tracing
+    # without this torch.compile will struggels infer the shape of softmax_d
+    return dq, dk, dv, softmax_d
 
 
 if torch.__version__ >= "2.4.0":
