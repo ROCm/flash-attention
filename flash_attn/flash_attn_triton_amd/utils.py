@@ -1501,11 +1501,9 @@ def is_cdna():
 
 @functools.cache
 def is_rdna():
-    return is_hip() and get_arch() in (
+    arch = get_arch()
+    return is_hip() and (arch in (
         "gfx1030",
-        "gfx1100",
-        "gfx1101",
-        "gfx1102",
         "gfx1200",
         "gfx1201",
-    )
+    ) or arch.startswith("gfx11"))

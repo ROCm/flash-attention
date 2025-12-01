@@ -93,12 +93,9 @@ def get_fwd_configs(autotune: bool):
                 )
         elif arch in (
             "gfx1030",
-            "gfx1100",
-            "gfx1101",
-            "gfx1102",
             "gfx1200",
             "gfx1201",
-        ):  # RDNA architectures
+        ) or arch.startswith("gfx11"):  # RDNA architectures
             configs.append(
                 triton.Config(
                     {
