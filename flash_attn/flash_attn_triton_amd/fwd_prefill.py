@@ -102,6 +102,19 @@ def get_fwd_configs(autotune: bool):
             configs.append(
                 triton.Config(
                     {
+                        "BLOCK_M": 64,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 1,
+                        "PRE_LOAD_V": True,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                )
+            )
+        else:
+            configs.append(
+                triton.Config(
+                    {
                         "BLOCK_M": 32,
                         "BLOCK_N": 32,
                         "waves_per_eu": 2,
@@ -109,19 +122,6 @@ def get_fwd_configs(autotune: bool):
                     },
                     num_stages=1,
                     num_warps=2,
-                )
-            )
-        else:
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
                 )
             )
 
