@@ -212,7 +212,7 @@ ext_modules = []
 # files included in the source distribution, in case the user compiles from source.
 if os.path.isdir(".git"):
     if not SKIP_CK_BUILD:
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+        #subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
         subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
 else:
     if IS_ROCM:
