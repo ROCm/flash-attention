@@ -1,6 +1,6 @@
 import torch
 import os
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
@@ -12,7 +12,6 @@ from .utils import (
     PHILOX_OFFSET,
     SHAPE_EXPECTATIONS,
     round_multiple,
-    tensor_stats,
 )
 from .llc_cache_aware import is_head_grouping_beneficial, print_head_grouping_info
 
@@ -34,7 +33,7 @@ def fwd(
     softcap: float,
     return_softmax: bool,
     gen_: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
 
     # Reject FP8 tensors (FA2 AMD path does not support FP8)
     if str(q.dtype).startswith("torch.float8"):
@@ -51,11 +50,11 @@ def fwd(
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::fwd inputs")
-        print(tensor_stats("q", q))
-        print(tensor_stats("k", k))
-        print(tensor_stats("v", v))
-        print(tensor_stats("out", out))
-        print(tensor_stats("alibi_slopes", alibi_slopes))
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
+        print("out:", out.shape if out is not None else None)
+        print("alibi_slopes:", alibi_slopes.shape if alibi_slopes is not None else None)
         print("dropout_p:", dropout_p)
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
@@ -70,7 +69,7 @@ def fwd(
         out.zero_()
 
     # Layout / shapes
-    layout = "bshd"
+    layout: Literal["bshd", "bhsd", "thd"] = "bshd"
     max_seqlen_q = q.shape[1]
     max_seqlen_k = k.shape[1]
     batch, _, nheads_q, _ = q.shape
@@ -234,9 +233,9 @@ def fwd(
 
     if DEBUG:
         print("flash_attn_triton_amd.py::fwd outputs")
-        print(tensor_stats("out", out))
-        print(tensor_stats("softmax_lse", softmax_lse))
-        print(tensor_stats("sd_mask", sd_mask))
+        print("out:", out.shape)
+        print("softmax_lse:", softmax_lse.shape)
+        print("sd_mask:", sd_mask.shape if sd_mask is not None else None)
         print("rng_state:", rng_state)
 
     # --- Assertions (shape + dtype contracts) ---
@@ -299,7 +298,7 @@ def bwd(
     deterministic: bool,
     gen_: Optional[torch.Tensor] = None,
     rng_state: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if softcap != 0.0:
         raise NotImplementedError(
             "softcap is not supported in the AMD Triton FA2 interface (expected 0.0)."
@@ -317,16 +316,16 @@ def bwd(
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::bwd inputs")
-        print(tensor_stats("dout", dout))
-        print(tensor_stats("q", q))
-        print(tensor_stats("k", k))
-        print(tensor_stats("v", v))
-        print(tensor_stats("out", out))
-        print(tensor_stats("softmax_lse", softmax_lse))
-        print(tensor_stats("dq", dq))
-        print(tensor_stats("dk", dk))
-        print(tensor_stats("dv", dv))
-        print(tensor_stats("alibi_slopes", alibi_slopes))
+        print("dout:", dout.shape)
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
+        print("out:", out.shape)
+        print("softmax_lse:", softmax_lse.shape)
+        print("dq:", dq.shape if dq is not None else None)
+        print("dk:", dk.shape if dk is not None else None)
+        print("dv:", dv.shape if dv is not None else None)
+        print("alibi_slopes:", alibi_slopes.shape if alibi_slopes is not None else None)
         print("dropout_p:", dropout_p)
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
@@ -402,9 +401,9 @@ def bwd(
 
     if DEBUG:
         print("flash_attn_triton_amd.py::bwd outputs")
-        print(tensor_stats("dq", dq))
-        print(tensor_stats("dk", dk))
-        print(tensor_stats("dv", dv))
+        print("dq:", dq.shape)
+        print("dk:", dk.shape)
+        print("dv:", dv.shape)
     # --- Assertions ---
     assert dq.shape == q.shape, f"[bwd] dq shape {dq.shape} != q shape {q.shape}"
     assert dk.shape == k.shape, f"[bwd] dk shape {dk.shape} != k shape {k.shape}"
@@ -442,7 +441,7 @@ def varlen_fwd(
     softcap: float,
     return_softmax: bool,
     gen_: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
 
     if str(q.dtype).startswith("torch.float8"):
         raise NotImplementedError(
@@ -486,7 +485,7 @@ def varlen_fwd(
     out = torch.zeros_like(q) if out is None else out.zero_()
 
     # Layout and basic info for varlen
-    layout = "thd"
+    layout: Literal["bshd", "bhsd", "thd"] = "thd"
     batch = len(cu_seqlens_q) - 1
     total_q, nheads_q, _ = q.shape
 
@@ -699,7 +698,7 @@ def varlen_bwd(
     deterministic: bool,
     gen_: Optional[torch.Tensor] = None,
     rng_state: Optional[torch.Tensor] = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if str(q.dtype).startswith("torch.float8"):
         raise NotImplementedError(
             "FP8 tensors are not supported in the AMD Triton FA2 interface (varlen_bwd). Use the FA3 path instead."
@@ -824,7 +823,7 @@ def fwd_kvcache(
     v_cache: torch.Tensor,
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]],
+    cache_seqlens: Optional[Union[int, torch.Tensor]],
     rotary_cos: Optional[torch.Tensor],
     rotary_sin: Optional[torch.Tensor],
     cache_batch_idx: Optional[torch.Tensor],
@@ -839,7 +838,7 @@ def fwd_kvcache(
     softcap: float,
     rotary_interleaved: bool,
     num_splits: int,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
 
     if softcap != 0.0:
         raise NotImplementedError(
@@ -878,7 +877,7 @@ def fwd_kvcache(
     out = torch.zeros_like(q) if out is None else out.zero_()
 
     # Basic layout info for decode path
-    layout = "bshd"
+    layout: Literal["bshd"] = "bshd"
     max_seqlen_q = q.shape[1]
     max_seqlen_k = k_cache.shape[1]
     cache_seqlens_tensor = (
