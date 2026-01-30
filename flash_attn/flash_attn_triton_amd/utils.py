@@ -37,6 +37,8 @@ __all__ = [
     "get_padded_headsize",
     # Misc helpers
     "round_multiple",
+    # Head grouping (LLC optimization)
+    "is_head_grouping_beneficial",
 ]
 
 
@@ -54,6 +56,21 @@ _RECOMMENDED_FP8_REPLACEMENTS: dict[str, dict[torch.dtype, torch.dtype]] = {
         torch.float8_e4m3fn: torch.float8_e4m3fnuz,
         torch.float8_e5m2: torch.float8_e5m2fnuz,
     },
+}
+
+# Infinity Cache (LLC) sizes for AMD GPUs in bytes
+# Note: This is the L3/Infinity Cache, NOT the L2 cache
+# RDNA3: L2=6MB, Infinity Cache (LLC)=96MB
+_LLC_CACHE_SIZES: dict[str, int] = {
+    # RDNA2
+    "gfx1030": 128 * 1024 * 1024,  # RX 6900 XT - 128 MB Infinity Cache
+    # RDNA3 consumer
+    "gfx1100": 96 * 1024 * 1024,   # RX 7900 XTX - 96 MB Infinity Cache
+    "gfx1101": 64 * 1024 * 1024,   # RX 7800 XT - 64 MB Infinity Cache
+    "gfx1102": 32 * 1024 * 1024,   # RX 7600 - 32 MB Infinity Cache
+    # RDNA4
+    "gfx1200": 32 * 1024 * 1024,   # RX 9060/XT - 32 MB Infinity Cache
+    "gfx1201": 64 * 1024 * 1024,   # RX 9070/XT - 64 MB Infinity Cache
 }
 
 
@@ -93,6 +110,26 @@ class GpuArch:
             ).multi_processor_count
         )
 
+    @property
+    def llc_size(self) -> Optional[int]:
+        """
+        Get Infinity Cache (LLC) size in bytes.
+        
+        For RDNA3, this is the 96 MB Infinity Cache, not the 6 MB L2.
+        Returns None for architectures without a known LLC size (e.g., CDNA).
+        """
+        # Check exact match first
+        if self.name in _LLC_CACHE_SIZES:
+            return _LLC_CACHE_SIZES[self.name]
+        
+        # Check prefix match (e.g., gfx1100 matches gfx1100)
+        for known_arch, size in _LLC_CACHE_SIZES.items():
+            if self.name.startswith(known_arch):
+                return size
+        
+        # No LLC for this architecture
+        return None
+
 
 # -------------------------------
 # Global Variables
@@ -111,6 +148,8 @@ AUTOTUNE = os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0").lower() in
 #
 # Set via: FLASH_ATTENTION_TRITON_AMD_DEBUG=0|1|2
 DEBUG: int = int(os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0"))
+DISABLE_HEAD_GROUPING = os.environ.get("FLASH_ATTN_DISABLE_HEAD_GROUPING", "0") == "1"
+
 if AUTOTUNE or DEBUG > 0:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 if DEBUG >= 2:
@@ -241,6 +280,92 @@ def get_padded_headsize(size: int) -> int:
 def round_multiple(x: int, m: int) -> int:
     """Round x up to the nearest multiple of m."""
     return (x + m - 1) // m * m
+
+
+def _get_dtype_size(dtype: torch.dtype) -> Optional[int]:
+    """Get element size in bytes for a dtype. Returns None if unknown."""
+    if dtype in (torch.float16, torch.bfloat16):
+        return 2
+    elif dtype == torch.float32:
+        return 4
+    elif 'float8' in str(dtype).lower():
+        return 1
+    return None
+
+
+def calculate_optimal_head_group_size(
+    seqlen_k: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    llc_size: int,
+    llc_utilization: float = 1.0,
+) -> int:
+    """
+    Calculate the optimal number of heads to process together to fit K,V in LLC.
+    """
+    elem_size = _get_dtype_size(dtype) or 2  # Default to fp16
+    
+    # Memory for K and V per head
+    kv_per_head = seqlen_k * head_dim * elem_size * 2  # *2 for K and V
+    
+    # Target LLC usage
+    target_llc = int(llc_size * llc_utilization)
+    
+    # Calculate number of heads that fit
+    if kv_per_head == 0:
+        return 1
+    
+    return max(1, target_llc // kv_per_head)
+
+
+def is_head_grouping_beneficial(
+    nheads: int,
+    seqlen_k: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    threshold_ratio: float = 1.5,
+) -> tuple[bool, int]:
+    """
+    Determine if head grouping would be beneficial and return optimal group size.
+    
+    Currently limited to RDNA GPUs with known LLC sizes.
+    
+    Returns:
+        (should_group, group_size): If should_group is False, group_size equals nheads.
+    """
+    # Check if disabled via environment
+    if DISABLE_HEAD_GROUPING:
+        return False, nheads
+    
+    # Only apply head grouping to RDNA GPUs with known LLC
+    arch = get_arch()
+    llc_size = arch.llc_size
+    if llc_size is None:
+        return False, nheads
+    
+    elem_size = _get_dtype_size(dtype) or 2  # Default to fp16
+    
+    # Total K,V memory for all heads
+    total_kv = nheads * seqlen_k * head_dim * elem_size * 2
+    
+    # Only group if K,V significantly exceeds LLC
+    if total_kv < llc_size * threshold_ratio:
+        return False, nheads
+    
+    # Calculate optimal group size
+    group_size = calculate_optimal_head_group_size(
+        seqlen_k, head_dim, dtype, llc_size
+    )
+    
+    # Only group if we'd have at least 2 groups
+    if group_size >= nheads:
+        return False, nheads
+    
+    # Minimum group size to avoid excessive kernel launches
+    min_group_size = max(1, nheads // 16)  # At most 16 groups
+    group_size = max(group_size, min_group_size)
+    
+    return True, min(group_size, nheads)
 
 
 # -------------------------------
