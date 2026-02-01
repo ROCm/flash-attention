@@ -37,10 +37,9 @@ def get_fwd_decode_configs(autotune: bool):
     Returns:
         (splitk_configs, reduce_config): Tuple of config lists for each kernel
     """
+    arch = get_arch()
 
     if not autotune:
-        arch = get_arch()
-        
         if arch.is_rdna:
             return (
                 [
@@ -77,19 +76,24 @@ def get_fwd_decode_configs(autotune: bool):
             )
 
     # ===================== Autotune Sweep =====================
-    arch = get_arch()
-    splitk_configs = []
-    
-    BLOCK_M_OPTIONS = [64, 32, 16]
-    BLOCK_N_OPTIONS = [128, 64, 32, 16]
-    NUM_WARPS_OPTIONS = [2, 4]
-    NUM_STAGES_OPTIONS = [1]
-    WAVES_PER_EU_OPTIONS = [4, 2, 1]
+    if arch.is_rdna:
+        BLOCK_M_OPTIONS = [32, 64]
+        BLOCK_N_OPTIONS = [32, 64]
+        NUM_WARPS_OPTIONS = [2]
+        NUM_STAGES_OPTIONS = [1]
+        WAVES_PER_EU_OPTIONS = [1, 2, 4]
+    else:
+        BLOCK_M_OPTIONS = [16, 32, 64]
+        BLOCK_N_OPTIONS = [32, 64, 128]
+        NUM_WARPS_OPTIONS = [2, 4]
+        NUM_STAGES_OPTIONS = [1]
+        WAVES_PER_EU_OPTIONS = [1, 2, 4]
     
     # Ensure BLOCK_M options don't exceed MAX_BLOCK_M
     assert all(bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS), \
         f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
     
+    splitk_configs = []
     for bm in BLOCK_M_OPTIONS:
         for bn in BLOCK_N_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:

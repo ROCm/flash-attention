@@ -40,11 +40,10 @@ NONCAUSAL_AUTOTUNE_KEYS = [
 
 
 def get_bwd_configs(autotune: bool):
+    arch = get_arch()
 
     # default config
     if not autotune:
-        arch = get_arch()
-        
         # configs for the kernels
         if arch.name == "gfx942":
             if arch.cu_count < 304:
@@ -401,24 +400,36 @@ def get_bwd_configs(autotune: bool):
         return (preprocess_configs, causal_configs, noncausal_configs)
 
     # ===================== Autotune Sweep =====================
-    # param options
-    PRE_BLOCK_OPTIONS = [64, 128]  # og: 128
-    PRE_WAVES_PER_EU_OPTIONS = [1, 2]
-    PRE_NUM_STAGES_OPTIONS = [1, 2]
-    PRE_NUM_WARPS_OPTIONS = [4, 8]
-    NUM_STAGES_OPTIONS = [1, 2]  # og: 1
-    NUM_WARPS_OPTIONS = [4, 8]  # og: 4
-    WAVES_PER_EU_OPTIONS = [1, 2]  # og: 1
-    NON_CAUSAL_BLOCK_M1_OPTIONS = [16, 32, 64, 128]  # og: 32
-    NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128, 256]  # og: 128
-    NON_CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64, 128]  # og: 32
-    CAUSAL_BLOCK_M1_OPTIONS = [  # og: 32
-        32,
-        64
-    ]
-    CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128]  # og: 128
-    CAUSAL_BLOCK_N2_OPTIONS = [32, 64]  # og: 32
-    BLK_SLICE_FACTOR_OPTIONS = [2]  # og: 2
+    if arch.is_rdna:
+        PRE_BLOCK_OPTIONS = [32, 64]
+        PRE_WAVES_PER_EU_OPTIONS = [1, 2, 4]
+        PRE_NUM_STAGES_OPTIONS = [1]
+        PRE_NUM_WARPS_OPTIONS = [2]
+        NUM_STAGES_OPTIONS = [1]
+        NUM_WARPS_OPTIONS = [2]
+        WAVES_PER_EU_OPTIONS = [1, 2, 4]
+        NON_CAUSAL_BLOCK_M1_OPTIONS = [32, 64]
+        NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64]
+        NON_CAUSAL_BLOCK_N2_OPTIONS = [32, 64]
+        CAUSAL_BLOCK_M1_OPTIONS = [32, 64]
+        CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64]
+        CAUSAL_BLOCK_N2_OPTIONS = [32, 64]
+        BLK_SLICE_FACTOR_OPTIONS = [2]
+    else:
+        PRE_BLOCK_OPTIONS = [64, 128]
+        PRE_WAVES_PER_EU_OPTIONS = [1, 2]
+        PRE_NUM_STAGES_OPTIONS = [1, 2]
+        PRE_NUM_WARPS_OPTIONS = [4, 8]
+        NUM_STAGES_OPTIONS = [1, 2]
+        NUM_WARPS_OPTIONS = [4, 8]
+        WAVES_PER_EU_OPTIONS = [1, 2]
+        NON_CAUSAL_BLOCK_M1_OPTIONS = [16, 32, 64, 128]
+        NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128, 256]
+        NON_CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64, 128]
+        CAUSAL_BLOCK_M1_OPTIONS = [32, 64]
+        CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128]
+        CAUSAL_BLOCK_N2_OPTIONS = [32, 64]
+        BLK_SLICE_FACTOR_OPTIONS = [2]
 
     # ==================== sweep configs ================================ 
     preprocess_autotune_configs = []

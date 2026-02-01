@@ -33,8 +33,8 @@ def get_fwd_prefill_configs(autotune: bool):
     #   - CDNA: BLOCK_N=64
     #   - RDNA: BLOCK_N=32
     # See _get_block_size_n_triton() in test_flash_attn_triton_amd.py
+    arch = get_arch()
     if not autotune:
-        arch = get_arch()
         if arch.name == "gfx950":
             return [
                 triton.Config(
@@ -98,13 +98,22 @@ def get_fwd_prefill_configs(autotune: bool):
             ]
 
     # ===================== Autotune Sweep =====================
+    if arch.is_rdna:
+        BLOCK_M_OPTIONS = [32, 64]
+        BLOCK_N_OPTIONS = [32, 64]
+        NUM_WARPS_OPTIONS = [2]
+        NUM_STAGES_OPTIONS = [1]
+        WAVES_PER_EU_OPTIONS = [1, 2, 4]
+        PRE_LOAD_V_OPTIONS = [False]
+    else:
+        BLOCK_M_OPTIONS = [64, 128]
+        BLOCK_N_OPTIONS = [32, 64, 128]
+        NUM_WARPS_OPTIONS = [4]
+        NUM_STAGES_OPTIONS = [1]
+        WAVES_PER_EU_OPTIONS = [1, 2, 4]
+        PRE_LOAD_V_OPTIONS = [False]
+    
     configs = []
-    BLOCK_M_OPTIONS = [128, 64, 32, 16]
-    BLOCK_N_OPTIONS = [128, 64, 32, 16]
-    NUM_WARPS_OPTIONS = [2, 4, 8]
-    NUM_STAGES_OPTIONS = [1, 2]
-    WAVES_PER_EU_OPTIONS = [4, 2, 1]
-    PRE_LOAD_V_OPTIONS = [False]
     for bm in BLOCK_M_OPTIONS:
         for bn in BLOCK_N_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
