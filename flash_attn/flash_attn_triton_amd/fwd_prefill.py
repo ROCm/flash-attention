@@ -101,8 +101,8 @@ def get_fwd_prefill_configs(autotune: bool):
     if arch.is_rdna:
         BLOCK_M_OPTIONS = [32, 64]
         BLOCK_N_OPTIONS = [32, 64]
-        NUM_WARPS_OPTIONS = [2]
-        NUM_STAGES_OPTIONS = [1]
+        NUM_WARPS_OPTIONS = [2, 4]
+        NUM_STAGES_OPTIONS = [1, 2]
         WAVES_PER_EU_OPTIONS = [1, 2, 4]
         PRE_LOAD_V_OPTIONS = [False]
     else:
