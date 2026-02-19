@@ -27,9 +27,11 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
+from quack import copy_utils
+
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
-from flash_attn.cute import copy_utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
@@ -46,13 +48,13 @@ from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from cutlass.cute import FastDivmodDivisor
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
-    ParamsBase,
 )
 
 
@@ -78,6 +80,7 @@ class FlashAttentionForwardSm100:
         is_local: bool = False,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
+        q_subtile_factor: int | None = None,
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: cutlass.Constexpr[int] = 2,
@@ -119,6 +122,7 @@ class FlashAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
+        self.q_subtile_factor = q_subtile_factor
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, (
                 "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
@@ -128,10 +132,9 @@ class FlashAttentionForwardSm100:
         )
         self.score_mod = score_mod
         self.mask_mod = mask_mod
-        if cutlass.const_expr(has_aux_tensors):
-            self.vec_size: cutlass.Constexpr = 1
-        else:
-            self.vec_size: cutlass.Constexpr = 2
+        self.vec_size: cutlass.Constexpr = getattr(
+            score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
+        )
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
@@ -232,7 +235,13 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = 4 if self.q_dtype.width == 8 or self.q_stage == 1 else 3
+        self.kv_stage = (
+            4
+            if (self.q_dtype.width == 8 or self.q_stage == 1)
+            and self.head_dim_padded <= 128
+            and self.head_dim_v_padded <= 128
+            else 3
+        )
         self.acc_stage = 1
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
@@ -289,15 +298,7 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (
-            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
-            t.stride[-1],
-        )
-        mQ, mK, mV, mO = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mQ, mK, mV, mO)
-        ]
+        mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
@@ -950,13 +951,13 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
             if warp_idx == self.empty_warp_ids[i]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.load(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -984,7 +985,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
             # if warp_idx == self.mma_warp_id or warp_idx == self.empty_warp_ids:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
             if warp_idx == self.mma_warp_id:
@@ -1027,7 +1028,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(not self.use_correction_warps_for_epi):
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
                 self.epilogue_s2g(
                     mO,
                     sO,
@@ -1048,7 +1049,7 @@ class FlashAttentionForwardSm100:
             (const_expr(self.q_stage == 1) and warp_idx <= self.softmax0_warp_ids[-1])
         ):
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.setmaxregister_increase(self.num_regs_softmax)
             softmax_loop = partial(
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
@@ -1095,7 +1096,7 @@ class FlashAttentionForwardSm100:
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+            cute.arch.setmaxregister_decrease(self.num_regs_correction)
             self.correction_loop(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -1304,6 +1305,7 @@ class FlashAttentionForwardSm100:
                     self.q_stage,
                     q_producer_phase,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
 
@@ -1379,7 +1381,14 @@ class FlashAttentionForwardSm100:
             process_tile = False
 
             if const_expr(self.use_block_sparsity):
-                block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block, self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+                block_iter_count = get_total_block_count(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                )
                 process_tile = block_iter_count > Int32(0)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -1690,7 +1699,14 @@ class FlashAttentionForwardSm100:
             softmax.reset()
 
             if const_expr(self.use_block_sparsity):
-                tile_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block, self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+                tile_block_count = get_total_block_count(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                )
                 has_work = tile_block_count > Int32(0)
             else:
                 tile_block_count = n_block_max - n_block_min
@@ -1719,8 +1735,8 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
             )
 
-            if has_work:
-                # Softmax acts as the producer: wait until correction signals the stage is empty
+            if const_expr(self.use_block_sparsity) or has_work:
+                # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
                 )
@@ -1760,15 +1776,17 @@ class FlashAttentionForwardSm100:
                     Int32(stage),
                     check_m_boundary,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
-                            tidx + stage * self.m_block_size + self.m_block_size * 2
+                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
                         ] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
+                    # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
@@ -1834,7 +1852,7 @@ class FlashAttentionForwardSm100:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
-                            tidx + stage * self.m_block_size + self.m_block_size * 2
+                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
                         ] = softmax.row_max[0]
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
@@ -1846,7 +1864,7 @@ class FlashAttentionForwardSm100:
             #     )
             #     LN2 = math.log(2.0)
             #     lse = (
-            #         (softmax.row_max[0] * softmax.scale_log2 + utils.log2f(softmax.row_sum[0])) * LN2
+            #         (softmax.row_max[0] * softmax.scale_log2 + cute.math.log2(softmax.row_sum[0], fastmath=True)) * LN2
             #         if not acc_O_mn_row_is_zero_or_nan else -Float32.inf
             #     )
             #     if const_expr(not seqlen.has_cu_seqlens_q):
@@ -1987,7 +2005,7 @@ class FlashAttentionForwardSm100:
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
-        # acc_scale = cute.arch.exp2(acc_scale_)
+        # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
     @cute.jit
@@ -2054,7 +2072,14 @@ class FlashAttentionForwardSm100:
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
 
             if const_expr(self.use_block_sparsity):
-                total_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block, self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+                total_block_count = get_total_block_count(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                )
                 has_work = total_block_count > Int32(0)
             else:
                 total_block_count = n_block_max - n_block_min
@@ -2133,7 +2158,7 @@ class FlashAttentionForwardSm100:
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[tidx + stage * self.m_block_size]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + stage * self.m_block_size + self.m_block_size * 2]
+                        row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
                     else:
                         row_max = None
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage)
@@ -2146,8 +2171,8 @@ class FlashAttentionForwardSm100:
                                 row_max = sink_val * (LOG2_E / softmax_scale_log2)
                                 row_sum = Float32(1.0)
                             else:
-                                row_sum += utils.exp2f(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2
+                                row_sum += cute.math.exp2(
+                                    sink_val * LOG2_E - row_max * softmax_scale_log2, fastmath=True
                                 )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
@@ -2252,7 +2277,7 @@ class FlashAttentionForwardSm100:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + utils.log2f(row_sum)) * LN2
+                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
@@ -2315,7 +2340,7 @@ class FlashAttentionForwardSm100:
             tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
             cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
@@ -2396,7 +2421,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
-                tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
@@ -2404,10 +2429,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)
