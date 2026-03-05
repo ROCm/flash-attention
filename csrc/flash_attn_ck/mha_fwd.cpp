@@ -294,6 +294,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         auto stream = at::cuda::getCurrentHIPStream().stream();
 #endif
         ck_tile::stream_config stream_config{stream};
+        stream_config.log_level_=2;
 
         auto traits =
             get_ck_fmha_fwd_traits(
