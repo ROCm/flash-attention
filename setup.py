@@ -197,7 +197,7 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
+    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942", "gfx1151"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -382,10 +382,25 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        gen_archs = os.getenv("GPU_ARCHS", "native").split(";")
+        if gen_archs == ["native"]:
+            gen_archs = [torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]]
+        codegen_targets = set()
+        for a in gen_archs:
+            if a.startswith("gfx9"):
+                codegen_targets.add("gfx9")
+                if "gfx950" in a:
+                    codegen_targets.add("gfx950")
+            elif a.startswith("gfx11"):
+                codegen_targets.add("gfx11")
+            elif a.startswith("gfx12"):
+                codegen_targets.add("gfx12")
+        targets_arg = ["--targets", ",".join(sorted(codegen_targets))] if codegen_targets else []
+        gen_common = [sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "--output_dir", "build", "--receipt", "2", "--optdim", optdim] + targets_arg
+        subprocess.run(gen_common + ["-d", "fwd"], check=True)
+        subprocess.run(gen_common + ["-d", "fwd_appendkv"], check=True)
+        subprocess.run(gen_common + ["-d", "fwd_splitkv"], check=True)
+        subprocess.run(gen_common + ["-d", "bwd"], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
