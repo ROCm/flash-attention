@@ -382,10 +382,15 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--filter", "fmha_fwd_d128_bf16_batch_b64x128x32x128x32x128_r4x1x1_r4x1x1_w16x16x32_w16x16x16_qr_async_vr_psskddv_nlogits_alibi_mask_lse_ndropout_nskip_nqscale_ntrload_nsink"], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", "999"], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", "999"], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--filter", "fmha_bwd_dot_do_o_d128_bf16_b64_batch_o2_psdv@fmha_bwd_convert_dq_d128_bf16_b64x0_batch_o2_psd_ndeterministic@fmha_bwd_d128_bf16_batch_b32x128x128x32x128x32x32x128x128_r1x4x1_r4x1x1_r1x4x1_w16x16x32_w16x16x32_o1_maxq0_pd8dv8_alibi_ndbias_mask_ndropout_ndeterministic_trload"], check=True)
+
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -439,6 +444,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         cc_flag += ["-O3","-std=c++20",
                     "-Wno-unknown-warning-option",
                     "-fbracket-depth=1024",
+                    "--save-temps",
+                    "-Wno-gnu-line-marker",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
                     "-fgpu-flush-denormals-to-zero",
                     "-DCK_ENABLE_BF16",
