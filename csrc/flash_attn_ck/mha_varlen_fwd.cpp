@@ -141,6 +141,8 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          d,             // hdim_v
                          h,             // nhead
                          h_k,           // nhead_k
+                         0,
+                         0,
                          softmax_scale, // scale_s
                          0.0f,          // logits_soft_cap
                          stride_q,
