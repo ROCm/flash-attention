@@ -407,11 +407,22 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             cc_flag = [f"--offload-arch={arch}"]
         arch_str = ','.join(archs)
 
-        optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", arch_str], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", arch_str], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", arch_str], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", arch_str], check=True)
+        subprocess.run([sys.executable, 
+            f"{ck_dir}/example/ck_tile/01_fmha/generate.py", 
+            "--targets", arch_str,
+            "--api", "fwd,fwd_splitkv,fwd_appendkv,pagedkv_prefill", 
+            "--optdim", "32,64,80,128,256",
+            "--filter", "*_nlogits*_nskip*_nsink*,*@*_nlogits*_nbias*_nsink*,*,*_nlogits*_nskip*_pagedkv*",
+            "--output_dir", "build"], 
+        check=True)
+        subprocess.run([sys.executable, 
+            f"{ck_dir}/example/ck_tile/01_fmha/generate.py", 
+            "--targets", arch_str,
+            "--api", "bwd", 
+            "--receipt", "3",
+            "--optdim", "32,64,96,128,256",
+            "--output_dir", "build"], 
+        check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -469,7 +480,16 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     "-DCK_USE_XDL",
                     "-DUSE_PROF_API=1",
                     # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                    "-D__HIP_PLATFORM_HCC__=1"]
+                    "-D__HIP_PLATFORM_HCC__=1",
+                    "-Wno-nrvo"]
+        
+        enable_wmma = False
+        if os.getenv("FORCE_DISABLE_WMMA", "FALSE") != "TRUE":
+            if any(target in arch for arch in archs for target in ["gfx11", "gfx12"]):
+                enable_wmma = True
+        if enable_wmma:
+            print("--- Enabling WMMA instances ---")
+            cc_flag += ["-DCK_USE_WMMA", "-DCK_TILE_USE_WMMA=1"]
 
         cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
 

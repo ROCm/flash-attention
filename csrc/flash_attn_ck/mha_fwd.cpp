@@ -5,6 +5,7 @@
 #include "flash_common.hpp"
 
 #include "fmha_fwd.hpp"
+#include "fmha_fwd_head_grouping.hpp"
 #include "mask.hpp"
 
 fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
@@ -119,8 +120,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          d,             // hdim_v
                          h,             // nhead
                          h_k,           // nhead_k
-                         0,
-                         0,
+                         0,             // num_head_q_total
+                         0,             // head_start
                          softmax_scale, // scale_s
                          0.0f,          // logits_soft_cap
                          stride_q,
@@ -332,7 +333,60 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 p_dropout,
                 drop_seed_offset);
 
-        float t = fmha_fwd(traits, args, stream_config);
+        // float t = fmha_fwd(traits, args, stream_config);
+        float t = -1.0f;
+        auto dispatch_fwd = [&](auto type_config_dummy) {
+            using TypeConfig = decltype(type_config_dummy);
+
+            using QDataType             = typename TypeConfig::QDataType;
+            using KDataType             = typename TypeConfig::KDataType;
+            using VDataType             = typename TypeConfig::VDataType;
+            using BiasDataType          = typename TypeConfig::BiasDataType;
+            using RandValOutputDataType = typename TypeConfig::RandValOutputDataType;
+            using LSEDataType           = typename TypeConfig::LSEDataType;
+            using ODataType             = typename TypeConfig::ODataType;
+
+            const auto group_size_opt = fmha_fwd_head_grouping::get_head_group_size(
+                num_heads,
+                num_heads_k,
+                batch_size,
+                seqlen_k,
+                head_size,
+                head_size,
+                sizeof(KDataType),
+                sizeof(VDataType)
+            );
+
+            float t_val = -1.0f;
+
+            if (group_size_opt.has_value() && group_size_opt.value() < num_heads) {
+                t_val = fmha_fwd_head_grouping::run_fwd_head_grouped<QDataType,
+                                                                    KDataType,
+                                                                    VDataType,
+                                                                    ODataType,
+                                                                    BiasDataType,
+                                                                    LSEDataType,
+                                                                    RandValOutputDataType>(
+                    stream_config,
+                    traits,
+                    args,
+                    num_heads,
+                    num_heads_k,
+                    group_size_opt.value(),
+                    false,
+                    [&](const auto& traits_inner, auto& args_inner, const auto& sc_inner) {
+                        return fmha_fwd(traits_inner, args_inner, sc_inner);
+                    });
+            } else {
+                t_val = fmha_fwd(traits, args, stream_config);
+            }
+            return t_val;
+        };
+        if (q_dtype == torch::kFloat16) {
+            t = dispatch_fwd(FmhaFwdTypeConfig<FmhaFwdFp16>{}); 
+        } else if (q_dtype == torch::kBFloat16) {
+            t = dispatch_fwd(FmhaFwdTypeConfig<FmhaFwdBf16>{}); 
+        }
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {
