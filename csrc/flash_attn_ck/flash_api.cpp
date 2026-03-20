@@ -17,7 +17,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        std::optional<at::Generator> gen_);
+        std::optional<at::Generator> gen_,
+        const std::string layout = "bshd");
 
 std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,                               // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i

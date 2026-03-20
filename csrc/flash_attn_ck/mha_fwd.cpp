@@ -48,27 +48,49 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    at::Tensor dropout_randval,
                                    float softmax_scale,
                                    float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset,
+                                   const std::string layout
+                                )
 {
-    // q: (batch_size, seqlen_q, nheads, d)
-    // k: (batch_size, seqlen_k, nheads_k, d)
-    // v: (batch_size, seqlen_k, nheads_k, d)
-    // o: (batch_size, seqlen_q, nheads, d)
+    // Declare variables outside the scope to ensure they live until the return statement
+    ck_tile::index_t stride_q, stride_k, stride_v, stride_o;
+    ck_tile::index_t nhead_stride_q, nhead_stride_k, nhead_stride_v, nhead_stride_o;
 
+    if (layout == "bhsd") {
+        // q: (batch_size, nheads, seqlen_q, d)
+        // k: (batch_size, nheads_k, seqlen_k, d)
+        // v: (batch_size, nheads_k, seqlen_k, d)
+        // o: (batch_size, nheads, seqlen_q, d)
+        stride_q = q.stride(2);
+        stride_k = k.stride(2);
+        stride_v = v.stride(2);
+        stride_o = out.stride(2);
+
+        nhead_stride_q = q.stride(1);
+        nhead_stride_k = k.stride(1);
+        nhead_stride_v = v.stride(1);
+        nhead_stride_o = out.stride(1);
+    }
+    else { // layout == "bshd"
+        // q: (batch_size, seqlen_q, nheads, d)
+        // k: (batch_size, seqlen_k, nheads_k, d)
+        // v: (batch_size, seqlen_k, nheads_k, d)
+        // o: (batch_size, seqlen_q, nheads, d)
+        stride_q = q.stride(1);
+        stride_k = k.stride(1);
+        stride_v = v.stride(1);
+        stride_o = out.stride(1);
+
+        nhead_stride_q = q.stride(2);
+        nhead_stride_k = k.stride(2);
+        nhead_stride_v = v.stride(2);
+        nhead_stride_o = out.stride(2);
+    }
     // alibi_slopes:(batch_size, nheads) or (nhead)
     // lse: (batch_size, nheads, seqlen_q)
     // randval: (batch_size, nheads, seqlen_q, seqlen_k)
 
-    ck_tile::index_t stride_q = q.stride(1);
-    ck_tile::index_t stride_k = k.stride(1);
-    ck_tile::index_t stride_v = v.stride(1);
-    ck_tile::index_t stride_o = out.stride(1);
     ck_tile::index_t stride_randval = has_dropout_randval ? dropout_randval.stride(2) : 0;
-
-    ck_tile::index_t nhead_stride_q = q.stride(2);
-    ck_tile::index_t nhead_stride_k = k.stride(2);
-    ck_tile::index_t nhead_stride_v = v.stride(2);
-    ck_tile::index_t nhead_stride_o = out.stride(2);
     ck_tile::index_t nhead_stride_lse = has_lse ? softmax_lse.stride(1) : 0;
     ck_tile::index_t nhead_stride_randval = has_dropout_randval ? dropout_randval.stride(1) : 0;
 
@@ -178,8 +200,13 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         int window_size_right,
         const float /*softcap*/,
         const bool return_dropout_randval,
-        std::optional<at::Generator> gen_)
+        std::optional<at::Generator> gen_,
+        const std::string layout = "bshd"
+    )
 {
+    TORCH_CHECK(layout == "bhsd" || layout == "bshd", 
+            "Unsupported layout: ", layout, ". Only 'bhsd' and 'bshd' are supported.");
+    
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
@@ -198,11 +225,20 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     const auto sizes = q.sizes();
 
     const int batch_size = sizes[0];
-    int seqlen_q = sizes[1];
-    int num_heads = sizes[2];
     const int head_size = sizes[3];
-    const int seqlen_k = k.size(1);
-    const int num_heads_k = k.size(2);
+    int num_heads, seqlen_q, num_heads_k, seqlen_k;
+    if (layout == "bhsd"){
+        seqlen_q = sizes[2];
+        num_heads = sizes[1];
+        seqlen_k = k.size(2);
+        num_heads_k = k.size(1);
+    }
+    else{ // layout == "bshd"
+        seqlen_q = sizes[1];
+        num_heads = sizes[2];
+        seqlen_k = k.size(1);
+        num_heads_k = k.size(2);
+    }
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size <= 256, "CK only supports head dimension at most 256");
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
@@ -235,14 +271,21 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
-        q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
+        q = q.reshape({batch_size, num_heads_k, ngroups, head_size});
+        q = layout == "bshd" ? q.transpose(1, 2): q;
         seqlen_q = ngroups;
         num_heads = num_heads_k;
     }
-
-    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
-    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+    if (layout == "bhsd"){
+        CHECK_SHAPE(q, batch_size, num_heads, seqlen_q, head_size);
+        CHECK_SHAPE(k, batch_size, num_heads_k, seqlen_k, head_size);
+        CHECK_SHAPE(v, batch_size, num_heads_k, seqlen_k, head_size);
+    }
+    else{
+        CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
+        CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
+    }
 
     at::Tensor out;
     if (out_.has_value()) {
@@ -331,61 +374,68 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 p,
                 softmax_scale,
                 p_dropout,
-                drop_seed_offset);
+                drop_seed_offset,
+                layout
+            );
 
         // float t = fmha_fwd(traits, args, stream_config);
         float t = -1.0f;
-        auto dispatch_fwd = [&](auto type_config_dummy) {
-            using TypeConfig = decltype(type_config_dummy);
+        if (layout == "bhsd"){
+            t = fmha_fwd(traits, args, stream_config);
+        }
+        else { //layout == "bshd"
+            auto dispatch_fwd = [&](auto type_config_dummy) {
+                using TypeConfig = decltype(type_config_dummy);
 
-            using QDataType             = typename TypeConfig::QDataType;
-            using KDataType             = typename TypeConfig::KDataType;
-            using VDataType             = typename TypeConfig::VDataType;
-            using BiasDataType          = typename TypeConfig::BiasDataType;
-            using RandValOutputDataType = typename TypeConfig::RandValOutputDataType;
-            using LSEDataType           = typename TypeConfig::LSEDataType;
-            using ODataType             = typename TypeConfig::ODataType;
+                using QDataType             = typename TypeConfig::QDataType;
+                using KDataType             = typename TypeConfig::KDataType;
+                using VDataType             = typename TypeConfig::VDataType;
+                using BiasDataType          = typename TypeConfig::BiasDataType;
+                using RandValOutputDataType = typename TypeConfig::RandValOutputDataType;
+                using LSEDataType           = typename TypeConfig::LSEDataType;
+                using ODataType             = typename TypeConfig::ODataType;
 
-            const auto group_size_opt = fmha_fwd_head_grouping::get_head_group_size(
-                num_heads,
-                num_heads_k,
-                batch_size,
-                seqlen_k,
-                head_size,
-                head_size,
-                sizeof(KDataType),
-                sizeof(VDataType)
-            );
-
-            float t_val = -1.0f;
-
-            if (group_size_opt.has_value() && group_size_opt.value() < num_heads) {
-                t_val = fmha_fwd_head_grouping::run_fwd_head_grouped<QDataType,
-                                                                    KDataType,
-                                                                    VDataType,
-                                                                    ODataType,
-                                                                    BiasDataType,
-                                                                    LSEDataType,
-                                                                    RandValOutputDataType>(
-                    stream_config,
-                    traits,
-                    args,
+                const auto group_size_opt = fmha_fwd_head_grouping::get_head_group_size(
                     num_heads,
                     num_heads_k,
-                    group_size_opt.value(),
-                    false,
-                    [&](const auto& traits_inner, auto& args_inner, const auto& sc_inner) {
-                        return fmha_fwd(traits_inner, args_inner, sc_inner);
-                    });
-            } else {
-                t_val = fmha_fwd(traits, args, stream_config);
+                    batch_size,
+                    seqlen_k,
+                    head_size,
+                    head_size,
+                    sizeof(KDataType),
+                    sizeof(VDataType)
+                );
+
+                float t_val = -1.0f;
+
+                if (group_size_opt.has_value() && group_size_opt.value() < num_heads) {
+                    t_val = fmha_fwd_head_grouping::run_fwd_head_grouped<QDataType,
+                                                                        KDataType,
+                                                                        VDataType,
+                                                                        ODataType,
+                                                                        BiasDataType,
+                                                                        LSEDataType,
+                                                                        RandValOutputDataType>(
+                        stream_config,
+                        traits,
+                        args,
+                        num_heads,
+                        num_heads_k,
+                        group_size_opt.value(),
+                        false,
+                        [&](const auto& traits_inner, auto& args_inner, const auto& sc_inner) {
+                            return fmha_fwd(traits_inner, args_inner, sc_inner);
+                        });
+                } else {
+                    t_val = fmha_fwd(traits, args, stream_config);
+                }
+                return t_val;
+            };
+            if (q_dtype == torch::kFloat16) {
+                t = dispatch_fwd(FmhaFwdTypeConfig<FmhaFwdFp16>{}); 
+            } else if (q_dtype == torch::kBFloat16) {
+                t = dispatch_fwd(FmhaFwdTypeConfig<FmhaFwdBf16>{}); 
             }
-            return t_val;
-        };
-        if (q_dtype == torch::kFloat16) {
-            t = dispatch_fwd(FmhaFwdTypeConfig<FmhaFwdFp16>{}); 
-        } else if (q_dtype == torch::kBFloat16) {
-            t = dispatch_fwd(FmhaFwdTypeConfig<FmhaFwdBf16>{}); 
         }
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
@@ -396,8 +446,14 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
 
     if (seqlenq_ngroups_swapped) {
-        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
-        q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
+        if (layout == "bshd") {
+            out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
+            q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
+        } 
+        else if (layout == "bhsd") {
+            out = out.reshape({batch_size, num_heads_k * seqlen_q, 1, head_size});
+            q = q.reshape({batch_size, num_heads_k * seqlen_q, 1, head_size});
+        }
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
     return {out, softmax_lse, p, rng_state};
