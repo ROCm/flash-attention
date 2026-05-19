@@ -373,7 +373,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
             auto t = std::make_shared<at::Tensor>(torch::empty(
                 {static_cast<int64_t>(bytes)},
-                torch::TensorOptions().dtype(at::kByte).pinned_memory(true)));
+                torch::TensorOptions().dtype(at::kByte).device(at::kCPU).pinned_memory(true)));
             return std::shared_ptr<void>(t, t->data_ptr());
         };
         ck_tile::stream_config prep_cfg{stream};
