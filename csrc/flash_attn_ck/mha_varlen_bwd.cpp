@@ -324,6 +324,11 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     } else {
         dq = torch::empty_like(q);
     }
+    // The convert_dq mask-aware ELSE branch returns early for fully-masked Q-tiles,
+    // relying on dq being pre-zeroed. (We did try several zero-write kernel patterns
+    // but all hit a half-tile-write bug in store_tile via pad_tensor_view.) Pre-zero
+    // here unconditionally to handle that case; cost is small (dq is ~MB scale).
+    if (deterministic) dq.zero_();
     if (dk_.has_value()) {
         dk = dk_.value();
         TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
@@ -367,7 +372,13 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         flash::check_gfx1x_bwd_supported(deterministic);
     }
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum  = torch::zeros({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat));
+    // Experimental: testing torch::empty + M0_1D=32 codegen (convert kM0 aligned with bwd kM0).
+    // If convert kM0 matches bwd kM0, the convert kernel's mask check at convert-tile
+    // granularity exactly matches bwd's per-sub-tile write decision, so reads from
+    // dq_acc are guaranteed to hit only bwd-written slots. This makes torch::empty safe.
+    at::Tensor dq_accum  = deterministic
+        ? torch::empty({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat))
+        : torch::zeros({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat));
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
