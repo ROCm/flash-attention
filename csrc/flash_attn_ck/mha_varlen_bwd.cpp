@@ -2,6 +2,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
+#include <cstdlib>
 #include "flash_common.hpp"
 
 #include "fmha_bwd.hpp"
@@ -387,6 +388,20 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     } else {
         dk_expanded = dk;
         dv_expanded = dv;
+    }
+
+    // GRID PRUNE: when the DQDKDV grid is pruned for sliding-window, dead K-tiles (keys no
+    // query attends) are never launched, so their dk/dv would be left uninitialized ->
+    // non-deterministic. Pre-zero dk/dv here (separate fill kernel) so the pruned dead-tile
+    // ranges are deterministically 0; the kernel then `set`s the live tiles. Mirrors the
+    // existing dq.zero_() pattern. Gated to deterministic + bottom-right sliding-window.
+    if (deterministic && window_size_left >= 0 && window_size_right <= 0) {
+        if (const char* e = std::getenv("ROCM_FLASH_ATTN_GRID_PRUNE")) {
+            if (std::atoi(e) != 0) {
+                dk_expanded.zero_();
+                dv_expanded.zero_();
+            }
+        }
     }
 
     if(zero_tensors) {
