@@ -219,7 +219,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     if (is_causal) {
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         window_size_right = 0;
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        std::string mask_identify = "t:" + std::to_string(window_size_left) + "," + "0";
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // casual
     }
     else if (window_size_left == -1 && window_size_right == -1) {
@@ -227,7 +227,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
     else {
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+        std::string mask_identify = "t:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
 
