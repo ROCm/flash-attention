@@ -64,9 +64,21 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
+USE_AITER_ROCM = os.getenv("FLASH_ATTENTION_AITER_ENABLE", "FALSE") == "TRUE"
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+ROCM_BACKEND: Optional[Literal["aiter", "triton", "ck"]] = None
 if IS_ROCM:
-    ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
+    if USE_AITER_ROCM and USE_TRITON_ROCM:
+        raise RuntimeError(
+            "FLASH_ATTENTION_AITER_ENABLE and "
+            "FLASH_ATTENTION_TRITON_AMD_ENABLE cannot both be TRUE"
+        )
+    if USE_AITER_ROCM:
+        ROCM_BACKEND = "aiter"
+    elif USE_TRITON_ROCM:
+        ROCM_BACKEND = "triton"
+    else:
+        ROCM_BACKEND = "ck"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
@@ -255,16 +267,25 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
-    if ROCM_BACKEND == "triton":
+    if ROCM_BACKEND in ("aiter", "triton"):
         if os.path.isdir(".git"):
-            subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
+            submodule_command = ["git", "submodule", "update", "--init"]
+            if ROCM_BACKEND == "aiter":
+                submodule_command.append("--recursive")
+            submodule_command.append("third_party/aiter")
+            subprocess.run(submodule_command, check=True)
         else:
             assert os.path.isdir("third_party/aiter"), (
                 "third_party/aiter is missing, please use source distribution or git clone"
             )
+        aiter_env = os.environ.copy()
+        if ROCM_BACKEND == "aiter":
+            # FMHA v3 and AITER's CK fallback are disabled in Triton-only builds.
+            aiter_env["AITER_TRITON_ONLY"] = "0"
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
             check=True,
+            env=aiter_env,
         )
     elif ROCM_BACKEND == "ck":
         if os.path.isdir(".git"):
@@ -461,7 +482,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    # Skips CK C++ extension compilation if using Triton Backend
+    # Skip the in-tree CK extension when using an AITER-managed backend.
     if ROCM_BACKEND == "ck":
         ck_dir = "csrc/composable_kernel"
 
@@ -749,7 +770,7 @@ class NinjaBuildExtension(BuildExtension):
 
 
 # Build install_requires based on platform
-if ROCM_BACKEND == "triton":
+if ROCM_BACKEND in ("aiter", "triton"):
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
